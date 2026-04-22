@@ -433,7 +433,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
             return `${value.slice(0, limit)}\n...[truncated ${value.length - limit} chars]`;
           };
 
-          for (let round = 0; round < 5; round += 1) {
+          for (let round = 0; round < 25; round += 1) {
             const prompt = buildProviderPrompt(chatPrompt, repoContext, toolResults);
             appendPromptPreviewLog(session.id, 'agent', prompt, round + 1);
             await provider.sendPrompt(prompt);

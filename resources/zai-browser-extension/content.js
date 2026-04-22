@@ -315,7 +315,7 @@ function startStreaming() {
         return;
       }
     } else {
-      const seemsDone = !generating && streamState.hasNewContent && streamState.stableTicks >= 3;
+      const seemsDone = !generating && streamState.hasNewContent && streamState.stableTicks >= 2;
 
       if (seemsDone && streamState.lastText) {
         emitStreamEvent(streamState.streamId, {
@@ -326,7 +326,7 @@ function startStreaming() {
         return;
       }
 
-      if (!generating && !streamState.hasNewContent && streamState.stableTicks >= 12) {
+      if (!generating && !streamState.hasNewContent && streamState.stableTicks >= 10) {
         emitStreamEvent(streamState.streamId, {
           type: "error",
           message: "No new assistant response detected. Prompt may not have been submitted.",
@@ -450,7 +450,7 @@ async function runSendPrompt(params) {
     composer.click();
   }
   setComposerValue(composer, fullPrompt);
-  await wait(300);
+  await wait(150);
 
   // Try submit button first
   const submit = queryFirstVisible(SELECTORS.submit);
@@ -461,8 +461,8 @@ async function runSendPrompt(params) {
     }
   }
 
-  // If button is disabled, wait a moment for React state to catch up and retry
-  await wait(500);
+  // If button is disabled or didn't respond, wait a bit and retry aggressively
+  await wait(300);
   const retrySubmit = queryFirstVisible(SELECTORS.submit);
   if (retrySubmit && !retrySubmit.disabled) {
     retrySubmit.click();
@@ -471,7 +471,7 @@ async function runSendPrompt(params) {
     }
   }
 
-  // Fallback: try Enter key
+  // Fallback: try Enter key with multiple events for robustness
   const enterEvent = {
     key: "Enter",
     code: "Enter",
@@ -480,18 +480,23 @@ async function runSendPrompt(params) {
     bubbles: true,
     cancelable: true,
   };
-  composer.dispatchEvent(
-    new KeyboardEvent("keydown", enterEvent),
-  );
-  composer.dispatchEvent(
-    new KeyboardEvent("keypress", enterEvent),
-  );
-  composer.dispatchEvent(
-    new KeyboardEvent("keyup", enterEvent),
-  );
+  
+  composer.focus();
+  composer.dispatchEvent(new KeyboardEvent("keydown", enterEvent));
+  composer.dispatchEvent(new KeyboardEvent("keypress", enterEvent));
+  composer.dispatchEvent(new KeyboardEvent("keyup", enterEvent));
 
   if (await confirmPromptSubmission(composer)) {
     return { submitted: true };
+  }
+
+  // Final fallback: try form submission if applicable
+  const form = composer.closest('form');
+  if (form) {
+    form.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }));
+    if (await confirmPromptSubmission(composer)) {
+      return { submitted: true };
+    }
   }
 
   throw new Error("Prompt submit could not be confirmed in z.ai UI.");
@@ -511,6 +516,17 @@ async function runCheckReady() {
 }
 
 async function runStartNewConversation() {
+  const currentUrl = window.location.href;
+  const isHome = currentUrl === "https://chat.z.ai/" || currentUrl === "https://chat.z.ai" || currentUrl.endsWith(".z.ai/");
+  
+  if (!isHome) {
+    window.location.assign("https://chat.z.ai/");
+    return {
+      conversationId: undefined,
+      navigating: true,
+    };
+  }
+
   const previousConversationId = parseConversationId(window.location.href);
   const composer = queryFirstVisible(SELECTORS.input);
   if (composer) {

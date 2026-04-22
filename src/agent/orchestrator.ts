@@ -32,7 +32,7 @@ export class AgentOrchestrator {
       const context = await this.contextService.build(task);
       const toolResults: string[] = [];
 
-      for (let round = 0; round < 6; round += 1) {
+      for (let round = 0; round < 25; round += 1) {
         if (this.stops.has(sessionId)) {
           this.sessions.setStatus(sessionId, 'stopped');
           this.sessions.appendLog(sessionId, { level: 'warning', source: 'agent', message: 'Task stopped.' });
