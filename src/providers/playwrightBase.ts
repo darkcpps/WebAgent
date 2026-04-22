@@ -104,7 +104,7 @@ export abstract class PlaywrightWebProvider implements ProviderAdapter {
       await this.gotoHome();
       const htmlFirstPass = await this.extractModelValuesFromHtml();
       if (htmlFirstPass.length > 0) {
-        this.modelsCache = [{ id: 'auto', label: 'Auto' }, ...htmlFirstPass.map((label) => ({ id: label, label }))];
+        this.modelsCache = this.toModelList(htmlFirstPass);
         return this.modelsCache;
       }
 
@@ -122,10 +122,7 @@ export abstract class PlaywrightWebProvider implements ProviderAdapter {
       await this.page!.keyboard.press('Escape').catch(() => undefined);
 
       if (extracted.length > 0) {
-        this.modelsCache = [
-          { id: 'auto', label: 'Auto' },
-          ...extracted.map((label) => ({ id: label, label })),
-        ];
+        this.modelsCache = this.toModelList(extracted);
       }
 
       return this.modelsCache;
@@ -956,11 +953,39 @@ export abstract class PlaywrightWebProvider implements ProviderAdapter {
   }
 
   private normalizeModelLabel(value: string): string {
-    const cleaned = value.trim().replace(/\s+/g, ' ');
+    const cleaned = value
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter(Boolean)
+      .join(' ')
+      .replace(/\s+/g, ' ');
     if (!cleaned) {
       return '';
     }
-    return cleaned.replace(/\b([v])(\d+)/g, (_, prefix, digits) => `${prefix.toUpperCase()}${digits}`);
+    const normalized = cleaned
+      .replace(/\b(currently selected|selected|recommended)\b/gi, '')
+      .replace(/\s{2,}/g, ' ')
+      .trim();
+    if (!normalized) {
+      return '';
+    }
+    return normalized.replace(/\b([v])(\d+)/g, (_, prefix, digits) => `${prefix.toUpperCase()}${digits}`);
+  }
+
+  private toModelList(values: string[]): ChatModel[] {
+    const deduped = new Map<string, ChatModel>();
+    for (const value of values) {
+      const label = this.normalizeModelLabel(value);
+      if (!label) {
+        continue;
+      }
+      const id = label;
+      const key = id.toLowerCase();
+      if (!deduped.has(key)) {
+        deduped.set(key, { id, label });
+      }
+    }
+    return [{ id: 'auto', label: 'Auto' }, ...deduped.values()];
   }
 
   private escapeAttributeValue(value: string): string {

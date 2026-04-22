@@ -16,7 +16,8 @@
     "onStartupFinished",
     "onCommand:webagentCode.open",
     "onView:webagentCode.sessions",
-    "onView:webagentCode.activity"
+    "onView:webagentCode.activity",
+    "onView:webagentCode.bridge"
   ],
   "main": "./dist/extension.js",
   "contributes": {
@@ -80,6 +81,10 @@
         {
           "id": "webagentCode.activity",
           "name": "Activity"
+        },
+        {
+          "id": "webagentCode.bridge",
+          "name": "Bridge"
         }
       ]
     },

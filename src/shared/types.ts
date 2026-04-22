@@ -15,6 +15,7 @@ export interface ChatMessage {
   content: string;
   timestamp: number;
   modelId?: string;
+  rawContent?: string;
 }
 
 export interface LogEntry {

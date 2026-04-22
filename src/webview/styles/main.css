@@ -280,6 +280,22 @@ textarea {
   gap: 12px;
 }
 
+.header-tabs {
+  display: flex;
+  gap: 6px;
+}
+
+.tab-btn {
+  font-size: 12px;
+  padding: 6px 10px;
+  background: #171b22;
+}
+
+.tab-btn.active {
+  background: rgba(59, 130, 246, 0.25);
+  border-color: rgba(59, 130, 246, 0.7);
+}
+
 .debug-toggle {
   margin-left: auto;
   font-size: 12px;
@@ -321,11 +337,56 @@ textarea {
 
 .chat-bubble.assistant {
   align-self: flex-start;
-  background: #1f232c;
+  background: #1f232b;
+  position: relative;
 }
 
 .chat-content {
   word-break: break-word;
+  min-height: 20px;
+}
+
+.thinking-indicator-hint {
+  margin-top: 4px;
+  font-size: 11px;
+  color: var(--muted);
+  font-style: italic;
+  opacity: 0.7;
+}
+
+.thinking-section {
+  margin-top: 10px;
+  border-top: 1px solid var(--border);
+  padding-top: 8px;
+}
+
+.thinking-toggle-inline {
+  font-size: 11px;
+  padding: 4px 8px;
+  background: rgba(255, 255, 255, 0.05);
+  border-radius: 6px;
+  color: var(--muted);
+  transition: all 0.2s;
+}
+
+.thinking-toggle-inline:hover {
+  background: rgba(255, 255, 255, 0.1);
+  color: var(--text);
+}
+
+.thinking-content {
+  margin: 8px 0 0;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: #0a0c10;
+  padding: 10px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 11px;
+  line-height: 1.4;
+  white-space: pre-wrap;
+  max-height: 300px;
+  overflow: auto;
+  color: #a5b4fc;
 }
 
 .capacity-actions {
@@ -446,7 +507,7 @@ textarea {
   padding: 12px 16px 14px;
   background: #111419;
   display: grid;
-  grid-template-columns: 1fr auto auto;
+  grid-template-columns: 1fr auto auto auto;
   gap: 10px;
   align-items: end;
 }
@@ -533,10 +594,32 @@ textarea {
   border-color: rgba(59, 130, 246, 0.7);
 }
 
+.thinking-toggle {
+  height: fit-content;
+  background: #22242d;
+  transition: all 0.2s;
+}
+
+.thinking-toggle.active {
+  background: rgba(16, 185, 129, 0.2);
+  border-color: var(--success);
+  color: var(--success);
+  box-shadow: 0 0 10px rgba(52, 211, 153, 0.1);
+}
+
 .auth-warning {
   grid-column: 1 / -1;
   color: var(--warning);
   font-size: 12px;
+}
+
+.bridge-tab {
+  padding: 10px 16px 16px;
+  overflow: auto;
+}
+
+.bridge-tab-card {
+  max-width: 700px;
 }
 
 @media (max-width: 980px) {
@@ -549,5 +632,9 @@ textarea {
     max-height: 42vh;
     border-right: none;
     border-bottom: 1px solid var(--border);
+  }
+
+  .chat-composer {
+    grid-template-columns: 1fr 1fr;
   }
 }

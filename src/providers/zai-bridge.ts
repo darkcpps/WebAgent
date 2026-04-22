@@ -18,6 +18,53 @@ function asStringArray(value: unknown): string[] {
   return value.map((item) => (typeof item === 'string' ? item.trim() : '')).filter(Boolean);
 }
 
+function parseModelPayload(value: unknown): ChatModel[] {
+  const raw = (value && typeof value === 'object' && 'models' in (value as Record<string, unknown>))
+    ? (value as Record<string, unknown>).models
+    : value;
+
+  const entries = Array.isArray(raw) ? raw : [];
+  const models: ChatModel[] = [];
+  const seen = new Set<string>();
+
+  for (const entry of entries) {
+    if (typeof entry === 'string') {
+      const label = entry.trim();
+      if (!label || seen.has(label.toLowerCase())) {
+        continue;
+      }
+      seen.add(label.toLowerCase());
+      models.push({ id: label, label });
+      continue;
+    }
+
+    if (!entry || typeof entry !== 'object') {
+      continue;
+    }
+
+    const record = entry as Record<string, unknown>;
+    const idCandidate = [record.id, record.value, record.model, record.name, record.modelId].find((item) => typeof item === 'string') as string | undefined;
+    const labelCandidate = [record.label, record.name, record.displayName, record.model, record.id, record.text].find(
+      (item) => typeof item === 'string',
+    ) as string | undefined;
+
+    const id = (idCandidate || labelCandidate || '').trim();
+    const label = (labelCandidate || idCandidate || '').trim();
+    if (!id || !label) {
+      continue;
+    }
+
+    const key = id.toLowerCase();
+    if (seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    models.push({ id, label });
+  }
+
+  return models;
+}
+
 export class ZaiBridgeAdapter implements ProviderAdapter {
   readonly id = 'zai' as const;
   private readonly client: ZaiBridgeClient;
@@ -37,9 +84,10 @@ export class ZaiBridgeAdapter implements ProviderAdapter {
   async refreshModels(): Promise<ChatModel[]> {
     const result = await this.client.request('listModels');
     this.lastBridgeError = undefined;
-    const labels = asStringArray((result as { models?: unknown } | undefined)?.models ?? result);
+    const parsed = parseModelPayload((result as { models?: unknown } | undefined)?.models ?? result);
+    const labels = parsed.length > 0 ? parsed : asStringArray((result as { models?: unknown } | undefined)?.models ?? result).map((label) => ({ id: label, label }));
     if (labels.length > 0) {
-      this.modelsCache = [{ id: 'auto', label: 'Auto' }, ...labels.map((label) => ({ id: label, label }))];
+      this.modelsCache = [{ id: 'auto', label: 'Auto' }, ...labels];
     }
     return this.modelsCache;
   }

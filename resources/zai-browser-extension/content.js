@@ -16,10 +16,10 @@ const SELECTORS = {
   ],
   stop: ["button[aria-label*='Stop']", "button[data-testid*='stop']", "button:has(svg.size-5):not(.copy-response-button):not(.regenerate-response-button)"],
   newChat: ["button[aria-label*='New chat']", "a[href='/']"],
-  modelPicker: ["button[aria-label='Select a model']", "button[aria-label*='model']", "[role='combobox']"],
-  modelOption: ["button[aria-label='model-item'][data-value]", "button[data-value]", "[role='option']", "[role='menuitem']"],
+  modelPicker: ["button[aria-label='Select a model']", "button[aria-label*='model']", "button:has(svg.lucide-chevron-down)", "[role='combobox']"],
+  modelOption: ["button[aria-label='model-item'][data-value]", "button[data-value]", "[role='option']", "[role='menuitem']", ".model-item"],
   modelExpand: [],
-  signIn: ["a[href*='login']"],
+  signIn: ["a[href*='login']", "button:contains('Sign in')", "button:contains('Log in')"],
 };
 
 let activeStream = null;
@@ -77,7 +77,6 @@ function readLatestAssistantText() {
   const candidates = [];
   
   for (const container of containers) {
-    // Skip if this is actually a user message container
     if (container.closest("[class*='user'], [class*='human'], [class*='avatar-u'], [data-role='user']")) {
       continue;
     }
@@ -87,54 +86,58 @@ function readLatestAssistantText() {
       continue;
     }
 
-    // Instead of taking the whole parent, we look at children to filter out Thinking
-    const walker = document.createTreeWalker(container, NodeFilter.SHOW_ELEMENT);
-    let fullTextParts = [];
+    // We want to capture EVERYTHING, but identify thinking blocks.
+    // If we find a thinking block, we'll wrap its content in <think> tags.
+    const walker = document.createTreeWalker(container, NodeFilter.SHOW_ELEMENT | NodeFilter.SHOW_TEXT);
+    let parts = [];
     let node = walker.nextNode();
     
     while (node) {
-      const isThinkBlock = node.classList.contains("thinking-chain-container") || 
-                           node.classList.contains("thinking-block") ||
-                           node.closest(".thinking-chain-container") || 
-                           node.closest(".thinking-block");
-
-      if (isThinkBlock) {
-        node = walker.nextNode();
-        continue;
-      }
-                           
-      const hasThinkText = node.textContent?.includes("Thought Process") || 
-                           node.textContent?.includes("Thinking Chain");
-
-      // If it's a leaf-ish element or specific text-rich tag
-      if (!hasThinkText && (node.tagName === "P" || node.tagName === "LI")) {
-        const text = sanitizeText(node.innerText || "");
-        if (text) {
-          fullTextParts.push(text);
-          // After taking text from a P or LI, we skip its internal children to avoid duplicates
-          let next = walker.nextSibling();
-          if (!next) {
-             next = walker.nextNode(); // Fallback if no sibling
+      if (node.nodeType === Node.ELEMENT_NODE) {
+        const isThinkBlock = node.classList.contains("thinking-chain-container") || 
+                             node.classList.contains("thinking-block") ||
+                             node.classList.contains("thinking-chain-label");
+        
+        if (isThinkBlock) {
+          const text = sanitizeText(node.innerText || "");
+          if (text) {
+            parts.push(`<think>\n${text}\n</think>`);
+          }
+          // Skip children of this think block
+          let next = node.nextSibling;
+          while (!next && node.parentNode && node.parentNode !== container) {
+            node = node.parentNode;
+            next = node.nextSibling;
           }
           node = next;
           continue;
+        }
+      } else if (node.nodeType === Node.TEXT_NODE) {
+        const text = node.textContent;
+        if (text && text.trim()) {
+          parts.push(text);
         }
       }
       node = walker.nextNode();
     }
 
-    const joinedText = fullTextParts.join("\n\n").trim();
+    const joinedText = parts.join("").trim();
     if (joinedText) {
       candidates.push({ text: joinedText, bottom: rect.bottom });
     }
   }
 
   if (!candidates.length) {
-    // Fallback to simpler scraping if pinpointing failed
+    // Last resort: just get the text of the last assistant container
+    const containers = queryAll(SELECTORS.assistant);
+    if (containers.length > 0) {
+      const last = containers[containers.length - 1];
+      return sanitizeText(last.innerText || "");
+    }
     return "";
   }
 
-  candidates.sort((a, b) => b.bottom - a.bottom || b.text.length - a.text.length);
+  candidates.sort((a, b) => b.bottom - a.bottom);
   return candidates[0].text;
 }
 
@@ -384,20 +387,40 @@ async function runListModels() {
     return { models: [] };
   }
   picker.click();
-  await wait(200);
+  await wait(400); // Wait a bit longer for the menu to open
 
   const models = [];
-  for (const option of queryAll(SELECTORS.modelOption)) {
-    const value = sanitizeText(option.getAttribute("data-value") || option.innerText || "");
-    if (!value || value.length < 2 || value.length > 80) {
+  const seen = new Set();
+  const options = queryAll(SELECTORS.modelOption);
+  
+  // If no options found, try to find buttons inside the popover/menu
+  const candidates = options.length > 0 ? options : Array.from(document.querySelectorAll("[role='menu'] button, [role='listbox'] button, .popover button"));
+
+  for (const option of candidates) {
+    const id = sanitizeText(option.getAttribute("data-value") || option.getAttribute("id") || "");
+    const labelText = sanitizeText((option.innerText || "").split(/\r?\n/)[0] || "");
+    const label = labelText || id;
+    
+    if (!label || label.length < 2 || label.length > 80) {
       continue;
     }
-    if (!models.includes(value)) {
-      models.push(value);
+
+    const key = (id || label).toLowerCase();
+    if (seen.has(key)) {
+      continue;
     }
+    seen.add(key);
+    
+    models.push({
+      id: id || label,
+      label,
+    });
   }
 
-  document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
+  // Try to close the picker
+  document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true, keyCode: 27 }));
+  await wait(100);
+  
   return { models: models.slice(0, 60) };
 }
 

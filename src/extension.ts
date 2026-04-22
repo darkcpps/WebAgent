@@ -9,6 +9,7 @@ import { SessionStore } from './storage/sessionStore';
 import { TerminalRunner } from './terminal/runner';
 import { SessionTreeProvider } from './ui/tree/sessionTreeProvider';
 import { ActivityTreeProvider } from './ui/tree/activityTreeProvider';
+import { BridgeTreeProvider } from './ui/tree/bridgeTreeProvider';
 import { DiffPreviewService } from './services/diffPreviewService';
 import { BridgeCompanionManager } from './services/bridgeCompanionManager';
 import { WebAgentPanel } from './services/webviewPanel';
@@ -229,6 +230,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
           role: 'assistant',
           content: 'Thinking...',
           modelId: modelId && modelId !== 'auto' ? modelId : undefined,
+          rawContent: '',
         });
         sessions.setStatus(session.id, 'running');
 
@@ -305,13 +307,19 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 
             const responseText = await collectProviderText(session.id, providerId, (delta) => {
               if (assistantMessage) {
-                sessions.updateChatMessage(session.id, assistantMessage.id, { content: sanitizeResponse(delta) || 'Thinking...' });
+                sessions.updateChatMessage(session.id, assistantMessage.id, {
+                  content: sanitizeResponse(delta) || 'Thinking...',
+                  rawContent: delta,
+                });
               }
             });
             const cleaned = cleanFinalResponse(responseText);
             sessions.appendRawResponse(session.id, cleaned);
             if (assistantMessage) {
-              sessions.updateChatMessage(session.id, assistantMessage.id, { content: cleaned });
+              sessions.updateChatMessage(session.id, assistantMessage.id, {
+                content: cleaned,
+                rawContent: responseText,
+              });
             }
             // Always capture the browser URL after the response and lock it to this session.
             // Z.ai creates the /c/UUID path during response generation.
@@ -333,6 +341,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
           const repoContext = await workspaceContext.build(chatPrompt);
           const toolResults: string[] = [];
           let finalText = '';
+          let lastRawResponse = '';
 
           for (let round = 0; round < 5; round += 1) {
             const prompt = buildProviderPrompt(chatPrompt, repoContext, toolResults);
@@ -344,9 +353,11 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
                 const preview = sanitizeResponse(delta) || 'Thinking...';
                 sessions.updateChatMessage(session.id, assistantMessage.id, {
                   content: preview,
+                  rawContent: delta,
                 });
               }
             });
+            lastRawResponse = responseText;
             
             const cleaned = cleanFinalResponse(responseText, { preferJson: true });
             sessions.appendRawResponse(session.id, cleaned);
@@ -357,8 +368,13 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
             } catch {
               try {
                 parsed = parser.parse(cleaned);
-              } catch {
-                finalText = cleaned;
+              } catch (parseError) {
+                finalText = cleanFinalResponse(responseText);
+                sessions.appendLog(session.id, {
+                  level: 'warning',
+                  source: 'agent',
+                  message: `Could not parse tool JSON in round ${round + 1}: ${parseError instanceof Error ? parseError.message : String(parseError)}`,
+                });
                 break;
               }
             }
@@ -383,6 +399,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
           if (assistantMessage) {
             sessions.updateChatMessage(session.id, assistantMessage.id, {
               content: finalText || 'Done.',
+              rawContent: lastRawResponse || finalText || '',
             });
           }
           const conversationId = await provider.getCurrentConversationId().catch(() => undefined);
@@ -478,10 +495,12 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 
   const sessionTreeProvider = new SessionTreeProvider(sessions);
   const activityTreeProvider = new ActivityTreeProvider(sessions);
+  const bridgeTreeProvider = new BridgeTreeProvider(bridgeCompanion, providers, sessions, getBridgeState);
 
   context.subscriptions.push(
     vscode.window.registerTreeDataProvider('webagentCode.sessions', sessionTreeProvider),
     vscode.window.registerTreeDataProvider('webagentCode.activity', activityTreeProvider),
+    vscode.window.registerTreeDataProvider('webagentCode.bridge', bridgeTreeProvider),
     vscode.commands.registerCommand('webagentCode.open', () => panel.show()),
     vscode.commands.registerCommand('webagentCode.startTask', async () => {
       panel.show();

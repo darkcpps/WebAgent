@@ -30,6 +30,8 @@ interface PanelCallbacks {
 }
 
 export class WebAgentPanel {
+  private panel?: vscode.WebviewPanel;
+  private readonly readyToastShown = new Set<ProviderId>();
   private lastBridgeState?: BridgeUiState;
   private bridgeRefreshInProgress = false;
 

@@ -40,6 +40,9 @@ export function App(): JSX.Element {
   const [providerId, setProviderId] = useState<WebviewState['providers'][number]>('zai');
   const [message, setMessage] = useState('');
   const [agentMode, setAgentMode] = useState(false);
+  const [showThinking, setShowThinking] = useState(false);
+  const [activeTab, setActiveTab] = useState<'chat' | 'bridge'>('chat');
+  const [expandedThinkingByMessage, setExpandedThinkingByMessage] = useState<Record<string, boolean>>({});
   const [modelByProvider, setModelByProvider] = useState<Record<string, string>>({});
   const [toast, setToast] = useState<{ level: 'info' | 'warning' | 'error' | 'success'; message: string }>();
   const [debugOpen, setDebugOpen] = useState(true);
@@ -182,6 +185,13 @@ export function App(): JSX.Element {
     sendMessage(previousUserMessage.content, modelOverride);
   };
 
+  const toggleThoughtDetails = (messageId: string) => {
+    setExpandedThinkingByMessage((prev) => ({
+      ...prev,
+      [messageId]: !prev[messageId],
+    }));
+  };
+
   return (
     <div className="chat-shell">
       <aside className="chat-sidebar">
@@ -223,50 +233,6 @@ export function App(): JSX.Element {
           </div>
         </div>
 
-        {providerId === 'zai' ? (
-          <div className="card compact bridge-card">
-            <div className="bridge-title">z.ai Bridge</div>
-            <div className="bridge-row">
-              <span>Transport</span>
-              <strong>{state.bridge.transport}</strong>
-            </div>
-            <div className="bridge-row">
-              <span>Companion</span>
-              <span className={`bridge-pill ${state.bridge.companionReachable ? 'ok' : 'bad'}`}>
-                {state.bridge.companionReachable ? 'reachable' : 'offline'}
-              </span>
-            </div>
-            <div className="bridge-row">
-              <span>Browser Link</span>
-              <span className={`bridge-pill ${state.bridge.browserConnected ? 'ok' : 'bad'}`}>
-                {state.bridge.browserConnected ? 'connected' : 'not connected'}
-              </span>
-            </div>
-            <div className="bridge-row">
-              <span>z.ai Ready</span>
-              <span className={`bridge-pill ${state.bridge.ready ? 'ok' : 'warn'}`}>{state.bridge.ready ? 'yes' : 'no'}</span>
-            </div>
-            <div className="bridge-row small">
-              <span>Auto-start</span>
-              <span>{state.bridge.autoStartCompanion ? 'on' : 'off'}</span>
-            </div>
-            <div className="bridge-row small">
-              <span>Owned process</span>
-              <span>{state.bridge.companionOwnedByExtension ? 'yes' : 'no'}</span>
-            </div>
-            {state.bridge.lastError ? <div className="bridge-error">{state.bridge.lastError}</div> : null}
-            <div className="bridge-buttons">
-              <button onClick={() => vscode.postMessage({ type: 'startBridgeCompanion' })}>Start</button>
-              <button onClick={() => vscode.postMessage({ type: 'restartBridgeCompanion' })}>Restart</button>
-              <button onClick={() => vscode.postMessage({ type: 'stopBridgeCompanion' })}>Stop</button>
-            </div>
-            <div className="bridge-buttons">
-              <button onClick={() => vscode.postMessage({ type: 'openZaiInBrowser' })}>Open z.ai</button>
-              <button onClick={() => vscode.postMessage({ type: 'openBridgeExtensionFolder' })}>Open Ext Folder</button>
-            </div>
-          </div>
-        ) : null}
-
         <div className="session-list">
           {state.sessions.map((session) => (
             <div key={session.id} className={`session-item ${session.id === activeSession?.id ? 'active' : ''}`}>
@@ -297,104 +263,193 @@ export function App(): JSX.Element {
           <div className="hero-subtitle">
             {providerId} | {selectedModelId}
           </div>
+          <div className="header-tabs">
+            <button className={activeTab === 'chat' ? 'tab-btn active' : 'tab-btn'} onClick={() => setActiveTab('chat')}>
+              Chat
+            </button>
+            <button className={activeTab === 'bridge' ? 'tab-btn active' : 'tab-btn'} onClick={() => setActiveTab('bridge')}>
+              Bridge
+            </button>
+          </div>
           <button className="debug-toggle" onClick={() => setDebugOpen((value) => !value)}>
             {debugOpen ? 'Hide Debug' : 'Show Debug'}
           </button>
         </header>
 
-        <section className="chat-scroll">
-          {activeSession?.chatHistory.length ? (
-            activeSession.chatHistory.map((entry, index) => (
-              <article key={entry.id} className={`chat-bubble ${entry.role}`}>
-                <div className="chat-content">
-                  <MarkdownContent content={entry.content || (entry.role === 'assistant' ? 'Thinking...' : '')} />
-                </div>
-                {entry.role === 'assistant' && isCapacityMessage(entry.content) ? (
-                  <div className="capacity-actions">
-                    <button onClick={() => onRegenerate(index, false)} disabled={isRunning || !isLoggedIn}>
-                      Regenerate with current model
+        {activeTab === 'chat' ? (
+          <>
+            <section className="chat-scroll">
+              {activeSession?.chatHistory.length ? (
+                activeSession.chatHistory.map((entry, index) => {
+                  const thoughtView = getThoughtView(entry.rawContent, entry.content);
+                  const thinkingExpanded = Boolean(expandedThinkingByMessage[entry.id]);
+                  const contentToRender =
+                    entry.role === 'assistant' && thoughtView.answer.trim().length > 0 ? thoughtView.answer : entry.content;
+
+                  return (
+                    <article key={entry.id} className={`chat-bubble ${entry.role}`}>
+                      <div 
+                        className="chat-content"
+                        onClick={() => {
+                          if (entry.role === 'assistant' && (thoughtView.hasThinking || thoughtView.live)) {
+                            toggleThoughtDetails(entry.id);
+                          }
+                        }}
+                        style={entry.role === 'assistant' && (thoughtView.hasThinking || thoughtView.live) ? { cursor: 'pointer' } : undefined}
+                      >
+                        <MarkdownContent content={contentToRender || (entry.role === 'assistant' ? 'Thinking...' : '')} />
+                        {entry.role === 'assistant' && thoughtView.hasThinking && !thinkingExpanded && !showThinking ? (
+                          <div className="thinking-indicator-hint">Click to show thinking...</div>
+                        ) : null}
+                      </div>
+                      {(showThinking || thinkingExpanded) && entry.role === 'assistant' && (thoughtView.hasThinking || thoughtView.live) ? (
+                        <div className="thinking-section">
+                          <button className="thinking-toggle-inline" onClick={() => toggleThoughtDetails(entry.id)}>
+                            {thinkingExpanded ? 'Hide Thinking' : 'Show Thinking'}
+                            {thoughtView.live ? ' (Live)' : ''}
+                          </button>
+                          {thinkingExpanded ? (
+                            <pre className="thinking-content">{thoughtView.thinking || 'Thinking...'}</pre>
+                          ) : null}
+                        </div>
+                      ) : null}
+                      {entry.role === 'assistant' && isCapacityMessage(entry.content) ? (
+                        <div className="capacity-actions">
+                          <button onClick={() => onRegenerate(index, false)} disabled={isRunning || !isLoggedIn}>
+                            Regenerate with current model
+                          </button>
+                          <button onClick={() => onRegenerate(index, true)} disabled={isRunning || !isLoggedIn}>
+                            Switch to GLM-5-Turbo
+                          </button>
+                        </div>
+                      ) : null}
+                    </article>
+                  );
+                })
+              ) : (
+                <div className="empty-state">Start a new chat and send first message.</div>
+              )}
+              {activeSession?.approvalRequest ? (
+                <div className="approval-card">
+                  <div className="approval-header">
+                    <strong>Action Approval Required</strong>
+                    <span className="action-type">{activeSession.approvalRequest.type}</span>
+                  </div>
+                  <div className="approval-summary">{activeSession.approvalRequest.summary}</div>
+                  {activeSession.approvalRequest.preview ? (
+                    <pre className="approval-preview">{activeSession.approvalRequest.preview}</pre>
+                  ) : null}
+                  <div className="approval-buttons">
+                    <button
+                      className="primary approve-btn"
+                      onClick={() =>
+                        vscode.postMessage({
+                          type: 'approve',
+                          sessionId: activeSession.id,
+                          actionId: activeSession.approvalRequest!.actionId,
+                        })
+                      }
+                    >
+                      Approve
                     </button>
-                    <button onClick={() => onRegenerate(index, true)} disabled={isRunning || !isLoggedIn}>
-                      Switch to GLM-5-Turbo
+                    <button
+                      className="secondary reject-btn"
+                      onClick={() =>
+                        vscode.postMessage({
+                          type: 'reject',
+                          sessionId: activeSession.id,
+                          actionId: activeSession.approvalRequest!.actionId,
+                        })
+                      }
+                    >
+                      Reject
                     </button>
                   </div>
-                ) : null}
-              </article>
-            ))
-          ) : (
-            <div className="empty-state">Start a new chat and send first message.</div>
-          )}
-          {activeSession?.approvalRequest ? (
-            <div className="approval-card">
-              <div className="approval-header">
-                <strong>Action Approval Required</strong>
-                <span className="action-type">{activeSession.approvalRequest.type}</span>
-              </div>
-              <div className="approval-summary">{activeSession.approvalRequest.summary}</div>
-              {activeSession.approvalRequest.preview ? (
-                <pre className="approval-preview">{activeSession.approvalRequest.preview}</pre>
+                </div>
               ) : null}
-              <div className="approval-buttons">
-                <button
-                  className="primary approve-btn"
-                  onClick={() =>
-                    vscode.postMessage({
-                      type: 'approve',
-                      sessionId: activeSession.id,
-                      actionId: activeSession.approvalRequest!.actionId,
-                    })
+            </section>
+
+            <footer className="chat-composer">
+              <textarea
+                rows={3}
+                placeholder="Message..."
+                value={message}
+                onChange={(event) => setMessage(event.target.value)}
+                onKeyDown={(event) => {
+                  if (event.key === 'Enter' && !event.shiftKey) {
+                    event.preventDefault();
+                    onSend();
                   }
-                >
-                  Approve
-                </button>
-                <button
-                  className="secondary reject-btn"
-                  onClick={() =>
-                    vscode.postMessage({
-                      type: 'reject',
-                      sessionId: activeSession.id,
-                      actionId: activeSession.approvalRequest!.actionId,
-                    })
-                  }
-                >
-                  Reject
-                </button>
+                }}
+              />
+              <button className="primary send-btn" disabled={!canSend} onClick={onSend}>
+                Send
+              </button>
+              <button className={`agent-toggle ${agentMode ? 'active' : ''}`} onClick={() => setAgentMode((value) => !value)}>
+                Agent Mode: {agentMode ? 'On' : 'Off'}
+              </button>
+              <button className={`thinking-toggle ${showThinking ? 'active' : ''}`} onClick={() => setShowThinking((value) => !value)}>
+                Thinking: {showThinking ? 'On' : 'Off'}
+              </button>
+              {!isLoggedIn ? (
+                <div className="auth-warning">
+                  {isBridgeMode
+                    ? state.bridge.companionReachable
+                      ? state.bridge.browserConnected
+                        ? `Sign in on ${providerId} before sending messages.`
+                        : 'Load/enable browser extension so bridge can connect.'
+                      : 'Bridge companion offline. Start/restart from Bridge tab.'
+                    : `Sign in on ${providerId} before sending messages.`}
+                </div>
+              ) : null}
+            </footer>
+          </>
+        ) : (
+          <section className="bridge-tab">
+            {providerId !== 'zai' ? <div className="empty-state">Select provider `zai` to use bridge controls.</div> : null}
+            <div className="card bridge-tab-card">
+              <div className="bridge-title">z.ai Bridge</div>
+              <div className="bridge-row">
+                <span>Transport</span>
+                <strong>{state.bridge.transport}</strong>
+              </div>
+              <div className="bridge-row">
+                <span>Companion</span>
+                <span className={`bridge-pill ${state.bridge.companionReachable ? 'ok' : 'bad'}`}>
+                  {state.bridge.companionReachable ? 'reachable' : 'offline'}
+                </span>
+              </div>
+              <div className="bridge-row">
+                <span>Browser Link</span>
+                <span className={`bridge-pill ${state.bridge.browserConnected ? 'ok' : 'bad'}`}>
+                  {state.bridge.browserConnected ? 'connected' : 'not connected'}
+                </span>
+              </div>
+              <div className="bridge-row">
+                <span>z.ai Ready</span>
+                <span className={`bridge-pill ${state.bridge.ready ? 'ok' : 'warn'}`}>{state.bridge.ready ? 'yes' : 'no'}</span>
+              </div>
+              <div className="bridge-row small">
+                <span>Auto-start</span>
+                <span>{state.bridge.autoStartCompanion ? 'on' : 'off'}</span>
+              </div>
+              <div className="bridge-row small">
+                <span>Owned process</span>
+                <span>{state.bridge.companionOwnedByExtension ? 'yes' : 'no'}</span>
+              </div>
+              {state.bridge.lastError ? <div className="bridge-error">{state.bridge.lastError}</div> : null}
+              <div className="bridge-buttons">
+                <button onClick={() => vscode.postMessage({ type: 'startBridgeCompanion' })}>Start</button>
+                <button onClick={() => vscode.postMessage({ type: 'restartBridgeCompanion' })}>Restart</button>
+                <button onClick={() => vscode.postMessage({ type: 'stopBridgeCompanion' })}>Stop</button>
+              </div>
+              <div className="bridge-buttons">
+                <button onClick={() => vscode.postMessage({ type: 'openZaiInBrowser' })}>Open z.ai</button>
+                <button onClick={() => vscode.postMessage({ type: 'openBridgeExtensionFolder' })}>Open Ext Folder</button>
               </div>
             </div>
-          ) : null}
-        </section>
-
-        <footer className="chat-composer">
-          <textarea
-            rows={3}
-            placeholder="Message..."
-            value={message}
-            onChange={(event) => setMessage(event.target.value)}
-            onKeyDown={(event) => {
-              if (event.key === 'Enter' && !event.shiftKey) {
-                event.preventDefault();
-                onSend();
-              }
-            }}
-          />
-          <button className="primary send-btn" disabled={!canSend} onClick={onSend}>
-            Send
-          </button>
-          <button className={`agent-toggle ${agentMode ? 'active' : ''}`} onClick={() => setAgentMode((value) => !value)}>
-            Agent Mode: {agentMode ? 'On' : 'Off'}
-          </button>
-          {!isLoggedIn ? (
-            <div className="auth-warning">
-              {isBridgeMode
-                ? state.bridge.companionReachable
-                  ? state.bridge.browserConnected
-                    ? `Sign in on ${providerId} before sending messages.`
-                    : 'Load/enable browser extension so bridge can connect.'
-                  : 'Bridge companion offline. Start/restart from z.ai Bridge card.'
-                : `Sign in on ${providerId} before sending messages.`}
-            </div>
-          ) : null}
-        </footer>
+          </section>
+        )}
 
         {debugOpen ? (
           <section className="debug-console">
@@ -419,6 +474,59 @@ export function App(): JSX.Element {
       </main>
     </div>
   );
+}
+
+interface ThoughtView {
+  answer: string;
+  thinking: string;
+  hasThinking: boolean;
+  live: boolean;
+}
+
+function getThoughtView(rawContent: string | undefined, fallbackAnswer: string): ThoughtView {
+  const raw = (rawContent || '').trim();
+  if (!raw) {
+    return {
+      answer: fallbackAnswer,
+      thinking: '',
+      hasThinking: false,
+      live: /thinking\.\.\./i.test(fallbackAnswer),
+    };
+  }
+
+  let working = raw;
+  const thinkingParts: string[] = [];
+
+  const taggedThinkRegex = /<(think|thought|reasoning|analysis)>([\s\S]*?)(?:<\/\1>|$)/gi;
+  working = working.replace(taggedThinkRegex, (_whole, _tag: string, content: string) => {
+    if (content.trim()) {
+      thinkingParts.push(content.trim());
+    }
+    return '';
+  });
+
+  const headingThinkRegex =
+    /(?:^|\n)(?:#{1,3}\s*)?(?:thinking|thought process|reasoning|analysis)\s*:?\s*([\s\S]*?)(?=\n(?:#{1,3}\s*)?(?:final answer|answer|response|result)\s*:|$)/gi;
+  working = working.replace(headingThinkRegex, (_whole, content: string) => {
+    if (content.trim()) {
+      thinkingParts.push(content.trim());
+    }
+    return '';
+  });
+
+  const answer = fallbackAnswer || working.trim();
+  let thinking = thinkingParts.join('\n\n').trim();
+  const live = /thinking\.\.\./i.test(fallbackAnswer) || /<(think|thought|reasoning|analysis)>/i.test(raw);
+  if (!thinking && /thinking\.\.\./i.test(fallbackAnswer) && raw) {
+    thinking = raw;
+  }
+
+  return {
+    answer,
+    thinking,
+    hasThinking: thinking.length > 0,
+    live,
+  };
 }
 
 function MarkdownContent({ content }: { content: string }): JSX.Element {

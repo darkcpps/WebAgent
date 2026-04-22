@@ -26,14 +26,9 @@ export function sanitizeResponse(text: string, options: SanitizeResponseOptions 
   let cleaned = text.trim();
 
   // 1. Remove XML-style thinking/thought tags first.
-  const unclosedTags = ['<think>', '<thought>', '<reasoning>', '<analysis>'];
-  if (unclosedTags.some(tag => cleaned.toLowerCase().includes(tag) && !cleaned.toLowerCase().includes(tag.replace('<', '</')))) {
-    return 'Thinking...';
-  }
-  cleaned = cleaned.replace(/<think>[\s\S]*?<\/think>/gi, '');
-  cleaned = cleaned.replace(/<thought>[\s\S]*?<\/thought>/gi, '');
-  cleaned = cleaned.replace(/<reasoning>[\s\S]*?<\/reasoning>/gi, '');
-  cleaned = cleaned.replace(/<analysis>[\s\S]*?<\/analysis>/gi, '');
+  // Instead of returning "Thinking..." if unclosed, we strip the tag and show what we have.
+  cleaned = cleaned.replace(/<(think|thought|reasoning|analysis)>([\s\S]*?)(?:<\/\1>|$)/gi, '');
+  
   cleaned = cleaned.replace(/<details[\s\S]*?<\/details>/gi, '');
   cleaned = cleaned.replace(/<summary>[\s\S]*?<\/summary>/gi, '');
 
