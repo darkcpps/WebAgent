@@ -1,0 +1,38 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "build",
+      "type": "shell",
+      "command": "npm.cmd",
+      "args": ["run", "build"],
+      "group": {
+        "kind": "build",
+        "isDefault": true
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "check",
+      "type": "shell",
+      "command": "npm.cmd",
+      "args": ["run", "check"],
+      "problemMatcher": []
+    },
+    {
+      "label": "watch",
+      "type": "shell",
+      "command": "npm.cmd",
+      "args": ["run", "watch"],
+      "isBackground": true,
+      "problemMatcher": []
+    },
+    {
+      "label": "package",
+      "type": "shell",
+      "command": "npm.cmd",
+      "args": ["run", "package"],
+      "problemMatcher": []
+    }
+  ]
+}

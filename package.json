@@ -1,0 +1,175 @@
+{
+  "name": "webagent-code",
+  "displayName": "WebAgent Code",
+  "description": "Use website-based AI chat providers as agentic coding assistants inside VS Code.",
+  "version": "0.1.0",
+  "publisher": "local",
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.95.0"
+  },
+  "categories": [
+    "Other",
+    "Programming Languages"
+  ],
+  "activationEvents": [
+    "onStartupFinished",
+    "onCommand:webagentCode.open",
+    "onView:webagentCode.sessions",
+    "onView:webagentCode.activity"
+  ],
+  "main": "./dist/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "webagentCode.open",
+        "title": "WebAgent Code: Open Panel"
+      },
+      {
+        "command": "webagentCode.startTask",
+        "title": "WebAgent Code: Start Task"
+      },
+      {
+        "command": "webagentCode.stopTask",
+        "title": "WebAgent Code: Stop Task"
+      },
+      {
+        "command": "webagentCode.loginProvider",
+        "title": "WebAgent Code: Login to Provider"
+      },
+      {
+        "command": "webagentCode.resetConversation",
+        "title": "WebAgent Code: Reset Provider Conversation"
+      },
+      {
+        "command": "webagentCode.startBridgeCompanion",
+        "title": "WebAgent Code: Start Bridge Companion"
+      },
+      {
+        "command": "webagentCode.stopBridgeCompanion",
+        "title": "WebAgent Code: Stop Bridge Companion"
+      },
+      {
+        "command": "webagentCode.restartBridgeCompanion",
+        "title": "WebAgent Code: Restart Bridge Companion"
+      },
+      {
+        "command": "webagentCode.approvePendingAction",
+        "title": "WebAgent Code: Approve Pending Action"
+      },
+      {
+        "command": "webagentCode.rejectPendingAction",
+        "title": "WebAgent Code: Reject Pending Action"
+      }
+    ],
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "webagentCode",
+          "title": "WebAgent Code",
+          "icon": "resources/icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "webagentCode": [
+        {
+          "id": "webagentCode.sessions",
+          "name": "Sessions"
+        },
+        {
+          "id": "webagentCode.activity",
+          "name": "Activity"
+        }
+      ]
+    },
+    "menus": {
+      "view/item/context": [
+        {
+          "command": "webagentCode.approvePendingAction",
+          "when": "view == webagentCode.activity && viewItem == pendingAction",
+          "group": "inline"
+        },
+        {
+          "command": "webagentCode.rejectPendingAction",
+          "when": "view == webagentCode.activity && viewItem == pendingAction",
+          "group": "inline"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "WebAgent Code",
+      "properties": {
+        "webagentCode.approvalMode": {
+          "type": "string",
+          "enum": [
+            "view-only",
+            "ask-before-action",
+            "auto-apply-safe-edits"
+          ],
+          "default": "ask-before-action",
+          "description": "Controls when WebAgent Code asks for approval before performing actions."
+        },
+        "webagentCode.maxFiles": {
+          "type": "number",
+          "default": 150,
+          "minimum": 10,
+          "description": "Maximum number of workspace files to consider while building repo context."
+        },
+        "webagentCode.includeHiddenFiles": {
+          "type": "boolean",
+          "default": false,
+          "description": "Whether hidden files should be considered during repo scans."
+        },
+        "webagentCode.transport.zai": {
+          "type": "string",
+          "enum": [
+            "bridge",
+            "playwright"
+          ],
+          "default": "bridge",
+          "description": "Transport for z.ai provider. Use bridge for local browser extension companion, or playwright fallback."
+        },
+        "webagentCode.bridge.autoReconnect": {
+          "type": "boolean",
+          "default": true,
+          "description": "Whether bridge transport should auto-reconnect to the local companion."
+        },
+        "webagentCode.bridge.requestTimeoutMs": {
+          "type": "number",
+          "default": 15000,
+          "minimum": 1000,
+          "description": "Request timeout in milliseconds for z.ai bridge RPC calls."
+        },
+        "webagentCode.bridge.autoStartCompanion": {
+          "type": "boolean",
+          "default": true,
+          "description": "Automatically start the local z.ai bridge companion when bridge transport is active."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "build": "node esbuild.js",
+    "watch": "node esbuild.js --watch",
+    "check": "tsc --noEmit",
+    "package": "npm run build && vsce package",
+    "bridge:companion": "node resources/zai-bridge-companion/server.js",
+    "bridge:doctor": "node resources/zai-bridge-companion/doctor.js"
+  },
+  "dependencies": {
+    "playwright": "^1.54.1",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "ws": "^8.18.3",
+    "zod": "^3.24.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.10",
+    "@types/react": "^18.3.12",
+    "@types/react-dom": "^18.3.1",
+    "@types/vscode": "^1.95.0",
+    "esbuild": "^0.24.2",
+    "typescript": "^5.7.3"
+  }
+}
