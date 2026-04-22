@@ -41,11 +41,12 @@ export function App(): JSX.Element {
   const [message, setMessage] = useState('');
   const [agentMode, setAgentMode] = useState(false);
   const [showThinking, setShowThinking] = useState(false);
-  const [activeTab, setActiveTab] = useState<'chat' | 'bridge'>('chat');
+  const [activeTab, setActiveTab] = useState<'chat' | 'bridge' | 'settings'>('chat');
   const [expandedThinkingByMessage, setExpandedThinkingByMessage] = useState<Record<string, boolean>>({});
   const [modelByProvider, setModelByProvider] = useState<Record<string, string>>({});
   const [toast, setToast] = useState<{ level: 'info' | 'warning' | 'error' | 'success'; message: string }>();
   const [debugOpen, setDebugOpen] = useState(true);
+  const [sessionContextMenu, setSessionContextMenu] = useState<{ sessionId: string; x: number; y: number } | null>(null);
   const hasPerformedStartupReadyCheck = useRef(false);
 
   useEffect(() => {
@@ -102,6 +103,24 @@ export function App(): JSX.Element {
     return () => window.clearTimeout(timeoutId);
   }, [toast]);
 
+  useEffect(() => {
+    const closeMenu = () => setSessionContextMenu(null);
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        setSessionContextMenu(null);
+      }
+    };
+
+    window.addEventListener('click', closeMenu);
+    window.addEventListener('scroll', closeMenu, true);
+    window.addEventListener('keydown', closeOnEscape);
+    return () => {
+      window.removeEventListener('click', closeMenu);
+      window.removeEventListener('scroll', closeMenu, true);
+      window.removeEventListener('keydown', closeOnEscape);
+    };
+  }, []);
+
   const providerModels = useMemo(
     () => state.providerModels[providerId] ?? [{ id: 'auto', label: 'Auto' }],
     [providerId, state.providerModels],
@@ -131,9 +150,50 @@ export function App(): JSX.Element {
   const isLoggedIn = isBridgeMode ? state.bridge.ready : state.providerReady[providerId];
   const canSend = message.trim().length > 0 && !isRunning && isLoggedIn;
   const debugLogs = activeSession?.logs ?? [];
+  const autoApproveEnabled = state.approvalMode === 'auto-apply-safe-edits';
+  const modifiedActionTypes = new Set(['edit_file', 'create_file', 'delete_file', 'rename_file']);
+  const hasCompletedCodeChanges = Boolean(
+    activeSession?.actionHistory.some((action) => action.status === 'done' && modifiedActionTypes.has(action.type)),
+  );
+  const latestAssistantMessageId =
+    activeSession?.chatHistory
+      .filter((entry) => entry.role === 'assistant')
+      .at(-1)?.id ?? undefined;
+  const composerPlaceholder = agentMode
+    ? 'Describe an agent task (files, goals, constraints)...'
+    : 'Ask a question about your code, recent changes, or next steps...';
 
   const onNewChat = () => {
     vscode.postMessage({ type: 'newChat', providerId });
+  };
+
+  const onDeleteSession = (sessionId: string) => {
+    setSessionContextMenu(null);
+    vscode.postMessage({ type: 'deleteChat', sessionId });
+  };
+
+  const onOpenSessionContextMenu = (event: React.MouseEvent, sessionId: string) => {
+    event.preventDefault();
+    event.stopPropagation();
+    const menuWidth = 150;
+    const menuHeight = 46;
+    const x = Math.min(event.clientX, window.innerWidth - menuWidth - 8);
+    const y = Math.min(event.clientY, window.innerHeight - menuHeight - 8);
+    setSessionContextMenu({ sessionId, x: Math.max(8, x), y: Math.max(8, y) });
+  };
+
+  const onSetAutoApprove = (enabled: boolean) => {
+    vscode.postMessage({
+      type: 'setApprovalMode',
+      mode: enabled ? 'auto-apply-safe-edits' : 'ask-before-action',
+    });
+  };
+
+  const onPreviewChanges = () => {
+    if (!activeSession) {
+      return;
+    }
+    vscode.postMessage({ type: 'previewSessionChanges', sessionId: activeSession.id });
   };
 
   const sendMessage = (content: string, modelOverride?: string) => {
@@ -240,20 +300,18 @@ export function App(): JSX.Element {
         <div className="session-list">
           <div className="list-title">Recent Chats</div>
           {state.sessions.map((session) => (
-            <div key={session.id} className={`session-item ${session.id === activeSession?.id ? 'active' : ''}`}>
+            <div
+              key={session.id}
+              className={`session-item ${session.id === activeSession?.id ? 'active' : ''}`}
+              onContextMenu={(event) => onOpenSessionContextMenu(event, session.id)}
+              title="Right-click to remove from IDE"
+            >
               <button className="session-open" onClick={() => vscode.postMessage({ type: 'setActiveSession', sessionId: session.id })}>
                 <div className="session-top">
                   <span className="session-provider">{session.providerId}</span>
                   <span className={`status-dot ${session.status}`} title={session.status}></span>
                 </div>
                 <div className="session-task">{session.chatHistory.at(-1)?.content?.slice(0, 44) || 'Empty session...'}</div>
-              </button>
-              <button
-                className="session-delete"
-                title="Delete chat"
-                onClick={() => vscode.postMessage({ type: 'deleteChat', sessionId: session.id })}
-              >
-                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M3 6h18M19 6v14a2 2 0 01-2 2H7a2 2 0 01-2-2V6m3 0V4a2 2 0 012-2h4a2 2 0 012 2v2"></path></svg>
               </button>
             </div>
           ))}
@@ -270,6 +328,9 @@ export function App(): JSX.Element {
             </button>
             <button className={activeTab === 'bridge' ? 'tab-btn active' : 'tab-btn'} onClick={() => setActiveTab('bridge')}>
                Bridge Settings
+            </button>
+            <button className={activeTab === 'settings' ? 'tab-btn active' : 'tab-btn'} onClick={() => setActiveTab('settings')}>
+               Settings
             </button>
           </div>
           <button className="debug-toggle" onClick={() => setDebugOpen((value) => !value)}>
@@ -327,6 +388,16 @@ export function App(): JSX.Element {
                             </button>
                           </div>
                         ) : null}
+                        {entry.role === 'assistant' &&
+                        !isRunning &&
+                        hasCompletedCodeChanges &&
+                        latestAssistantMessageId === entry.id ? (
+                          <div className="response-actions">
+                            <button className="glass-btn preview-changes-btn" onClick={onPreviewChanges}>
+                              Preview
+                            </button>
+                          </div>
+                        ) : null}
                       </div>
                     </article>
                   );
@@ -372,11 +443,11 @@ export function App(): JSX.Element {
             </section>
 
             <footer className="chat-composer">
-              <div className="composer-input-area">
+               <div className="composer-input-area">
                  <textarea
                    rows={1}
-                   placeholder="Type a message or /agent to start a task..."
-                   value={message}
+                    placeholder={composerPlaceholder}
+                    value={message}
                    onChange={(event) => {
                      event.target.style.height = 'auto';
                      event.target.style.height = (event.target.scrollHeight < 200 ? event.target.scrollHeight : 200) + 'px';
@@ -391,11 +462,11 @@ export function App(): JSX.Element {
                    }}
                  />
                  <button className="primary send-btn" disabled={!canSend} onClick={() => { onSend(); }}>
-                   <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><line x1="22" y1="2" x2="11" y2="13"></line><polygon points="22 2 15 22 11 13 2 9 22 2"></polygon></svg>
-                 </button>
-              </div>
+                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><line x1="22" y1="2" x2="11" y2="13"></line><polygon points="22 2 15 22 11 13 2 9 22 2"></polygon></svg>
+                  </button>
+               </div>
 
-              <div className="composer-toolbar">
+               <div className="composer-toolbar">
                 <label className="toggle-switch">
                   <input type="checkbox" checked={agentMode} onChange={(e) => setAgentMode(e.target.checked)} />
                   <span className="slider"></span>
@@ -422,7 +493,7 @@ export function App(): JSX.Element {
               </div>
             </footer>
           </>
-        ) : (
+        ) : activeTab === 'bridge' ? (
           <section className="bridge-tab">
             {providerId !== 'zai' ? (
               <div className="empty-state">Select provider `zai` to view bridge tools.</div>
@@ -467,6 +538,25 @@ export function App(): JSX.Element {
               </div>
             )}
           </section>
+        ) : (
+          <section className="settings-tab">
+            <div className="card settings-card glass-panel">
+              <div className="settings-title">Workflow Settings</div>
+              <div className="settings-row">
+                <div>
+                  <div className="settings-label">Auto Approve</div>
+                  <div className="settings-help">When enabled, safe edits run without manual Approve clicks.</div>
+                </div>
+                <label className="toggle-switch">
+                  <input type="checkbox" checked={autoApproveEnabled} onChange={(e) => onSetAutoApprove(e.target.checked)} />
+                  <span className="slider"></span>
+                </label>
+              </div>
+              <div className="settings-note">
+                Sensitive paths and dangerous commands are still protected by safety rules.
+              </div>
+            </div>
+          </section>
         )}
 
         {debugOpen && (
@@ -487,6 +577,15 @@ export function App(): JSX.Element {
             </div>
           </section>
         )}
+        {sessionContextMenu ? (
+          <div
+            className="session-context-menu"
+            style={{ left: sessionContextMenu.x, top: sessionContextMenu.y }}
+            onClick={(event) => event.stopPropagation()}
+          >
+            <button onClick={() => onDeleteSession(sessionContextMenu.sessionId)}>Remove</button>
+          </div>
+        ) : null}
       </main>
     </div>
   );
@@ -545,6 +644,149 @@ function getThoughtView(rawContent: string | undefined, fallbackAnswer: string):
   };
 }
 
+function renderInlineMarkdown(text: string, keyPrefix: string): React.ReactNode[] {
+  const nodes: React.ReactNode[] = [];
+  const tokenRegex = /(`[^`]+`|\*\*\*[^*]+?\*\*\*|\*\*[^*]+?\*\*|\*[^*]+?\*|__[^_]+?__|_[^_]+?_)/g;
+  let lastIndex = 0;
+  let tokenIndex = 0;
+  let match: RegExpExecArray | null;
+
+  while ((match = tokenRegex.exec(text)) !== null) {
+    const plain = text.slice(lastIndex, match.index);
+    if (plain) {
+      nodes.push(<React.Fragment key={`${keyPrefix}-plain-${tokenIndex}`}>{plain}</React.Fragment>);
+    }
+
+    const token = match[0];
+    const delimiterLength = token.startsWith('`')
+      ? 1
+      : token.startsWith('***') || token.startsWith('___')
+      ? 3
+      : token.startsWith('**') || token.startsWith('__')
+      ? 2
+      : 1;
+    const inner = token.slice(delimiterLength, -delimiterLength);
+    if (token.startsWith('`')) {
+      nodes.push(
+        <code key={`${keyPrefix}-code-${tokenIndex}`} className="md-inline-code">
+          {inner}
+        </code>,
+      );
+    } else if (token.startsWith('***') || token.startsWith('___')) {
+      nodes.push(
+        <strong key={`${keyPrefix}-strong-${tokenIndex}`}>
+          <em>{inner}</em>
+        </strong>,
+      );
+    } else if (token.startsWith('**') || token.startsWith('__')) {
+      nodes.push(<strong key={`${keyPrefix}-strong-${tokenIndex}`}>{inner}</strong>);
+    } else {
+      nodes.push(<em key={`${keyPrefix}-em-${tokenIndex}`}>{inner}</em>);
+    }
+
+    lastIndex = tokenRegex.lastIndex;
+    tokenIndex += 1;
+  }
+
+  const suffix = text.slice(lastIndex);
+  if (suffix) {
+    nodes.push(<React.Fragment key={`${keyPrefix}-suffix`}>{suffix}</React.Fragment>);
+  }
+
+  return nodes;
+}
+
+function renderTextBlock(text: string, blockIndex: number): React.ReactNode[] {
+  const lines = text.split(/\r?\n/);
+  const nodes: React.ReactNode[] = [];
+  let i = 0;
+  let nodeIndex = 0;
+
+  while (i < lines.length) {
+    const line = lines[i];
+    const trimmed = line.trim();
+    if (!trimmed) {
+      i += 1;
+      continue;
+    }
+
+    const headingMatch = trimmed.match(/^(#{1,6})\s+(.+)$/);
+    if (headingMatch) {
+      const level = Math.min(headingMatch[1].length, 6);
+      const textValue = headingMatch[2].trim();
+      const className = `md-heading md-h${level}`;
+      const key = `md-${blockIndex}-heading-${nodeIndex}`;
+      if (level === 1) nodes.push(<h1 key={key} className={className}>{renderInlineMarkdown(textValue, key)}</h1>);
+      else if (level === 2) nodes.push(<h2 key={key} className={className}>{renderInlineMarkdown(textValue, key)}</h2>);
+      else if (level === 3) nodes.push(<h3 key={key} className={className}>{renderInlineMarkdown(textValue, key)}</h3>);
+      else if (level === 4) nodes.push(<h4 key={key} className={className}>{renderInlineMarkdown(textValue, key)}</h4>);
+      else if (level === 5) nodes.push(<h5 key={key} className={className}>{renderInlineMarkdown(textValue, key)}</h5>);
+      else nodes.push(<h6 key={key} className={className}>{renderInlineMarkdown(textValue, key)}</h6>);
+      i += 1;
+      nodeIndex += 1;
+      continue;
+    }
+
+    if (/^\s*[-*+]\s+/.test(line)) {
+      const items: string[] = [];
+      while (i < lines.length && /^\s*[-*+]\s+/.test(lines[i])) {
+        items.push(lines[i].replace(/^\s*[-*+]\s+/, '').trim());
+        i += 1;
+      }
+      const key = `md-${blockIndex}-ul-${nodeIndex}`;
+      nodes.push(
+        <ul key={key} className="md-list">
+          {items.map((item, itemIndex) => (
+            <li key={`${key}-li-${itemIndex}`}>{renderInlineMarkdown(item, `${key}-li-${itemIndex}`)}</li>
+          ))}
+        </ul>,
+      );
+      nodeIndex += 1;
+      continue;
+    }
+
+    if (/^\s*\d+\.\s+/.test(line)) {
+      const items: string[] = [];
+      while (i < lines.length && /^\s*\d+\.\s+/.test(lines[i])) {
+        items.push(lines[i].replace(/^\s*\d+\.\s+/, '').trim());
+        i += 1;
+      }
+      const key = `md-${blockIndex}-ol-${nodeIndex}`;
+      nodes.push(
+        <ol key={key} className="md-list md-list-ordered">
+          {items.map((item, itemIndex) => (
+            <li key={`${key}-li-${itemIndex}`}>{renderInlineMarkdown(item, `${key}-li-${itemIndex}`)}</li>
+          ))}
+        </ol>,
+      );
+      nodeIndex += 1;
+      continue;
+    }
+
+    const paragraph: string[] = [];
+    while (
+      i < lines.length &&
+      lines[i].trim() &&
+      !/^(#{1,6})\s+/.test(lines[i].trim()) &&
+      !/^\s*[-*+]\s+/.test(lines[i]) &&
+      !/^\s*\d+\.\s+/.test(lines[i])
+    ) {
+      paragraph.push(lines[i].trim());
+      i += 1;
+    }
+    const paragraphText = paragraph.join(' ');
+    const key = `md-${blockIndex}-p-${nodeIndex}`;
+    nodes.push(
+      <p key={key} className="md-paragraph">
+        {renderInlineMarkdown(paragraphText, key)}
+      </p>,
+    );
+    nodeIndex += 1;
+  }
+
+  return nodes;
+}
+
 function MarkdownContent({ content }: { content: string }): JSX.Element {
   const blocks: Array<{ type: 'text' | 'code'; text: string; lang?: string }> = [];
   const regex = /```([a-zA-Z0-9_-]+)?\n([\s\S]*?)```/g;
@@ -580,9 +822,7 @@ function MarkdownContent({ content }: { content: string }): JSX.Element {
             <code>{block.text}</code>
           </pre>
         ) : (
-          <div key={`text-${index}`} className="md-text">
-            {block.text}
-          </div>
+          <div key={`text-${index}`} className="md-text">{renderTextBlock(block.text, index)}</div>
         ),
       )}
     </>

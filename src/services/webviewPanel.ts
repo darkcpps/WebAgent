@@ -27,6 +27,8 @@ interface PanelCallbacks {
   restartBridgeCompanion(): Promise<void>;
   openBridgeExtensionFolder(): Promise<void>;
   openZaiInBrowser(): Promise<void>;
+  setApprovalMode(mode: ApprovalMode): Promise<void>;
+  previewSessionChanges(sessionId: string): Promise<void>;
 }
 
 export class WebAgentPanel {
@@ -174,6 +176,14 @@ export class WebAgentPanel {
           return;
         case 'openZaiInBrowser':
           await this.callbacks.openZaiInBrowser();
+          return;
+        case 'setApprovalMode':
+          await this.callbacks.setApprovalMode(message.mode);
+          await this.postState();
+          await this.postToast('success', `Approval mode set to ${message.mode}.`);
+          return;
+        case 'previewSessionChanges':
+          await this.callbacks.previewSessionChanges(message.sessionId);
           return;
       }
     } catch (error) {

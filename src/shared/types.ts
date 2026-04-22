@@ -40,6 +40,7 @@ export interface SessionState {
   id: string;
   providerId: ProviderId;
   providerSessionId?: string;
+  lastPromptMode?: 'chat' | 'agent';
   task: string;
   workspaceRoot?: string;
   status: SessionStatus;

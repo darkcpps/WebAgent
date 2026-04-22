@@ -17,7 +17,7 @@ const SELECTORS = {
   stop: ["button[aria-label*='Stop']", "button[data-testid*='stop']", "button:has(svg.size-5):not(.copy-response-button):not(.regenerate-response-button)"],
   newChat: ["button[aria-label*='New chat']", "a[href='/']"],
   modelPicker: ["button[aria-label='Select a model']", "button[aria-label*='model']", "button:has(svg.lucide-chevron-down)", "[role='combobox']"],
-  modelOption: ["button[aria-label='model-item'][data-value]", "button[data-value]", "[role='option']", "[role='menuitem']", ".model-item"],
+  modelOption: ["div[role='option']", "li[role='option']", "button[aria-label='model-item'][data-value]", "button[data-value]", "[role='option']", "[role='menuitem']", ".model-item"],
   modelExpand: [],
   signIn: ["a[href*='login']", "button:contains('Sign in')", "button:contains('Log in')"],
 };
@@ -86,58 +86,64 @@ function readLatestAssistantText() {
       continue;
     }
 
-    // We want to capture EVERYTHING, but identify thinking blocks.
-    // If we find a thinking block, we'll wrap its content in <think> tags.
-    const walker = document.createTreeWalker(container, NodeFilter.SHOW_ELEMENT | NodeFilter.SHOW_TEXT);
-    let parts = [];
-    let node = walker.nextNode();
+    // Work on a detached clone to not mess up UI
+    const clone = container.cloneNode(true);
+    let thoughtText = "";
     
-    while (node) {
-      if (node.nodeType === Node.ELEMENT_NODE) {
-        const isThinkBlock = node.classList.contains("thinking-chain-container") || 
-                             node.classList.contains("thinking-block") ||
-                             node.classList.contains("thinking-chain-label");
-        
-        if (isThinkBlock) {
-          const text = sanitizeText(node.innerText || "");
-          if (text) {
-            parts.push(`<think>\n${text}\n</think>`);
-          }
-          // Skip children of this think block
-          let next = node.nextSibling;
-          while (!next && node.parentNode && node.parentNode !== container) {
-            node = node.parentNode;
-            next = node.nextSibling;
-          }
-          node = next;
-          continue;
-        }
-      } else if (node.nodeType === Node.TEXT_NODE) {
-        const text = node.textContent;
-        if (text && text.trim()) {
-          parts.push(text);
+    // Find thinking blocks by CSS class
+    const thinkBlocks = clone.querySelectorAll(".thinking-block, .thinking-chain-container");
+    for (const block of thinkBlocks) {
+      // The user specified that the actual thought process inside is often inside a blockquote
+      const quote = block.querySelector("blockquote");
+      if (quote) {
+        thoughtText += quote.innerText + "\n\n";
+      } else {
+        thoughtText += block.innerText + "\n\n";
+      }
+      block.remove(); // Remove it from the clone so it doesn't appear in finalText
+    }
+    
+    // Find any remaining "Thought Process" text labels just in case and remove their wrappers
+    const labelWalker = document.createTreeWalker(clone, NodeFilter.SHOW_TEXT);
+    let n = labelWalker.nextNode();
+    while (n) {
+      const text = (n.nodeValue || "").trim();
+      if (text === "Thought Process" || text === "Thinking Chain") {
+        let p = n.parentElement;
+        if (p) {
+           let marker = p;
+           while (marker && marker.parentElement && marker.parentElement !== clone) {
+             if (marker.nextElementSibling) {
+               thoughtText += marker.nextElementSibling.innerText + "\n\n";
+               marker.nextElementSibling.remove();
+               break;
+             }
+             marker = marker.parentElement;
+           }
+           p.remove();
         }
       }
-      node = walker.nextNode();
+      n = labelWalker.nextNode();
     }
-
-    const joinedText = parts.join("").trim();
-    if (joinedText) {
-      candidates.push({ text: joinedText, bottom: rect.bottom });
+    
+    // Extract the remaining text as final answer
+    let finalText = clone.innerText || "";
+    
+    // Synthesize them cleanly
+    let synthesized = "";
+    if (thoughtText.trim()) {
+      synthesized += `<think>\n${thoughtText.trim()}\n</think>\n\n`;
     }
+    synthesized += finalText.trim();
+    
+    candidates.push({ text: synthesized.trim(), bottom: rect.bottom });
   }
 
   if (!candidates.length) {
-    // Last resort: just get the text of the last assistant container
-    const containers = queryAll(SELECTORS.assistant);
-    if (containers.length > 0) {
-      const last = containers[containers.length - 1];
-      return sanitizeText(last.innerText || "");
-    }
     return "";
   }
 
-  candidates.sort((a, b) => b.bottom - a.bottom);
+  candidates.sort((a, b) => b.bottom - a.bottom || b.text.length - a.text.length);
   return candidates[0].text;
 }
 
@@ -175,28 +181,42 @@ function maybeEmitMetadata(streamState) {
 }
 
 function maybeEmitDelta(streamState, freshText) {
-  if (!freshText) {
+  const normalized = freshText || "";
+  if (!normalized) {
     maybeEmitMetadata(streamState);
+    streamState.stableTicks += 1;
     return;
   }
 
   maybeEmitMetadata(streamState);
 
-  if (freshText === streamState.lastText) {
+  if (!streamState.hasNewContent && normalized === streamState.initialText) {
     streamState.stableTicks += 1;
     return;
   }
 
-  let delta = "";
-  if (freshText.startsWith(streamState.lastText)) {
-    delta = freshText.slice(streamState.lastText.length);
-  } else if (!streamState.lastText) {
-    delta = freshText;
-  } else {
-    delta = freshText;
+  if (normalized === streamState.lastText) {
+    streamState.stableTicks += 1;
+    return;
   }
 
-  streamState.lastText = freshText;
+  if (!streamState.hasNewContent) {
+    streamState.hasNewContent = true;
+    if (streamState.initialText && normalized.startsWith(streamState.initialText)) {
+      streamState.lastText = streamState.initialText;
+    }
+  }
+
+  let delta = "";
+  if (streamState.lastText && normalized.startsWith(streamState.lastText)) {
+    delta = normalized.slice(streamState.lastText.length);
+  } else if (!streamState.lastText) {
+    delta = normalized;
+  } else {
+    delta = normalized;
+  }
+
+  streamState.lastText = normalized;
   streamState.stableTicks = 0;
 
   if (delta) {
@@ -207,13 +227,57 @@ function maybeEmitDelta(streamState, freshText) {
   }
 }
 
+let apiInterceptedText = null;
+let apiInterceptedReasoning = "";
+let apiInterceptedContent = "";
+let isApiStreamFinished = false;
+let lastApiStartAt = 0;
+
+window.addEventListener('message', (event) => {
+    if (event.data?.type === 'ZAI_API_START') {
+        lastApiStartAt = Date.now();
+        apiInterceptedReasoning = "";
+        apiInterceptedContent = "";
+        apiInterceptedText = "";
+        isApiStreamFinished = false;
+    } else if (event.data?.type === 'ZAI_API_CHUNK') {
+        const payload = event.data.data;
+        if (payload?.type === "chat:completion" && payload.data) {
+             const chunkData = payload.data;
+             if (chunkData.phase === "thinking" && chunkData.delta_content) {
+                 apiInterceptedReasoning += chunkData.delta_content;
+             } else if (chunkData.phase === "answer" && chunkData.delta_content) {
+                 apiInterceptedContent += chunkData.delta_content;
+             } else if (chunkData.phase === "done" && chunkData.done === true) {
+                 isApiStreamFinished = true;
+             }
+             
+             let synthesized = "";
+             if (apiInterceptedReasoning) {
+                 synthesized += `<think>\n${apiInterceptedReasoning.trim()}\n</think>\n\n`;
+             }
+             if (apiInterceptedContent) {
+                 synthesized += apiInterceptedContent.trim();
+             }
+             apiInterceptedText = synthesized.trim();
+        }
+    } else if (event.data?.type === 'ZAI_API_DONE' || event.data?.type === 'ZAI_API_ERROR') {
+        isApiStreamFinished = true;
+    }
+});
+
 function startStreaming() {
   stopActiveStream();
+
   const streamId = randomId("stream");
+  const initialText = readLatestAssistantText();
   const streamState = {
     streamId,
-    lastText: readLatestAssistantText(),
+    initialText,
+    lastText: initialText,
     lastConversationId: parseConversationId(),
+    hasNewContent: false,
+    sawGenerating: false,
     stableTicks: 0,
     observer: null,
     tickTimer: null,
@@ -221,7 +285,9 @@ function startStreaming() {
   };
 
   streamState.observer = new MutationObserver(() => {
-    maybeEmitDelta(streamState, readLatestAssistantText());
+    if (apiInterceptedText === null) {
+      maybeEmitDelta(streamState, readLatestAssistantText());
+    }
   });
   streamState.observer.observe(document.body, {
     childList: true,
@@ -230,27 +296,45 @@ function startStreaming() {
   });
 
   streamState.tickTimer = setInterval(() => {
-    const text = readLatestAssistantText();
+    const generating = stopButtonVisible();
+    if (generating) {
+      streamState.sawGenerating = true;
+    }
+
+    const text = apiInterceptedText !== null ? apiInterceptedText : readLatestAssistantText();
     maybeEmitDelta(streamState, text);
 
-    const generating = stopButtonVisible();
-    if (!generating && streamState.lastText && streamState.stableTicks >= 3) {
-      emitStreamEvent(streamState.streamId, {
-        type: "done",
-        fullText: streamState.lastText,
-      });
-      stopActiveStream();
-      return;
-    }
+    if (apiInterceptedText !== null) {
+      if (isApiStreamFinished) {
+        emitStreamEvent(streamState.streamId, {
+          type: "done",
+          fullText: apiInterceptedText,
+        });
+        apiInterceptedText = null;
+        stopActiveStream();
+        return;
+      }
+    } else {
+      const seemsDone = !generating && streamState.hasNewContent && streamState.stableTicks >= 3;
 
-    if (!generating && !streamState.lastText && streamState.stableTicks >= 12) {
-      emitStreamEvent(streamState.streamId, {
-        type: "error",
-        message: "No assistant response detected in z.ai DOM.",
-      });
-      stopActiveStream();
+      if (seemsDone && streamState.lastText) {
+        emitStreamEvent(streamState.streamId, {
+          type: "done",
+          fullText: streamState.lastText,
+        });
+        stopActiveStream();
+        return;
+      }
+
+      if (!generating && !streamState.hasNewContent && streamState.stableTicks >= 12) {
+        emitStreamEvent(streamState.streamId, {
+          type: "error",
+          message: "No new assistant response detected. Prompt may not have been submitted.",
+        });
+        stopActiveStream();
+      }
     }
-  }, 500);
+  }, 200); // 200ms tick for much smoother native streaming updates
 
   streamState.hardTimeout = setTimeout(() => {
     emitStreamEvent(streamState.streamId, {
@@ -289,8 +373,67 @@ function setComposerValue(composer, text) {
   composer.dispatchEvent(new InputEvent("input", { bubbles: true, data: normalized }));
 }
 
+function readComposerValue(composer) {
+  if (composer instanceof HTMLTextAreaElement || composer instanceof HTMLInputElement) {
+    return composer.value || "";
+  }
+  return composer.innerText || composer.textContent || "";
+}
+
+function isComposerEmpty(composer) {
+  return sanitizeText(readComposerValue(composer)).length === 0;
+}
+
+async function confirmPromptSubmission(composer) {
+  const baselineApiStart = lastApiStartAt;
+  for (let i = 0; i < 20; i++) {
+    await wait(100);
+    if (lastApiStartAt > baselineApiStart || stopButtonVisible() || isComposerEmpty(composer)) {
+      return true;
+    }
+  }
+  return false;
+}
+
 async function wait(ms) {
   await new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function generateConversationId() {
+  if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
+    return crypto.randomUUID();
+  }
+  return `${Date.now()}-${Math.random().toString(16).slice(2, 10)}-${Math.random().toString(16).slice(2, 10)}`;
+}
+
+function findNewChatControl() {
+  const fromSelectors = queryFirstVisible(SELECTORS.newChat);
+  if (fromSelectors) {
+    return fromSelectors;
+  }
+
+  const candidates = Array.from(document.querySelectorAll("button, a, [role='button'], [role='menuitem']"));
+  for (const node of candidates) {
+    const element = node;
+    if (!element || typeof element.getBoundingClientRect !== "function") {
+      continue;
+    }
+    const rect = element.getBoundingClientRect();
+    if (rect.width <= 0 || rect.height <= 0) {
+      continue;
+    }
+
+    const text = sanitizeText(element.textContent || "").toLowerCase();
+    const aria = sanitizeText(element.getAttribute("aria-label") || "").toLowerCase();
+    const title = sanitizeText(element.getAttribute("title") || "").toLowerCase();
+    const href = sanitizeText(element.getAttribute("href") || "").toLowerCase();
+    const combined = `${text} ${aria} ${title} ${href}`;
+    if (/\bnew\s*chat\b/.test(combined) || /\bnew\s*conversation\b/.test(combined) || href === "/") {
+      return element;
+    }
+  }
+
+  return null;
 }
 
 async function runSendPrompt(params) {
@@ -313,7 +456,9 @@ async function runSendPrompt(params) {
   const submit = queryFirstVisible(SELECTORS.submit);
   if (submit && !submit.disabled) {
     submit.click();
-    return { submitted: true };
+    if (await confirmPromptSubmission(composer)) {
+      return { submitted: true };
+    }
   }
 
   // If button is disabled, wait a moment for React state to catch up and retry
@@ -321,20 +466,35 @@ async function runSendPrompt(params) {
   const retrySubmit = queryFirstVisible(SELECTORS.submit);
   if (retrySubmit && !retrySubmit.disabled) {
     retrySubmit.click();
-    return { submitted: true };
+    if (await confirmPromptSubmission(composer)) {
+      return { submitted: true };
+    }
   }
 
   // Fallback: try Enter key
+  const enterEvent = {
+    key: "Enter",
+    code: "Enter",
+    keyCode: 13,
+    which: 13,
+    bubbles: true,
+    cancelable: true,
+  };
   composer.dispatchEvent(
-    new KeyboardEvent("keydown", {
-      key: "Enter",
-      code: "Enter",
-      keyCode: 13,
-      which: 13,
-      bubbles: true,
-    }),
+    new KeyboardEvent("keydown", enterEvent),
   );
-  return { submitted: true };
+  composer.dispatchEvent(
+    new KeyboardEvent("keypress", enterEvent),
+  );
+  composer.dispatchEvent(
+    new KeyboardEvent("keyup", enterEvent),
+  );
+
+  if (await confirmPromptSubmission(composer)) {
+    return { submitted: true };
+  }
+
+  throw new Error("Prompt submit could not be confirmed in z.ai UI.");
 
 }
 
@@ -351,16 +511,60 @@ async function runCheckReady() {
 }
 
 async function runStartNewConversation() {
-  const button = queryFirstVisible(SELECTORS.newChat);
+  const previousConversationId = parseConversationId(window.location.href);
+  const composer = queryFirstVisible(SELECTORS.input);
+  if (composer) {
+    setComposerValue(composer, "");
+  }
+
+  const button = findNewChatControl();
   if (button && button.click) {
     button.click();
-    await wait(400);
-  } else if (!window.location.pathname || window.location.pathname !== "/") {
-    window.location.assign("https://chat.z.ai/");
-    await wait(600);
   }
+
+  for (let attempt = 0; attempt < 20; attempt += 1) {
+    await wait(100);
+    const currentConversationId = parseConversationId(window.location.href);
+    if (currentConversationId && currentConversationId !== previousConversationId) {
+      return {
+        conversationId: currentConversationId,
+        navigating: false,
+      };
+    }
+    if (!currentConversationId) {
+      return {
+        conversationId: undefined,
+        navigating: false,
+      };
+    }
+  }
+
+  // SPA fallback: force a unique conversation route without page unload prompts.
+  const fallbackConversationId = generateConversationId();
+  const fallbackPath = `/c/${fallbackConversationId}`;
+  try {
+    window.history.pushState({}, "", fallbackPath);
+    window.dispatchEvent(new PopStateEvent("popstate"));
+    window.dispatchEvent(new Event("locationchange"));
+  } catch {
+    // ignore
+  }
+
+  for (let attempt = 0; attempt < 10; attempt += 1) {
+    await wait(100);
+    const currentConversationId = parseConversationId(window.location.href);
+    if (currentConversationId === fallbackConversationId) {
+      return {
+        conversationId: currentConversationId,
+        navigating: false,
+      };
+    }
+  }
+
+  // Last-resort return so caller can still track a new thread id and avoid reusing the previous one.
   return {
-    conversationId: parseConversationId(window.location.href),
+    conversationId: fallbackConversationId,
+    navigating: false,
   };
 }
 
@@ -382,25 +586,56 @@ async function runOpenConversation(params) {
 }
 
 async function runListModels() {
-  const picker = queryFirstVisible(SELECTORS.modelPicker);
+  let picker = queryFirstVisible(SELECTORS.modelPicker);
+  
+  // Fallback: look for an element stating the active model
+  if (!picker) {
+    const activeIndicators = Array.from(document.querySelectorAll("button, div")).filter(el => {
+      const txt = (el.textContent || "").trim();
+      return /GLM-[0-9]/.test(txt) && !el.closest(".chat-assistant");
+    });
+    if (activeIndicators.length > 0) {
+       picker = activeIndicators[0];
+       // Go up to find the actual clickable button if we hit a text span
+       const btnParent = picker.closest('button, [role="combobox"]');
+       if (btnParent) picker = btnParent;
+    }
+  }
+
   if (!picker) {
     return { models: [] };
   }
+  
   picker.click();
-  await wait(400); // Wait a bit longer for the menu to open
+  await wait(800); // Wait longer for the menu to open, React might be slow
 
   const models = [];
   const seen = new Set();
-  const options = queryAll(SELECTORS.modelOption);
+  let options = queryAll(SELECTORS.modelOption);
   
-  // If no options found, try to find buttons inside the popover/menu
-  const candidates = options.length > 0 ? options : Array.from(document.querySelectorAll("[role='menu'] button, [role='listbox'] button, .popover button"));
+  if (options.length === 0) {
+    await wait(400); // Try waiting a bit more
+    options = queryAll(SELECTORS.modelOption);
+  }
+  
+  // If no options found, try to find items inside the popover/menu or search by known text
+  let candidates = options.length > 0 ? options : Array.from(document.querySelectorAll("[role='menu'] button, [role='listbox'] button, .popover button, [role='menu'] div, [role='listbox'] div, .model-item"));
+
+  // Super fallback: find elements by text
+  if (candidates.length === 0) {
+    const knownModels = ["GLM-5.1", "GLM-5-Turbo", "GLM-5V-Turbo", "GLM-5", "GLM-4.7", "GLM-4.6V", "GLM-4.5-Air"];
+    candidates = Array.from(document.querySelectorAll("div, li, button, span")).filter(el => {
+      const txt = (el.textContent || "").trim();
+      return knownModels.includes(txt) || /^GLM-/.test(txt);
+    });
+  }
 
   for (const option of candidates) {
     const id = sanitizeText(option.getAttribute("data-value") || option.getAttribute("id") || "");
-    const labelText = sanitizeText((option.innerText || "").split(/\r?\n/)[0] || "");
-    const label = labelText || id;
+    let label = sanitizeText((option.innerText || option.textContent || "").split(/\r?\n/)[0] || "");
+    label = label || id;
     
+    // Ignore empty or very long strings
     if (!label || label.length < 2 || label.length > 80) {
       continue;
     }
@@ -419,7 +654,7 @@ async function runListModels() {
 
   // Try to close the picker
   document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true, keyCode: 27 }));
-  await wait(100);
+  await wait(200);
   
   return { models: models.slice(0, 60) };
 }

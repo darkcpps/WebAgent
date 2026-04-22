@@ -15,6 +15,10 @@ export function buildProviderPrompt(task: string, context: RepoContext, toolResu
     '6. When the task is complete, use the `finish` action.',
     '7. Do not include your internal reasoning or thought process in the JSON. Put it in the "summary" field if necessary.',
     '8. Use workspace-relative paths only (e.g. "src/app.ts"). Do not use absolute paths like "C:\\\\...".',
+    '9. Discovery-first behavior: if the task is not a clearly single-file change, start by exploring with `list_files`/`search_files`, then `read_file` on likely targets.',
+    '10. Before any `edit_file`, `delete_file`, or `rename_file`, you must have read that exact target file in this run (except brand new files created with `create_file`).',
+    '11. Treat provided context snippets as hints only. For exact code truth, call `read_file` on the target paths before making changes.',
+    '12. Never mix `finish` with other actions in the same response. Emit `finish` alone only when no more tool actions are needed.',
     '',
     '### AVAILABLE ACTIONS',
     '- list_files: {"type":"list_files", "limit": 100} - List files in the workspace.',
@@ -48,6 +52,10 @@ export function buildProviderPrompt(task: string, context: RepoContext, toolResu
 
   const userPrompt = [
     `Task:\n${task}`,
+    '',
+    'Important operating note:',
+    '- The "Relevant files" section may be incomplete or truncated.',
+    '- In medium/large repos, narrow scope with `search_files` and then `read_file` specific files before editing.',
     '',
     `Workspace summary:\n${context.summary}`,
     '',

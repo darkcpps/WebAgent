@@ -16,7 +16,8 @@ import { WebAgentPanel } from './services/webviewPanel';
 import { WorkspaceContextService } from './workspace/context';
 import { WorkspaceFilesService } from './workspace/files';
 import { GitService } from './workspace/git';
-import type { BridgeUiState, ProviderId } from './shared/types';
+import type { ApprovalMode, BridgeUiState, ProviderId } from './shared/types';
+import type { ProviderPrompt } from './providers/base';
 import { AgentResponseParser } from './agent/parser';
 import { buildProviderPrompt } from './agent/planner';
 import { sanitizeResponse } from './shared/utils';
@@ -105,6 +106,47 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   const cleanFinalResponse = (text: string, options?: { preferJson?: boolean }): string => {
     const cleaned = sanitizeResponse(text, options);
     return cleaned || 'No response text was parsed from provider.';
+  };
+
+  const truncatePromptPreview = (value: string, limit = 2200): string => {
+    if (value.length <= limit) {
+      return value;
+    }
+    return `${value.slice(0, limit)}\n\n...[truncated ${value.length - limit} chars]`;
+  };
+
+  const buildChatAskPrompt = (userPrompt: string, options: { wasPreviouslyAgentMode: boolean }): ProviderPrompt => {
+    const systemLines = [
+      'You are in Chat/Ask mode inside an IDE conversation.',
+      'Respond conversationally and helpfully to the user question.',
+      'Do not output tool-action JSON and do not behave as an autonomous agent in this mode.',
+      'Explain code changes clearly when asked, and ask clarifying questions if context is missing.',
+      options.wasPreviouslyAgentMode
+        ? 'Important: Previous agent-mode instructions in this thread are inactive. Ignore them unless the user explicitly asks to enable Agent Mode again.'
+        : 'Stay in Chat/Ask mode unless the user explicitly asks to switch to Agent Mode.',
+    ];
+
+    return {
+      systemPrompt: systemLines.join('\n'),
+      userPrompt,
+    };
+  };
+
+  const appendPromptPreviewLog = (
+    sessionId: string,
+    mode: 'chat' | 'agent',
+    prompt: ProviderPrompt,
+    round?: number,
+  ): void => {
+    const label = mode === 'chat' ? 'Chat/Ask' : round ? `Agent (round ${round})` : 'Agent';
+    const systemPreview = truncatePromptPreview(prompt.systemPrompt);
+    const userPreview = truncatePromptPreview(prompt.userPrompt);
+
+    sessions.appendLog(sessionId, {
+      level: 'info',
+      source: 'agent',
+      message: `${label} prompt preview\nSystem:\n${systemPreview}\n\nUser:\n${userPreview}`,
+    });
   };
 
   const maybeOfferZaiPlaywrightFallback = async (sessionId: string, error: unknown): Promise<void> => {
@@ -199,12 +241,6 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         if (!session) {
           return;
         }
-        if (session.providerSessionId) {
-          await providers.get(session.providerId, { sessionId }).deleteConversation(session.providerSessionId).catch(() => undefined);
-        }
-        if (sessions.getActive()?.id === sessionId) {
-          await providers.get(session.providerId, { sessionId }).resetConversation().catch(() => undefined);
-        }
         providers.clearZaiSessionTransport(sessionId);
         sessions.delete(sessionId);
       },
@@ -217,6 +253,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       sendChat: async (providerId, message, modelId, sessionId, agentMode) => {
         const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
         const existing = sessionId ? sessions.get(sessionId) : undefined;
+        const wasEmptySession = (existing?.chatHistory.length ?? 0) === 0;
         const session =
           existing && existing.providerId === providerId ? existing : sessions.create(providerId, 'Chat session', workspaceRoot);
 
@@ -266,11 +303,33 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
             });
             await provider.openConversation(sessionConversationId).catch(() => false);
           }
-          // If the session has NO stored ID, just use whatever page is currently open.
-          // The browser is either on the home page (new chat) or an existing conversation.
-          // Either way, we just type into it. No startNewConversation() call needed.
-          // If the browser happens to be on an existing conversation and we don't have an ID yet, adopt it.
-          if (!sessionConversationId && browserConversationId) {
+          // For a brand-new local session, never inherit a pre-existing browser conversation.
+          // Force the browser back to "new chat" context if we detect an active thread URL.
+          if (!sessionConversationId && wasEmptySession && browserConversationId) {
+            sessions.appendLog(session.id, {
+              level: 'info',
+              source: 'agent',
+              message: 'Fresh chat requested. Resetting browser to new conversation context...',
+            });
+            await provider.startNewConversation().catch(() => undefined);
+
+            let clearedConversation = false;
+            for (let attempt = 0; attempt < 8; attempt += 1) {
+              await new Promise((resolve) => setTimeout(resolve, 250));
+              const currentConversation = await provider.getCurrentConversationId().catch(() => undefined);
+              if (!currentConversation) {
+                clearedConversation = true;
+                break;
+              }
+            }
+
+            if (!clearedConversation) {
+              throw new Error('Could not switch z.ai browser to a fresh chat context.');
+            }
+          }
+
+          // For non-new sessions that somehow lack a stored ID, adopt the currently open browser thread.
+          if (!sessionConversationId && !wasEmptySession && browserConversationId) {
             sessions.setProviderSessionId(session.id, browserConversationId);
           }
 
@@ -295,15 +354,16 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
           const trimmedMessage = message.trim();
           const useAgentTools = Boolean(agentMode) || /^\/agent\s+/i.test(trimmedMessage);
           const chatPrompt = /^\/agent\s+/i.test(trimmedMessage) ? trimmedMessage.replace(/^\/agent\s+/i, '').trim() : trimmedMessage;
+          const wasPreviouslyAgentMode = sessions.get(session.id)?.lastPromptMode === 'agent';
+          sessions.update(session.id, { lastPromptMode: useAgentTools ? 'agent' : 'chat' });
           if (!chatPrompt) {
             throw new Error('Empty message.');
           }
 
           if (!useAgentTools) {
-            await provider.sendPrompt({
-              systemPrompt: '',
-              userPrompt: chatPrompt,
-            });
+            const prompt = buildChatAskPrompt(chatPrompt, { wasPreviouslyAgentMode });
+            appendPromptPreviewLog(session.id, 'chat', prompt);
+            await provider.sendPrompt(prompt);
 
             const responseText = await collectProviderText(session.id, providerId, (delta) => {
               if (assistantMessage) {
@@ -342,21 +402,43 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
           const toolResults: string[] = [];
           let finalText = '';
           let lastRawResponse = '';
+          const actionUpdates: string[] = [];
+
+          const compact = (value: string, limit = 220): string => {
+            const normalized = value.replace(/\s+/g, ' ').trim();
+            if (normalized.length <= limit) {
+              return normalized;
+            }
+            return `${normalized.slice(0, limit)}...`;
+          };
+
+          const pushActionUpdate = (line: string): void => {
+            actionUpdates.push(line);
+            if (actionUpdates.length > 20) {
+              actionUpdates.shift();
+            }
+
+            if (assistantMessage) {
+              sessions.updateChatMessage(session.id, assistantMessage.id, {
+                content: 'Working...',
+                rawContent: lastRawResponse || 'Working...',
+              });
+            }
+          };
+
+          const trimForToolPrompt = (value: string, limit = 2600): string => {
+            if (value.length <= limit) {
+              return value;
+            }
+            return `${value.slice(0, limit)}\n...[truncated ${value.length - limit} chars]`;
+          };
 
           for (let round = 0; round < 5; round += 1) {
             const prompt = buildProviderPrompt(chatPrompt, repoContext, toolResults);
+            appendPromptPreviewLog(session.id, 'agent', prompt, round + 1);
             await provider.sendPrompt(prompt);
             
-            const responseText = await collectProviderText(session.id, providerId, (delta) => {
-              if (assistantMessage) {
-                // Show human-readable preview during streaming, not raw JSON
-                const preview = sanitizeResponse(delta) || 'Thinking...';
-                sessions.updateChatMessage(session.id, assistantMessage.id, {
-                  content: preview,
-                  rawContent: delta,
-                });
-              }
-            });
+            const responseText = await collectProviderText(session.id, providerId);
             lastRawResponse = responseText;
             
             const cleaned = cleanFinalResponse(responseText, { preferJson: true });
@@ -381,11 +463,27 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 
             if (parsed.summary) {
               sessions.appendLog(session.id, { level: 'info', source: 'provider', message: parsed.summary });
+              pushActionUpdate(`AI plan: ${compact(parsed.summary, 160)}`);
             }
 
+            const hasNonTerminalActions = parsed.actions.some((action) => action.type !== 'ask_user' && action.type !== 'finish');
+
             for (const action of parsed.actions) {
+              if (action.type === 'finish' && hasNonTerminalActions) {
+                sessions.appendLog(session.id, {
+                  level: 'warning',
+                  source: 'agent',
+                  message: 'Ignoring mixed finish action; sending tool outputs back to AI for the next round.',
+                });
+                pushActionUpdate('Continuing: sent tool outputs back to AI for follow-up reasoning.');
+                continue;
+              }
+
               const result = await executor.execute(session.id, action);
-              toolResults.push(`${action.type}: ${result.message}`);
+              toolResults.push(`${action.type}: ${trimForToolPrompt(result.message)}`);
+              const summaryLabel = action.summary?.trim();
+              const label = summaryLabel && summaryLabel.length > 0 ? `${action.type} (${summaryLabel})` : action.type;
+              pushActionUpdate(`${label} -> ${compact(result.message)}`);
               finalText = result.message;
 
               if (action.type === 'ask_user' || action.type === 'finish' || result.done) {
@@ -394,6 +492,15 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
                 break;
               }
             }
+          }
+
+          if (actionUpdates.length > 0) {
+            const outcome = finalText ? compact(finalText, 260) : '';
+            finalText = [
+              'Completed actions:',
+              ...actionUpdates.map((entry, idx) => `${idx + 1}. ${entry}`),
+              ...(outcome ? ['', `Outcome: ${outcome}`] : []),
+            ].join('\n');
           }
 
           if (assistantMessage) {
@@ -489,6 +596,35 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       },
       openZaiInBrowser: async () => {
         await vscode.env.openExternal(vscode.Uri.parse('https://chat.z.ai/'));
+      },
+      setApprovalMode: async (mode: ApprovalMode) => {
+        if (mode !== 'ask-before-action' && mode !== 'auto-apply-safe-edits' && mode !== 'view-only') {
+          throw new Error(`Unsupported approval mode: ${mode}`);
+        }
+        await vscode.workspace.getConfiguration('webagentCode').update('approvalMode', mode, vscode.ConfigurationTarget.Workspace);
+      },
+      previewSessionChanges: async (sessionId) => {
+        const session = sessions.get(sessionId);
+        if (!session) {
+          throw new Error('Session not found.');
+        }
+
+        const modifiedActions = session.actionHistory.filter(
+          (action) =>
+            action.status === 'done' &&
+            ['edit_file', 'create_file', 'delete_file', 'rename_file'].includes(action.type),
+        );
+
+        if (!modifiedActions.length) {
+          await vscode.window.showInformationMessage('No code modifications recorded for this session.');
+          return;
+        }
+
+        const gitDiff = await git.getDiff().catch(() => 'No diff');
+        const actionSummaries = modifiedActions.map((action) =>
+          [action.summary || action.type, action.preview ? `(${action.preview.split('\n')[0]})` : ''].filter(Boolean).join(' '),
+        );
+        await diffPreview.showSessionChangePreview(session.task || 'Chat session', actionSummaries, gitDiff);
       },
     },
   );

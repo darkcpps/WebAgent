@@ -24,4 +24,33 @@ export class DiffPreviewService {
       `WebAgent Preview: ${relativePath}`,
     );
   }
+
+  async showSessionChangePreview(sessionTitle: string, actionSummaries: string[], gitDiff: string): Promise<void> {
+    const hasDiff = Boolean(gitDiff && gitDiff.trim() && gitDiff.trim() !== 'No diff');
+    const lines: string[] = [
+      `# WebAgent Change Preview`,
+      '',
+      `Session: ${sessionTitle || 'Chat session'}`,
+      `Generated: ${new Date().toLocaleString()}`,
+      '',
+      '## Modified Actions',
+      ...(actionSummaries.length
+        ? actionSummaries.map((entry, index) => `${index + 1}. ${entry}`)
+        : ['No modifying actions were recorded for this session.']),
+      '',
+      '## Git Diff',
+    ];
+
+    if (hasDiff) {
+      lines.push('```diff', gitDiff, '```');
+    } else {
+      lines.push('No unstaged git diff is currently available.');
+    }
+
+    const document = await vscode.workspace.openTextDocument({
+      language: 'markdown',
+      content: lines.join('\n'),
+    });
+    await vscode.window.showTextDocument(document, { preview: false, viewColumn: vscode.ViewColumn.Beside });
+  }
 }

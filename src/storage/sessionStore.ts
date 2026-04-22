@@ -17,6 +17,7 @@ export class SessionStore {
       this.sessions.set(session.id, {
         ...session,
         providerSessionId: session.providerSessionId,
+        lastPromptMode: session.lastPromptMode ?? 'chat',
         rawResponses: session.rawResponses ?? [],
         chatHistory: session.chatHistory ?? [],
       });
@@ -53,6 +54,7 @@ export class SessionStore {
     const session: SessionState = {
       id: createId('session'),
       providerId,
+      lastPromptMode: 'chat',
       task,
       workspaceRoot,
       status: 'idle',
