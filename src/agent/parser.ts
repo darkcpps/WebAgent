@@ -3,7 +3,9 @@ import { agentResponseSchema, type AgentResponse } from './protocol';
 
 export class AgentResponseParser {
   parse(input: string): AgentResponse {
-    const candidates = this.extractCandidates(input);
+    // Strip XML thinking tags so the parser doesn't get confused by reasoning blocks.
+    const strippedInput = input.replace(/<(think|thought|reasoning|analysis)>([\s\S]*?)(?:<\/\1>|$)/gi, '');
+    const candidates = this.extractCandidates(strippedInput);
 
     for (const candidate of candidates) {
       try {
@@ -185,6 +187,15 @@ export class AgentResponseParser {
     repaired = repaired.replace(/:\s*'([^'\\]*(?:\\.[^'\\]*)*)'/g, (_whole, rawValue: string) => {
       const escaped = rawValue.replace(/"/g, '\\"');
       return `:"${escaped}"`;
+    });
+
+    // Fix unescaped newlines in JSON string values
+    repaired = repaired.replace(/"([^"\\]*(?:\\.[^"\\]*)*)"/g, (match, inner) => {
+      if (inner.includes('\n') || inner.includes('\r')) {
+        const escaped = inner.replace(/\n/g, '\\n').replace(/\r/g, '\\r');
+        return `"${escaped}"`;
+      }
+      return match;
     });
 
     return repaired.trim();
