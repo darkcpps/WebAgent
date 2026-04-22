@@ -25,6 +25,10 @@ const bridgePreferences = {
   modelLabel: undefined,
   enableThinking: undefined,
 };
+const ALLOWED_JSON_FETCH_URLS = new Set([
+  "https://chat.z.ai/api/models",
+  "https://chat.z.ai/api/config",
+]);
 
 function cleanString(value) {
   return typeof value === "string" ? value.trim() : "";
@@ -51,7 +55,68 @@ window.addEventListener("message", (event) => {
     return;
   }
   const data = event.data;
-  if (!data || data.type !== "ZAI_BRIDGE_SET_PREFERENCES") {
+  if (!data || typeof data !== "object") {
+    return;
+  }
+
+  if (data.type === "ZAI_BRIDGE_FETCH_JSON_REQUEST") {
+    const requestId = cleanString(data.requestId);
+    const url = cleanString(data.url);
+    if (!requestId || !url) {
+      return;
+    }
+
+    if (!ALLOWED_JSON_FETCH_URLS.has(url)) {
+      window.postMessage(
+        {
+          type: "ZAI_BRIDGE_FETCH_JSON_RESPONSE",
+          requestId,
+          ok: false,
+          error: `URL not allowed: ${url}`,
+        },
+        "*",
+      );
+      return;
+    }
+
+    void (async () => {
+      try {
+        const response = await originalFetch(url, {
+          method: "GET",
+          credentials: "include",
+          headers: {
+            accept: "application/json, text/plain, */*",
+          },
+        });
+        if (!response.ok) {
+          throw new Error(`HTTP ${response.status} for ${url}`);
+        }
+        const result = await response.json();
+        window.postMessage(
+          {
+            type: "ZAI_BRIDGE_FETCH_JSON_RESPONSE",
+            requestId,
+            ok: true,
+            result,
+          },
+          "*",
+        );
+      } catch (error) {
+        window.postMessage(
+          {
+            type: "ZAI_BRIDGE_FETCH_JSON_RESPONSE",
+            requestId,
+            ok: false,
+            error: String(error),
+          },
+          "*",
+        );
+      }
+    })();
+    return;
+  }
+
+  if (data.type !== "ZAI_BRIDGE_SET_PREFERENCES") {
     return;
   }
 

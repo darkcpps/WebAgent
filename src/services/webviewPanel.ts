@@ -116,8 +116,14 @@ export class WebAgentPanel {
         }
         case 'checkProviderReady': {
           const readiness = await this.callbacks.checkProviderReady(message.providerId);
-          if (readiness.ready) {
+          let refreshedModels = false;
+          try {
             await this.callbacks.refreshProviderModels(message.providerId);
+            refreshedModels = true;
+          } catch {
+            refreshedModels = false;
+          }
+          if (readiness.ready || refreshedModels) {
             await this.postState();
           }
           if (!message.silent) {

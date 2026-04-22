@@ -429,6 +429,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
           let executedActionCount = 0;
           let failedActionCount = 0;
           let endedByAskUser = false;
+          let invalidToolResponseCount = 0;
+          let autoCorrectionCount = 0;
 
           const compact = (value: string, limit = 220): string => {
             const normalized = value.replace(/\s+/g, ' ').trim();
@@ -485,15 +487,45 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
               try {
                 parsed = parser.parse(cleaned);
               } catch (parseError) {
-                finalText = cleanFinalResponse(responseText);
+                invalidToolResponseCount += 1;
+                const parseErrorMessage = parseError instanceof Error ? parseError.message : String(parseError);
                 sessions.appendLog(session.id, {
                   level: 'warning',
                   source: 'agent',
-                  message: `Could not parse tool JSON in round ${round + 1}: ${parseError instanceof Error ? parseError.message : String(parseError)}`,
+                  message: `Could not parse tool JSON in round ${round + 1}: ${parseErrorMessage}`,
                 });
+
+                if (invalidToolResponseCount <= 4) {
+                  autoCorrectionCount += 1;
+                  const responsePreview = cleanFinalResponse(responseText).slice(0, 1200);
+                  toolResults.push(
+                    [
+                      'SYSTEM_FEEDBACK: Your previous response did not use a valid executable tool JSON object.',
+                      `Parse error: ${parseErrorMessage}`,
+                      'Respond ONLY with this exact shape:',
+                      '{"summary":"...","actions":[{"type":"list_files|read_file|search_files|edit_file|create_file|delete_file|rename_file|run_command|get_git_diff|ask_user|finish", ...}]}',
+                      'Use only allowed tool names. Do not include prose outside JSON. If uncertain, use read_file/search_files first.',
+                      `Previous invalid response (truncated): ${responsePreview || '[empty]'}`,
+                    ].join('\n'),
+                  );
+                  if (toolResults.length > 10) {
+                    toolResults.shift();
+                  }
+                  pushActionUpdate('Auto-recovery: requested valid tool JSON after invalid tool/output response.');
+                  continue;
+                }
+
+                finalText = [
+                  'Need your input to continue.',
+                  'The model repeatedly returned invalid tool output and could not execute actions in IDE.',
+                  'Try again or simplify the request.',
+                ].join('\n');
+                endedByAskUser = true;
                 break;
               }
             }
+
+            invalidToolResponseCount = 0;
 
             if (parsed.summary) {
               sessions.appendLog(session.id, { level: 'info', source: 'provider', message: parsed.summary });
@@ -526,6 +558,23 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
               const label = summaryLabel && summaryLabel.length > 0 ? `${action.type} (${summaryLabel})` : action.type;
               pushActionUpdate(`${label} -> ${compact(result.message)}`);
               finalText = result.message;
+
+              if (/^(Action failed:|Blocked action )/i.test(result.message.trim())) {
+                if (autoCorrectionCount < 4) {
+                  autoCorrectionCount += 1;
+                  toolResults.push(
+                    [
+                      'SYSTEM_FEEDBACK: The previous action failed or was blocked in IDE execution.',
+                      `Failure detail: ${result.message}`,
+                      'Adjust your next action to use valid workspace-relative paths and supported tools.',
+                      'If editing, ensure you read_file the exact target first.',
+                    ].join('\n'),
+                  );
+                  if (toolResults.length > 10) {
+                    toolResults.shift();
+                  }
+                }
+              }
 
               if (action.type === 'ask_user' || action.type === 'finish' || result.done) {
                 if (action.type === 'ask_user') {

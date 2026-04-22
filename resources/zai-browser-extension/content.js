@@ -378,7 +378,58 @@ function pickDefaultModelId(rawModels, rawConfig) {
   return recursiveDefault(rawModels) || recursiveDefault(rawConfig);
 }
 
+async function fetchJsonViaInject(url, timeoutMs = 12000) {
+  const requestId = randomId("fetchjson");
+  return await new Promise((resolve, reject) => {
+    let done = false;
+    const timeout = setTimeout(() => {
+      if (done) {
+        return;
+      }
+      done = true;
+      window.removeEventListener("message", onMessage);
+      reject(new Error(`[zai-bridge] Inject fetch timed out for ${url}`));
+    }, timeoutMs);
+
+    const onMessage = (event) => {
+      if (done || event.source !== window) {
+        return;
+      }
+      const data = event.data;
+      if (!data || data.type !== "ZAI_BRIDGE_FETCH_JSON_RESPONSE" || data.requestId !== requestId) {
+        return;
+      }
+
+      done = true;
+      clearTimeout(timeout);
+      window.removeEventListener("message", onMessage);
+      if (data.ok) {
+        resolve(data.result);
+      } else {
+        reject(new Error(String(data.error || `Inject fetch failed for ${url}`)));
+      }
+    };
+
+    window.addEventListener("message", onMessage);
+    window.postMessage(
+      {
+        type: "ZAI_BRIDGE_FETCH_JSON_REQUEST",
+        requestId,
+        url,
+      },
+      "*",
+    );
+  });
+}
+
 async function fetchJsonEndpoint(url) {
+  try {
+    const result = await fetchJsonViaInject(url);
+    return result;
+  } catch (injectError) {
+    console.warn(`[zai-bridge] Inject fetch failed for ${url}, falling back to content fetch:`, injectError);
+  }
+
   const response = await fetch(url, {
     method: "GET",
     credentials: "include",
