@@ -90,7 +90,7 @@ export class ActionExecutor {
       }
       case 'read_file': {
         const content = await this.files.readFile(action.path);
-        return `Read ${action.path}:\n${truncate(content, 8000)}`;
+        return `Read ${action.path}:\n${truncate(content, 20000)}`;
       }
       case 'search_files': {
         const results = await this.files.searchFiles(action.query, action.limit ?? 20);

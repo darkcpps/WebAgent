@@ -17,7 +17,7 @@ import { WorkspaceContextService } from './workspace/context';
 import { WorkspaceFilesService } from './workspace/files';
 import { GitService } from './workspace/git';
 import type { ApprovalMode, BridgeUiState, ProviderId } from './shared/types';
-import type { ProviderPrompt } from './providers/base';
+import type { ProviderAdapter, ProviderPrompt } from './providers/base';
 import { AgentResponseParser } from './agent/parser';
 import { buildProviderPrompt } from './agent/planner';
 import { sanitizeResponse } from './shared/utils';
@@ -148,6 +148,24 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       message: `${label} prompt preview\nSystem:\n${systemPreview}\n\nUser:\n${userPreview}`,
     });
   };
+
+  const getConversationIdSafely = async (
+    provider: ProviderAdapter,
+    timeoutMs = 7000,
+  ): Promise<string | undefined> =>
+    await new Promise<string | undefined>((resolve) => {
+      const timer = setTimeout(() => resolve(undefined), timeoutMs);
+      void provider
+        .getCurrentConversationId()
+        .then((conversationId) => {
+          clearTimeout(timer);
+          resolve(conversationId);
+        })
+        .catch(() => {
+          clearTimeout(timer);
+          resolve(undefined);
+        });
+    });
 
   const maybeOfferZaiPlaywrightFallback = async (sessionId: string, error: unknown): Promise<void> => {
     if (providers.getZaiTransport(sessionId) !== 'bridge') {
@@ -316,7 +334,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
             let clearedConversation = false;
             for (let attempt = 0; attempt < 8; attempt += 1) {
               await new Promise((resolve) => setTimeout(resolve, 250));
-              const currentConversation = await provider.getCurrentConversationId().catch(() => undefined);
+              const currentConversation = await getConversationIdSafely(provider, 3000);
               if (!currentConversation) {
                 clearedConversation = true;
                 break;
@@ -381,10 +399,11 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
                 rawContent: responseText,
               });
             }
+            sessions.setStatus(session.id, 'done');
             // Always capture the browser URL after the response and lock it to this session.
             // Z.ai creates the /c/UUID path during response generation.
             await new Promise((r) => setTimeout(r, 1500));
-            const conversationId = await provider.getCurrentConversationId().catch(() => undefined);
+            const conversationId = await getConversationIdSafely(provider);
             if (conversationId) {
               sessions.setProviderSessionId(session.id, conversationId);
               sessions.appendLog(session.id, {
@@ -393,7 +412,6 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
                 message: `Session locked to conversation: ${conversationId}`,
               });
             }
-            sessions.setStatus(session.id, 'done');
             return;
           }
 
@@ -403,6 +421,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
           let finalText = '';
           let lastRawResponse = '';
           const actionUpdates: string[] = [];
+          let executedActionCount = 0;
+          let failedActionCount = 0;
+          let endedByAskUser = false;
 
           const compact = (value: string, limit = 220): string => {
             const normalized = value.replace(/\s+/g, ' ').trim();
@@ -426,7 +447,15 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
             }
           };
 
-          const trimForToolPrompt = (value: string, limit = 2600): string => {
+          const trimForToolPrompt = (actionType: string, value: string): string => {
+            const limitByAction: Record<string, number> = {
+              read_file: 14000,
+              search_files: 6000,
+              list_files: 5000,
+              run_command: 8000,
+              get_git_diff: 8000,
+            };
+            const limit = limitByAction[actionType] ?? 3000;
             if (value.length <= limit) {
               return value;
             }
@@ -480,13 +509,23 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
               }
 
               const result = await executor.execute(session.id, action);
-              toolResults.push(`${action.type}: ${trimForToolPrompt(result.message)}`);
+              executedActionCount += 1;
+              if (/^(Action failed:|Blocked action )/i.test(result.message.trim())) {
+                failedActionCount += 1;
+              }
+              toolResults.push(`${action.type}: ${trimForToolPrompt(action.type, result.message)}`);
+              if (toolResults.length > 10) {
+                toolResults.shift();
+              }
               const summaryLabel = action.summary?.trim();
               const label = summaryLabel && summaryLabel.length > 0 ? `${action.type} (${summaryLabel})` : action.type;
               pushActionUpdate(`${label} -> ${compact(result.message)}`);
               finalText = result.message;
 
               if (action.type === 'ask_user' || action.type === 'finish' || result.done) {
+                if (action.type === 'ask_user') {
+                  endedByAskUser = true;
+                }
                 finalText = result.message;
                 round = 99;
                 break;
@@ -494,31 +533,58 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
             }
           }
 
-          if (actionUpdates.length > 0) {
-            const outcome = finalText ? compact(finalText, 260) : '';
+          if (endedByAskUser) {
+            const followUpQuestion = compact(finalText || 'I need your input to continue.', 360);
+            const recentUpdates = actionUpdates.slice(-5);
             finalText = [
-              'Completed actions:',
-              ...actionUpdates.map((entry, idx) => `${idx + 1}. ${entry}`),
-              ...(outcome ? ['', `Outcome: ${outcome}`] : []),
+              'Need your input to continue.',
+              `Question: ${followUpQuestion}`,
+              ...(recentUpdates.length > 0 ? ['', 'Recent actions:', ...recentUpdates.map((entry, idx) => `${idx + 1}. ${entry}`)] : []),
             ].join('\n');
+          } else {
+            const completionLine =
+              executedActionCount > 0
+                ? `Task complete. Ran ${executedActionCount} action${executedActionCount === 1 ? '' : 's'}.`
+                : 'Task complete.';
+            const failureLine =
+              failedActionCount > 0
+                ? `${failedActionCount} action${failedActionCount === 1 ? '' : 's'} failed or were blocked.`
+                : '';
+            const outcome = finalText ? compact(finalText, 300) : '';
+            const recentUpdates = actionUpdates.slice(-6);
+            finalText = [
+              completionLine,
+              ...(failureLine ? [failureLine] : []),
+              ...(recentUpdates.length > 0 ? ['', 'Recent actions:', ...recentUpdates.map((entry, idx) => `${idx + 1}. ${entry}`)] : []),
+              ...(outcome ? ['', `Result: ${outcome}`] : []),
+            ].join('\n');
+          }
+
+          if (!finalText.trim() || /^working\.\.\.$/i.test(finalText.trim())) {
+            finalText = endedByAskUser ? 'Need your input to continue.' : 'Task complete.';
           }
 
           if (assistantMessage) {
             sessions.updateChatMessage(session.id, assistantMessage.id, {
-              content: finalText || 'Done.',
+              content: finalText,
               rawContent: lastRawResponse || finalText || '',
             });
           }
-          const conversationId = await provider.getCurrentConversationId().catch(() => undefined);
+          sessions.setStatus(session.id, 'done');
+          sessions.appendLog(session.id, {
+            level: endedByAskUser ? 'info' : 'success',
+            source: 'agent',
+            message: endedByAskUser ? 'Agent is waiting for user input.' : 'Agent task completed.',
+          });
+          const conversationId = await getConversationIdSafely(provider);
           if (conversationId) {
             sessions.setProviderSessionId(session.id, conversationId);
             sessions.appendLog(session.id, {
               level: 'info',
               source: 'agent',
-              message: `Session locked to conversation: ${conversationId}`,
-            });
+                message: `Session locked to conversation: ${conversationId}`,
+              });
           }
-          sessions.setStatus(session.id, 'done');
         } catch (error) {
           if (assistantMessage) {
             sessions.updateChatMessage(session.id, assistantMessage.id, {

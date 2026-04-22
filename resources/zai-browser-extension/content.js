@@ -14,7 +14,13 @@ const SELECTORS = {
     "[data-role='assistant']",
     "p[dir='auto']",
   ],
-  stop: ["button[aria-label*='Stop']", "button[data-testid*='stop']", "button:has(svg.size-5):not(.copy-response-button):not(.regenerate-response-button)"],
+  stop: [
+    "button[aria-label*='Stop']",
+    "button[aria-label*='stop']",
+    "button[data-testid*='stop']",
+    "button[title*='Stop']",
+    "[role='button'][aria-label*='Stop']",
+  ],
   newChat: ["button[aria-label*='New chat']", "a[href='/']"],
   modelPicker: ["button[aria-label='Select a model']", "button[aria-label*='model']", "button:has(svg.lucide-chevron-down)", "[role='combobox']"],
   modelOption: ["div[role='option']", "li[role='option']", "button[aria-label='model-item'][data-value]", "button[data-value]", "[role='option']", "[role='menuitem']", ".model-item"],
@@ -112,6 +118,27 @@ function sanitizeText(text) {
   return (text || "").replace(/\r/g, "").replace(/\u00a0/g, " ").replace(/\n\s*\n\s*\n/g, "\n\n").trim();
 }
 
+function isNodeVisible(node) {
+  if (!node || !(node instanceof Element)) {
+    return false;
+  }
+  if (!node.isConnected) {
+    return false;
+  }
+  const rect = node.getBoundingClientRect();
+  if (rect.width <= 0 || rect.height <= 0) {
+    return false;
+  }
+  const style = window.getComputedStyle(node);
+  if (style.display === "none" || style.visibility === "hidden" || style.pointerEvents === "none") {
+    return false;
+  }
+  if (Number(style.opacity || "1") === 0) {
+    return false;
+  }
+  return true;
+}
+
 function parseConversationId(url) {
   const match = (url || window.location.href).match(/\/c\/([A-Za-z0-9-]{8,})/);
   return match ? match[1] : undefined;
@@ -193,7 +220,36 @@ function readLatestAssistantText() {
 }
 
 function stopButtonVisible() {
-  return Boolean(queryFirstVisible(SELECTORS.stop));
+  const directMatches = queryAll(SELECTORS.stop);
+  const fallbackMatches = Array.from(document.querySelectorAll("button, [role='button']"));
+  const candidates = [...directMatches, ...fallbackMatches];
+
+  for (const node of candidates) {
+    if (!isNodeVisible(node)) {
+      continue;
+    }
+
+    const disabled = node.hasAttribute("disabled") || String(node.getAttribute("aria-disabled") || "").toLowerCase() === "true";
+    if (disabled) {
+      continue;
+    }
+
+    const text = sanitizeText(node.textContent || "").toLowerCase();
+    const aria = sanitizeText(node.getAttribute("aria-label") || "").toLowerCase();
+    const title = sanitizeText(node.getAttribute("title") || "").toLowerCase();
+    const testId = sanitizeText(node.getAttribute("data-testid") || "").toLowerCase();
+    const combined = `${text} ${aria} ${title} ${testId}`;
+
+    if (!combined.includes("stop") && !combined.includes("cancel")) {
+      continue;
+    }
+    if (/copy|regenerate|retry|edit|share|favorite|download/.test(combined)) {
+      continue;
+    }
+    return true;
+  }
+
+  return false;
 }
 
 function emitStreamEvent(streamId, event) {
@@ -431,11 +487,13 @@ function isComposerEmpty(composer) {
   return sanitizeText(readComposerValue(composer)).length === 0;
 }
 
-async function confirmPromptSubmission(composer) {
-  const baselineApiStart = lastApiStartAt;
+async function confirmPromptSubmission(composer, baseline) {
   for (let i = 0; i < 20; i++) {
     await wait(100);
-    if (lastApiStartAt > baselineApiStart || stopButtonVisible() || isComposerEmpty(composer)) {
+    const apiStarted = lastApiStartAt > baseline.apiStart;
+    const stopAppeared = !baseline.stopVisible && stopButtonVisible();
+    const composerCleared = baseline.composerHadText && isComposerEmpty(composer);
+    if (apiStarted || stopAppeared || composerCleared) {
       return true;
     }
   }
@@ -501,12 +559,20 @@ async function runSendPrompt(params) {
   }
   setComposerValue(composer, fullPrompt);
   await wait(150);
+  if (isComposerEmpty(composer)) {
+    throw new Error("Prompt text was not inserted into z.ai composer.");
+  }
 
   // Try submit button first
   const submit = queryFirstVisible(SELECTORS.submit);
   if (submit && !submit.disabled) {
+    const baseline = {
+      apiStart: lastApiStartAt,
+      stopVisible: stopButtonVisible(),
+      composerHadText: !isComposerEmpty(composer),
+    };
     submit.click();
-    if (await confirmPromptSubmission(composer)) {
+    if (await confirmPromptSubmission(composer, baseline)) {
       return { submitted: true };
     }
   }
@@ -515,8 +581,13 @@ async function runSendPrompt(params) {
   await wait(300);
   const retrySubmit = queryFirstVisible(SELECTORS.submit);
   if (retrySubmit && !retrySubmit.disabled) {
+    const baseline = {
+      apiStart: lastApiStartAt,
+      stopVisible: stopButtonVisible(),
+      composerHadText: !isComposerEmpty(composer),
+    };
     retrySubmit.click();
-    if (await confirmPromptSubmission(composer)) {
+    if (await confirmPromptSubmission(composer, baseline)) {
       return { submitted: true };
     }
   }
@@ -536,7 +607,13 @@ async function runSendPrompt(params) {
   composer.dispatchEvent(new KeyboardEvent("keypress", enterEvent));
   composer.dispatchEvent(new KeyboardEvent("keyup", enterEvent));
 
-  if (await confirmPromptSubmission(composer)) {
+  if (
+    await confirmPromptSubmission(composer, {
+      apiStart: lastApiStartAt,
+      stopVisible: stopButtonVisible(),
+      composerHadText: !isComposerEmpty(composer),
+    })
+  ) {
     return { submitted: true };
   }
 
@@ -544,7 +621,13 @@ async function runSendPrompt(params) {
   const form = composer.closest('form');
   if (form) {
     form.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }));
-    if (await confirmPromptSubmission(composer)) {
+    if (
+      await confirmPromptSubmission(composer, {
+        apiStart: lastApiStartAt,
+        stopVisible: stopButtonVisible(),
+        composerHadText: !isComposerEmpty(composer),
+      })
+    ) {
       return { submitted: true };
     }
   }
