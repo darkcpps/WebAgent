@@ -1,6 +1,28 @@
 // inject.js
-// This script runs in the MAIN world to intercept fetch responses natively.
+// This script runs in the MAIN world to intercept fetch responses natively and spoof visibility.
 
+// 1. Visibility & Focus Spoofing
+// Tricking the page into thinking it is always active and visible to prevent background throttling.
+Object.defineProperty(document, 'visibilityState', { get: () => 'visible', configurable: true });
+Object.defineProperty(document, 'hidden', { get: () => false, configurable: true });
+Object.defineProperty(document, 'webkitVisibilityState', { get: () => 'visible', configurable: true });
+Object.defineProperty(document, 'webkitHidden', { get: () => false, configurable: true });
+
+// Ensure focus remains "locked"
+document.hasFocus = () => true;
+
+// Prevent the page from knowing it lost focus or visibility changed
+const blockEvent = (e) => {
+    e.stopImmediatePropagation();
+    e.preventDefault();
+};
+
+window.addEventListener('visibilitychange', blockEvent, true);
+window.addEventListener('webkitvisibilitychange', blockEvent, true);
+window.addEventListener('blur', blockEvent, true);
+window.addEventListener('focusout', blockEvent, true);
+
+// 2. Fetch Interception
 const originalFetch = window.fetch;
 
 window.fetch = async function (...args) {

@@ -23,6 +23,51 @@ const SELECTORS = {
 };
 
 let activeStream = null;
+let wakeLock = null;
+let audioContext = null;
+
+async function requestWakeLock() {
+  try {
+    if ('wakeLock' in navigator) {
+      wakeLock = await navigator.wakeLock.request('screen');
+      wakeLock.addEventListener('release', () => {
+        console.log('[zai-bridge] Wake Lock was released');
+      });
+    }
+  } catch (err) {
+    console.error(`[zai-bridge] Wake Lock failed: ${err.name}, ${err.message}`);
+  }
+}
+
+function startSilentAudio() {
+  if (audioContext && audioContext.state === 'running') return;
+  try {
+    audioContext = new (window.AudioContext || window.webkitAudioContext)();
+    
+    // Create a silent buffer to play
+    const buffer = audioContext.createBuffer(1, 1, 22050);
+    const source = audioContext.createBufferSource();
+    source.buffer = buffer;
+    source.loop = true;
+    source.connect(audioContext.destination);
+    source.start();
+    
+    // Also try oscillator for more "activity"
+    const oscillator = audioContext.createOscillator();
+    const gainNode = audioContext.createGain();
+    gainNode.gain.value = 0.0001; // Extremely quiet but still there
+    oscillator.connect(gainNode);
+    gainNode.connect(audioContext.destination);
+    oscillator.start();
+
+    if (audioContext.state === 'suspended') {
+      audioContext.resume();
+    }
+    console.log('[zai-bridge] Silent audio keep-alive started');
+  } catch (err) {
+    console.warn('[zai-bridge] Could not start silent audio', err);
+  }
+}
 
 function randomId(prefix) {
   return `${prefix}_${Date.now()}_${Math.random().toString(16).slice(2, 8)}`;
@@ -268,6 +313,8 @@ window.addEventListener('message', (event) => {
 
 function startStreaming() {
   stopActiveStream();
+  startSilentAudio();
+  requestWakeLock();
 
   const streamId = randomId("stream");
   const initialText = readLatestAssistantText();
@@ -437,6 +484,9 @@ function findNewChatControl() {
 }
 
 async function runSendPrompt(params) {
+  startSilentAudio();
+  requestWakeLock();
+  
   const composer = queryFirstVisible(SELECTORS.input);
   if (!composer) {
     throw new Error("Unable to find z.ai prompt input.");
