@@ -11,30 +11,30 @@ function asString(value: unknown): string | undefined {
   return typeof value === 'string' && value.trim() ? value.trim() : undefined;
 }
 
-function asStringArray(value: unknown): string[] {
-  if (!Array.isArray(value)) {
-    return [];
-  }
-  return value.map((item) => (typeof item === 'string' ? item.trim() : '')).filter(Boolean);
+interface ParsedModelResponse {
+  models: ChatModel[];
+  selectedModelId?: string;
+  defaultModelId?: string;
 }
 
-function parseModelPayload(value: unknown): ChatModel[] {
-  const raw = (value && typeof value === 'object' && 'models' in (value as Record<string, unknown>))
-    ? (value as Record<string, unknown>).models
-    : value;
-
-  const entries = Array.isArray(raw) ? raw : [];
-  const models: ChatModel[] = [];
+function parseModelResponse(value: unknown): ParsedModelResponse {
+  const container = value && typeof value === 'object' ? (value as Record<string, unknown>) : undefined;
+  const rawEntries = container && Array.isArray(container.models) ? container.models : Array.isArray(value) ? value : [];
+  const parsed: ChatModel[] = [];
   const seen = new Set<string>();
 
-  for (const entry of entries) {
+  for (const entry of rawEntries) {
     if (typeof entry === 'string') {
-      const label = entry.trim();
-      if (!label || seen.has(label.toLowerCase())) {
+      const normalized = entry.trim();
+      if (!normalized) {
         continue;
       }
-      seen.add(label.toLowerCase());
-      models.push({ id: label, label });
+      const key = normalized.toLowerCase();
+      if (seen.has(key)) {
+        continue;
+      }
+      seen.add(key);
+      parsed.push({ id: normalized, label: normalized });
       continue;
     }
 
@@ -43,10 +43,28 @@ function parseModelPayload(value: unknown): ChatModel[] {
     }
 
     const record = entry as Record<string, unknown>;
-    const idCandidate = [record.id, record.value, record.model, record.name, record.modelId].find((item) => typeof item === 'string') as string | undefined;
-    const labelCandidate = [record.label, record.name, record.displayName, record.model, record.id, record.text].find(
-      (item) => typeof item === 'string',
-    ) as string | undefined;
+    const idCandidate = [
+      record.id,
+      record.model_id,
+      record.modelId,
+      record.backend_id,
+      record.backendId,
+      record.value,
+      record.code,
+      record.model,
+      record.key,
+      record.name,
+    ].find((item) => typeof item === 'string') as string | undefined;
+    const labelCandidate = [
+      record.name,
+      record.label,
+      record.display_name,
+      record.displayName,
+      record.title,
+      record.model_name,
+      record.text,
+      record.id,
+    ].find((item) => typeof item === 'string') as string | undefined;
 
     const id = (idCandidate || labelCandidate || '').trim();
     const label = (labelCandidate || idCandidate || '').trim();
@@ -59,10 +77,21 @@ function parseModelPayload(value: unknown): ChatModel[] {
       continue;
     }
     seen.add(key);
-    models.push({ id, label });
+    parsed.push({ id, label });
   }
 
-  return models;
+  const selectedModelId =
+    asString(container?.selectedModelId) ||
+    asString(container?.selected_model_id) ||
+    asString(container?.selectedModel) ||
+    asString(container?.selected_model);
+  const defaultModelId =
+    asString(container?.defaultModelId) ||
+    asString(container?.default_model_id) ||
+    asString(container?.defaultModel) ||
+    asString(container?.default_model);
+
+  return { models: parsed, selectedModelId, defaultModelId };
 }
 
 export class ZaiBridgeAdapter implements ProviderAdapter {
@@ -72,6 +101,8 @@ export class ZaiBridgeAdapter implements ProviderAdapter {
   private lastBridgeError?: string;
   private healthCache?: { status: BridgeHealthStatus; timestamp: number };
   private activeStreamId?: string;
+  private selectedModelId?: string;
+  private selectedModelLabel?: string;
 
   constructor(private readonly context: vscode.ExtensionContext) {
     this.client = new ZaiBridgeClient(context);
@@ -84,21 +115,62 @@ export class ZaiBridgeAdapter implements ProviderAdapter {
   async refreshModels(): Promise<ChatModel[]> {
     const result = await this.client.request('listModels');
     this.lastBridgeError = undefined;
-    const parsed = parseModelPayload((result as { models?: unknown } | undefined)?.models ?? result);
-    const labels = parsed.length > 0 ? parsed : asStringArray((result as { models?: unknown } | undefined)?.models ?? result).map((label) => ({ id: label, label }));
+    const parsed = parseModelResponse(result);
+    const labels = parsed.models;
     if (labels.length > 0) {
       this.modelsCache = [{ id: 'auto', label: 'Auto' }, ...labels];
+      const selectableIds = new Set(labels.map((model) => model.id.toLowerCase()));
+      const preferredSelected = parsed.selectedModelId || this.selectedModelId;
+      if (preferredSelected && selectableIds.has(preferredSelected.toLowerCase())) {
+        const active = labels.find((model) => model.id.toLowerCase() === preferredSelected.toLowerCase());
+        this.selectedModelId = active?.id;
+        this.selectedModelLabel = active?.label;
+      } else if (parsed.defaultModelId && selectableIds.has(parsed.defaultModelId.toLowerCase())) {
+        const fallback = labels.find((model) => model.id.toLowerCase() === parsed.defaultModelId?.toLowerCase());
+        this.selectedModelId = fallback?.id;
+        this.selectedModelLabel = fallback?.label;
+      } else if (this.selectedModelId && !selectableIds.has(this.selectedModelId.toLowerCase())) {
+        const first = labels[0];
+        this.selectedModelId = first?.id;
+        this.selectedModelLabel = first?.label;
+        console.warn(
+          `[zai-bridge] Saved model no longer exists. Falling back to ${this.selectedModelLabel || this.selectedModelId || 'Auto'}.`,
+        );
+      }
+      console.log(
+        `[zai-bridge] Models fetched: ${labels
+          .map((model) => `${model.label} (${model.id})`)
+          .slice(0, 20)
+          .join(', ')}`,
+      );
+      if (this.selectedModelId) {
+        console.log(`[zai-bridge] Active model: ${this.selectedModelLabel || this.selectedModelId} (${this.selectedModelId})`);
+      }
+    } else {
+      console.warn('[zai-bridge] /api/models returned no models. Keeping existing model cache.');
     }
     return this.modelsCache;
   }
 
   async selectModel(modelId: string): Promise<boolean> {
     if (!modelId || modelId === 'auto') {
+      this.selectedModelId = undefined;
+      this.selectedModelLabel = undefined;
       return true;
     }
-    const result = await this.client.request('selectModel', { modelId });
+    const result = await this.client.request('selectModel', {
+      modelId,
+      modelLabel: this.modelsCache.find((model) => model.id === modelId)?.label,
+    });
     this.lastBridgeError = undefined;
-    return asBoolean((result as { ok?: unknown } | undefined)?.ok ?? result);
+    const ok = asBoolean((result as { ok?: unknown } | undefined)?.ok ?? result);
+    if (ok) {
+      const active = this.modelsCache.find((model) => model.id === modelId);
+      this.selectedModelId = modelId;
+      this.selectedModelLabel = active?.label;
+      console.log(`[zai-bridge] Selected model: ${this.selectedModelLabel || modelId} (${modelId})`);
+    }
+    return ok;
   }
 
   async login(): Promise<void> {
@@ -188,8 +260,14 @@ export class ZaiBridgeAdapter implements ProviderAdapter {
     await this.client.request('sendPrompt', {
       systemPrompt: input.systemPrompt,
       userPrompt: input.userPrompt,
+      modelId: this.selectedModelId,
     });
     this.lastBridgeError = undefined;
+    if (this.selectedModelId) {
+      console.log(
+        `[zai-bridge] sendPrompt queued with model ${this.selectedModelLabel || this.selectedModelId} (${this.selectedModelId}).`,
+      );
+    }
   }
 
   async streamEvents(onEvent: (event: ProviderEvent) => void): Promise<void> {

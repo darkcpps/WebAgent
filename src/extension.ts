@@ -361,10 +361,15 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
                 message: `Could not select model ${modelId}. Proceeding with default.`,
               });
             } else {
+              const selectedModelLabel =
+                provider.listModels().find((entry) => entry.id === modelId)?.label || modelId;
               sessions.appendLog(session.id, {
                 level: 'info',
                 source: 'provider',
-                message: `Model selected: ${modelId}`,
+                message:
+                  providerId === 'zai'
+                    ? `Model selected: ${selectedModelLabel} (${modelId}). Request payload override armed for /api/v1/chats/new and /api/v2/chat/completions.`
+                    : `Model selected: ${selectedModelLabel} (${modelId})`,
               });
             }
           }

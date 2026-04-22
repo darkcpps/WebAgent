@@ -31,6 +31,15 @@ const SELECTORS = {
 let activeStream = null;
 let wakeLock = null;
 let audioContext = null;
+const MODEL_STATE_KEY = "zai-bridge:model-state";
+const modelState = {
+  selectedModelId: undefined,
+  selectedModelLabel: undefined,
+  enableThinking: undefined,
+  models: [],
+  defaultModelId: undefined,
+};
+let modelStateReady;
 
 async function requestWakeLock() {
   try {
@@ -116,6 +125,329 @@ function queryAll(selectors) {
 
 function sanitizeText(text) {
   return (text || "").replace(/\r/g, "").replace(/\u00a0/g, " ").replace(/\n\s*\n\s*\n/g, "\n\n").trim();
+}
+
+function toCleanString(value) {
+  if (typeof value !== "string") {
+    return "";
+  }
+  return sanitizeText(value);
+}
+
+function asBooleanOrUndefined(value) {
+  if (value === true || value === false) {
+    return value;
+  }
+  if (typeof value === "string") {
+    const lowered = value.trim().toLowerCase();
+    if (lowered === "true") {
+      return true;
+    }
+    if (lowered === "false") {
+      return false;
+    }
+  }
+  return undefined;
+}
+
+function safeJsonParse(text) {
+  try {
+    return JSON.parse(text);
+  } catch {
+    return undefined;
+  }
+}
+
+function readObjectPath(value, path) {
+  let cursor = value;
+  for (const key of path) {
+    if (!cursor || typeof cursor !== "object" || !(key in cursor)) {
+      return undefined;
+    }
+    cursor = cursor[key];
+  }
+  return cursor;
+}
+
+function postBridgePreferencesToPage() {
+  window.postMessage(
+    {
+      type: "ZAI_BRIDGE_SET_PREFERENCES",
+      payload: {
+        modelId: modelState.selectedModelId,
+        modelLabel: modelState.selectedModelLabel,
+        enableThinking: modelState.enableThinking,
+      },
+    },
+    "*",
+  );
+}
+
+async function persistModelState() {
+  try {
+    await chrome.storage.local.set({
+      [MODEL_STATE_KEY]: {
+        selectedModelId: modelState.selectedModelId,
+        selectedModelLabel: modelState.selectedModelLabel,
+        enableThinking: modelState.enableThinking,
+        defaultModelId: modelState.defaultModelId,
+      },
+    });
+  } catch (error) {
+    console.warn("[zai-bridge] Failed to persist model state:", error);
+  }
+}
+
+async function ensureModelStateLoaded() {
+  if (!modelStateReady) {
+    modelStateReady = (async () => {
+      try {
+        const stored = await chrome.storage.local.get([MODEL_STATE_KEY]);
+        const payload = stored?.[MODEL_STATE_KEY];
+        if (payload && typeof payload === "object") {
+          modelState.selectedModelId = toCleanString(payload.selectedModelId) || undefined;
+          modelState.selectedModelLabel = toCleanString(payload.selectedModelLabel) || undefined;
+          modelState.defaultModelId = toCleanString(payload.defaultModelId) || undefined;
+          modelState.enableThinking = asBooleanOrUndefined(payload.enableThinking);
+        }
+      } catch (error) {
+        console.warn("[zai-bridge] Failed to load model state:", error);
+      }
+      postBridgePreferencesToPage();
+    })();
+  }
+  await modelStateReady;
+}
+
+function normalizeModelOption(rawModel) {
+  if (!rawModel) {
+    return undefined;
+  }
+
+  if (typeof rawModel === "string") {
+    const value = toCleanString(rawModel);
+    if (!value) {
+      return undefined;
+    }
+    return { id: value, name: value, raw: rawModel };
+  }
+
+  if (typeof rawModel !== "object") {
+    return undefined;
+  }
+
+  const record = rawModel;
+  const idCandidates = [
+    record.id,
+    record.model_id,
+    record.modelId,
+    record.backend_id,
+    record.backendId,
+    record.value,
+    record.code,
+    record.slug,
+    record.model,
+    record.key,
+    record.name_en,
+    record.name,
+  ];
+  const nameCandidates = [
+    record.name,
+    record.label,
+    record.display_name,
+    record.displayName,
+    record.title,
+    record.model_name,
+    record.alias,
+    record.text,
+    record.id,
+  ];
+  const descriptionCandidates = [record.description, record.desc, record.intro, record.summary];
+
+  const id = idCandidates.map(toCleanString).find(Boolean) || "";
+  const name = nameCandidates.map(toCleanString).find(Boolean) || id;
+  const description = descriptionCandidates.map(toCleanString).find(Boolean) || undefined;
+
+  if (!id || !name) {
+    return undefined;
+  }
+
+  return { id, name, description, raw: rawModel };
+}
+
+function collectModelCandidates(value, output, depth = 0) {
+  if (depth > 6 || value == null) {
+    return;
+  }
+
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      collectModelCandidates(item, output, depth + 1);
+    }
+    return;
+  }
+
+  if (typeof value !== "object") {
+    return;
+  }
+
+  const normalized = normalizeModelOption(value);
+  if (normalized) {
+    output.push(normalized);
+  }
+
+  for (const nested of Object.values(value)) {
+    if (Array.isArray(nested) || (nested && typeof nested === "object")) {
+      collectModelCandidates(nested, output, depth + 1);
+    }
+  }
+}
+
+function dedupeModelOptions(models) {
+  const seen = new Set();
+  const deduped = [];
+
+  for (const model of models) {
+    if (!model || !model.id) {
+      continue;
+    }
+    const key = model.id.toLowerCase();
+    if (seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    deduped.push(model);
+  }
+
+  return deduped;
+}
+
+function pickDefaultModelId(rawModels, rawConfig) {
+  const directCandidates = [
+    readObjectPath(rawConfig, ["default_model"]),
+    readObjectPath(rawConfig, ["defaultModel"]),
+    readObjectPath(rawConfig, ["model"]),
+    readObjectPath(rawConfig, ["model_id"]),
+    readObjectPath(rawConfig, ["modelId"]),
+    readObjectPath(rawConfig, ["chat", "model"]),
+    readObjectPath(rawConfig, ["chat", "models", 0]),
+    readObjectPath(rawModels, ["default_model"]),
+    readObjectPath(rawModels, ["defaultModel"]),
+    readObjectPath(rawModels, ["model"]),
+    readObjectPath(rawModels, ["model_id"]),
+    readObjectPath(rawModels, ["modelId"]),
+  ];
+  const direct = directCandidates.map(toCleanString).find(Boolean);
+  if (direct) {
+    return direct;
+  }
+
+  const recursiveDefault = (value, depth = 0) => {
+    if (depth > 5 || value == null) {
+      return undefined;
+    }
+    if (Array.isArray(value)) {
+      for (const item of value) {
+        const found = recursiveDefault(item, depth + 1);
+        if (found) {
+          return found;
+        }
+      }
+      return undefined;
+    }
+    if (typeof value !== "object") {
+      return undefined;
+    }
+    const record = value;
+    const isDefault = record.default === true || record.is_default === true || record.isDefault === true || record.selected === true;
+    if (isDefault) {
+      const normalized = normalizeModelOption(record);
+      if (normalized?.id) {
+        return normalized.id;
+      }
+    }
+    for (const nested of Object.values(record)) {
+      const found = recursiveDefault(nested, depth + 1);
+      if (found) {
+        return found;
+      }
+    }
+    return undefined;
+  };
+
+  return recursiveDefault(rawModels) || recursiveDefault(rawConfig);
+}
+
+async function fetchJsonEndpoint(url) {
+  const response = await fetch(url, {
+    method: "GET",
+    credentials: "include",
+    headers: {
+      accept: "application/json, text/plain, */*",
+    },
+  });
+  if (!response.ok) {
+    throw new Error(`HTTP ${response.status} for ${url}`);
+  }
+  return await response.json();
+}
+
+async function discoverModelsFromApi() {
+  let rawModels;
+  let rawConfig;
+
+  try {
+    rawModels = await fetchJsonEndpoint("https://chat.z.ai/api/models");
+  } catch (error) {
+    console.warn("[zai-bridge] /api/models failed:", error);
+    return { models: [], defaultModelId: undefined, source: "fallback" };
+  }
+
+  try {
+    rawConfig = await fetchJsonEndpoint("https://chat.z.ai/api/config");
+  } catch (error) {
+    console.warn("[zai-bridge] /api/config fallback failed:", error);
+  }
+
+  const candidates = [];
+  collectModelCandidates(rawModels, candidates);
+  const models = dedupeModelOptions(candidates);
+  const defaultModelId = pickDefaultModelId(rawModels, rawConfig);
+
+  return { models, defaultModelId, source: "api" };
+}
+
+function formatModelOptionsForUi(models) {
+  return models.map((model) => ({
+    id: model.id,
+    label: model.name || model.id,
+    description: model.description,
+  }));
+}
+
+function alignSelectedModelWithAvailableModels() {
+  if (!modelState.models.length) {
+    return;
+  }
+
+  const exists = (candidate) =>
+    Boolean(candidate) && modelState.models.some((model) => model.id.toLowerCase() === candidate.toLowerCase());
+
+  if (exists(modelState.selectedModelId)) {
+    const active = modelState.models.find((model) => model.id.toLowerCase() === modelState.selectedModelId.toLowerCase());
+    modelState.selectedModelLabel = active?.name || modelState.selectedModelLabel;
+    return;
+  }
+
+  const preferredFallback = [modelState.defaultModelId, modelState.models[0]?.id].find((candidate) => exists(candidate));
+  if (!preferredFallback) {
+    return;
+  }
+
+  modelState.selectedModelId = preferredFallback;
+  const active = modelState.models.find((model) => model.id.toLowerCase() === preferredFallback.toLowerCase());
+  modelState.selectedModelLabel = active?.name || preferredFallback;
+  console.warn(`[zai-bridge] Saved model unavailable. Falling back to ${modelState.selectedModelLabel} (${modelState.selectedModelId}).`);
 }
 
 function isNodeVisible(node) {
@@ -335,6 +667,10 @@ let isApiStreamFinished = false;
 let lastApiStartAt = 0;
 
 window.addEventListener('message', (event) => {
+    if (event.source !== window) {
+      return;
+    }
+
     if (event.data?.type === 'ZAI_API_START') {
         lastApiStartAt = Date.now();
         apiInterceptedReasoning = "";
@@ -364,8 +700,19 @@ window.addEventListener('message', (event) => {
         }
     } else if (event.data?.type === 'ZAI_API_DONE' || event.data?.type === 'ZAI_API_ERROR') {
         isApiStreamFinished = true;
+    } else if (event.data?.type === "ZAI_BRIDGE_REQUEST_REWRITTEN") {
+        const payload = event.data.payload || {};
+        if (payload.endpoint && payload.modelId) {
+          console.log(`[zai-bridge] ${payload.endpoint} request model=${payload.modelId}${payload.enableThinking === undefined ? "" : ` thinking=${payload.enableThinking}`}`);
+        }
+        const nextThinking = asBooleanOrUndefined(payload.enableThinking);
+        if (nextThinking !== undefined) {
+          modelState.enableThinking = nextThinking;
+        }
     }
 });
+
+void ensureModelStateLoaded();
 
 function startStreaming() {
   stopActiveStream();
@@ -541,9 +888,37 @@ function findNewChatControl() {
   return null;
 }
 
+function sendPromptResult() {
+  return {
+    submitted: true,
+    selectedModelId: modelState.selectedModelId,
+    selectedModelLabel: modelState.selectedModelLabel,
+    enableThinking: modelState.enableThinking,
+  };
+}
+
 async function runSendPrompt(params) {
+  await ensureModelStateLoaded();
   startSilentAudio();
   requestWakeLock();
+
+  const requestedModelId = toCleanString(params.modelId);
+  if (requestedModelId) {
+    modelState.selectedModelId = requestedModelId;
+    const active = modelState.models.find((entry) => entry.id.toLowerCase() === requestedModelId.toLowerCase());
+    modelState.selectedModelLabel = active?.name || modelState.selectedModelLabel || requestedModelId;
+  }
+  const requestedThinking = asBooleanOrUndefined(params.enableThinking);
+  if (requestedThinking !== undefined) {
+    modelState.enableThinking = requestedThinking;
+  }
+  postBridgePreferencesToPage();
+  void persistModelState();
+  if (modelState.selectedModelId) {
+    console.log(
+      `[zai-bridge] Using model ${modelState.selectedModelLabel || modelState.selectedModelId} (${modelState.selectedModelId}) for upcoming /api/v1/chats/new and /api/v2/chat/completions requests.`,
+    );
+  }
   
   const composer = queryFirstVisible(SELECTORS.input);
   if (!composer) {
@@ -573,7 +948,7 @@ async function runSendPrompt(params) {
     };
     submit.click();
     if (await confirmPromptSubmission(composer, baseline)) {
-      return { submitted: true };
+      return sendPromptResult();
     }
   }
 
@@ -588,7 +963,7 @@ async function runSendPrompt(params) {
     };
     retrySubmit.click();
     if (await confirmPromptSubmission(composer, baseline)) {
-      return { submitted: true };
+      return sendPromptResult();
     }
   }
 
@@ -614,7 +989,7 @@ async function runSendPrompt(params) {
       composerHadText: !isComposerEmpty(composer),
     })
   ) {
-    return { submitted: true };
+    return sendPromptResult();
   }
 
   // Final fallback: try form submission if applicable
@@ -628,7 +1003,7 @@ async function runSendPrompt(params) {
         composerHadText: !isComposerEmpty(composer),
       })
     ) {
-      return { submitted: true };
+      return sendPromptResult();
     }
   }
 
@@ -637,6 +1012,8 @@ async function runSendPrompt(params) {
 }
 
 async function runCheckReady() {
+  await ensureModelStateLoaded();
+  postBridgePreferencesToPage();
   const input = queryFirstVisible(SELECTORS.input);
   const signInLink = queryFirstVisible(SELECTORS.signIn);
   const authHint = Array.from(document.querySelectorAll("button, a"))
@@ -734,7 +1111,7 @@ async function runOpenConversation(params) {
   return { opened: true, navigating: true };
 }
 
-async function runListModels() {
+async function runListModelsFromUiScrape() {
   let picker = queryFirstVisible(SELECTORS.modelPicker);
   
   // Fallback: look for an element stating the active model
@@ -752,7 +1129,7 @@ async function runListModels() {
   }
 
   if (!picker) {
-    return { models: [] };
+    return [];
   }
   
   picker.click();
@@ -805,31 +1182,121 @@ async function runListModels() {
   document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true, keyCode: 27 }));
   await wait(200);
   
-  return { models: models.slice(0, 60) };
+  return models.slice(0, 60);
+}
+
+async function runListModels() {
+  await ensureModelStateLoaded();
+  const discovered = await discoverModelsFromApi();
+
+  if (discovered.models.length > 0) {
+    modelState.models = discovered.models;
+    if (discovered.defaultModelId) {
+      modelState.defaultModelId = discovered.defaultModelId;
+    }
+    console.log(`[zai-bridge] Fetched ${modelState.models.length} models from /api/models.`);
+  } else {
+    const uiModels = await runListModelsFromUiScrape();
+    modelState.models = dedupeModelOptions(
+      uiModels.map((entry) => ({
+        id: toCleanString(entry.id) || toCleanString(entry.label),
+        name: toCleanString(entry.label) || toCleanString(entry.id),
+        raw: entry,
+      })),
+    );
+    console.warn("[zai-bridge] Falling back to UI model scrape because /api/models did not yield models.");
+  }
+
+  alignSelectedModelWithAvailableModels();
+  postBridgePreferencesToPage();
+  await persistModelState();
+
+  if (!modelState.models.length) {
+    return {
+      models: [],
+      selectedModelId: modelState.selectedModelId,
+      defaultModelId: modelState.defaultModelId,
+      source: discovered.source,
+    };
+  }
+
+  const modelsForUi = formatModelOptionsForUi(modelState.models);
+  const activeModel = modelState.models.find(
+    (entry) => modelState.selectedModelId && entry.id.toLowerCase() === modelState.selectedModelId.toLowerCase(),
+  );
+  console.log(
+    `[zai-bridge] Active model: ${activeModel?.name || modelState.selectedModelLabel || "none"} (${modelState.selectedModelId || "none"})`,
+  );
+  return {
+    models: modelsForUi,
+    selectedModelId: modelState.selectedModelId,
+    defaultModelId: modelState.defaultModelId,
+    source: discovered.source,
+  };
 }
 
 async function runSelectModel(params) {
-  const target = String(params.modelId || "").trim().toLowerCase();
-  if (!target) {
+  await ensureModelStateLoaded();
+  const targetRaw = toCleanString(params.modelId);
+  if (!targetRaw) {
     return { ok: true };
   }
-  const picker = queryFirstVisible(SELECTORS.modelPicker);
-  if (!picker) {
-    return { ok: false };
+
+  if (!modelState.models.length) {
+    await runListModels();
   }
 
-  picker.click();
-  await wait(200);
-  for (const option of queryAll(SELECTORS.modelOption)) {
-    const text = sanitizeText(option.getAttribute("data-value") || option.innerText || "");
-    if (text.toLowerCase() === target || text.toLowerCase().includes(target)) {
-      option.click();
-      await wait(100);
-      return { ok: true };
-    }
+  const target = targetRaw.toLowerCase();
+  const matchingModel = modelState.models.find(
+    (entry) => entry.id.toLowerCase() === target || entry.name.toLowerCase() === target,
+  );
+
+  if (matchingModel) {
+    modelState.selectedModelId = matchingModel.id;
+    modelState.selectedModelLabel = matchingModel.name;
+  } else {
+    const labelHint = toCleanString(params.modelLabel);
+    modelState.selectedModelId = targetRaw;
+    modelState.selectedModelLabel = labelHint || targetRaw;
+    console.warn(`[zai-bridge] Selected model id "${targetRaw}" not found in discovered list; using it directly.`);
   }
-  document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
-  return { ok: false };
+
+  const requestedThinking = asBooleanOrUndefined(params.enableThinking);
+  if (requestedThinking !== undefined) {
+    modelState.enableThinking = requestedThinking;
+  }
+
+  postBridgePreferencesToPage();
+  await persistModelState();
+
+  let uiClicked = false;
+  const picker = queryFirstVisible(SELECTORS.modelPicker);
+  if (picker) {
+    picker.click();
+    await wait(200);
+    for (const option of queryAll(SELECTORS.modelOption)) {
+      const text = sanitizeText(option.getAttribute("data-value") || option.innerText || "").toLowerCase();
+      if (
+        text === modelState.selectedModelId.toLowerCase() ||
+        text.includes(modelState.selectedModelId.toLowerCase()) ||
+        (modelState.selectedModelLabel && text.includes(modelState.selectedModelLabel.toLowerCase()))
+      ) {
+        option.click();
+        uiClicked = true;
+        await wait(100);
+        break;
+      }
+    }
+    document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
+  }
+
+  console.log(`[zai-bridge] Selected model ${modelState.selectedModelLabel} (${modelState.selectedModelId}), uiClicked=${uiClicked}`);
+  return {
+    ok: true,
+    modelId: modelState.selectedModelId,
+    modelLabel: modelState.selectedModelLabel,
+    uiClicked,
+  };
 }
 
 async function runStop() {
@@ -842,6 +1309,7 @@ async function runStop() {
 }
 
 async function handle(method, params) {
+  await ensureModelStateLoaded();
   switch (method) {
     case "health": {
       const ready = await runCheckReady();
