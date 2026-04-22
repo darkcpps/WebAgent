@@ -1,6 +1,6 @@
 import * as vscode from 'vscode';
 import type { ExtensionToWebviewMessage, WebviewToExtensionMessage } from '../shared/messages';
-import type { ApprovalMode, BridgeUiState, ProviderId } from '../shared/types';
+import type { ApprovalMode, BridgeUiState, ProviderId, ZaiManagedMode } from '../shared/types';
 import type { ProviderReadiness } from '../providers/base';
 import type { ProviderRegistry } from '../providers/registry';
 import type { SessionStore } from '../storage/sessionStore';
@@ -28,6 +28,7 @@ interface PanelCallbacks {
   openBridgeExtensionFolder(): Promise<void>;
   openZaiInBrowser(): Promise<void>;
   setApprovalMode(mode: ApprovalMode): Promise<void>;
+  setZaiRuntimeMode(mode: ZaiManagedMode): Promise<void>;
   previewSessionChanges(sessionId: string): Promise<void>;
 }
 
@@ -188,6 +189,11 @@ export class WebAgentPanel {
           await this.postState();
           await this.postToast('success', `Approval mode set to ${message.mode}.`);
           return;
+        case 'setZaiRuntimeMode':
+          await this.callbacks.setZaiRuntimeMode(message.mode);
+          await this.postState();
+          await this.postToast('info', `z.ai managed runtime set to ${message.mode}.`);
+          return;
         case 'previewSessionChanges':
           await this.callbacks.previewSessionChanges(message.sessionId);
           return;
@@ -211,7 +217,9 @@ export class WebAgentPanel {
         this.lastBridgeState = await this.callbacks.getBridgeState();
       } catch (error) {
         this.lastBridgeState = {
-          transport: 'playwright' as const,
+          transport: 'auto' as const,
+          activeRuntime: 'playwright' as const,
+          managedMode: 'headless' as const,
           autoStartCompanion: false,
           companionReachable: false,
           companionOwnedByExtension: false,
@@ -226,7 +234,9 @@ export class WebAgentPanel {
     }
 
     const bridge = this.lastBridgeState ?? {
-      transport: 'playwright' as const,
+      transport: 'auto' as const,
+      activeRuntime: 'playwright' as const,
+      managedMode: 'headless' as const,
       autoStartCompanion: false,
       companionReachable: false,
       companionOwnedByExtension: false,
@@ -244,7 +254,7 @@ export class WebAgentPanel {
         providerModels: {
           chatgpt: this.providers.get('chatgpt').listModels(),
           gemini: this.providers.get('gemini').listModels(),
-          zai: this.providers.get('zai').listModels(),
+          zai: this.providers.get('zai', { sessionId: this.sessions.getActive()?.id }).listModels(),
         },
         providerReady: this.callbacks.getProviderReadyState(),
         approvalMode: this.approvalMode(),

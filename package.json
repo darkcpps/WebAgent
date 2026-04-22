@@ -129,11 +129,21 @@
         "webagentCode.transport.zai": {
           "type": "string",
           "enum": [
+            "auto",
             "bridge",
             "playwright"
           ],
-          "default": "bridge",
-          "description": "Transport for z.ai provider. Use bridge for local browser extension companion, or playwright fallback."
+          "default": "auto",
+          "description": "Transport for z.ai provider. Auto prefers managed Playwright runtime, bridge uses local browser extension companion."
+        },
+        "webagentCode.zai.runtimeMode": {
+          "type": "string",
+          "enum": [
+            "headless",
+            "visible"
+          ],
+          "default": "headless",
+          "description": "Managed z.ai runtime mode. Headless runs in background after login; visible keeps browser window open."
         },
         "webagentCode.bridge.autoReconnect": {
           "type": "boolean",

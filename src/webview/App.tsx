@@ -25,7 +25,9 @@ const initialState: WebviewState = {
   },
   approvalMode: 'ask-before-action',
   bridge: {
-    transport: 'bridge',
+    transport: 'auto',
+    activeRuntime: 'playwright',
+    managedMode: 'headless',
     autoStartCompanion: true,
     companionReachable: false,
     companionOwnedByExtension: false,
@@ -146,7 +148,7 @@ export function App(): JSX.Element {
   );
 
   const isRunning = activeSession?.status === 'running';
-  const isBridgeMode = providerId === 'zai' && state.bridge.transport === 'bridge';
+  const isBridgeMode = providerId === 'zai' && state.bridge.activeRuntime === 'bridge';
   const isLoggedIn = isBridgeMode ? state.bridge.ready : state.providerReady[providerId];
   const canSend = message.trim().length > 0 && !isRunning && isLoggedIn;
   const debugLogs = activeSession?.logs ?? [];
@@ -501,8 +503,32 @@ export function App(): JSX.Element {
               <div className="card bridge-tab-card glass-panel">
                 <div className="bridge-title">Bridge Configuration</div>
                 <div className="bridge-row">
-                  <span>Transport</span>
+                  <span>Configured Transport</span>
                   <strong>{state.bridge.transport}</strong>
+                </div>
+                <div className="bridge-row">
+                  <span>Active Runtime</span>
+                  <strong>{state.bridge.activeRuntime === 'playwright' ? 'managed' : 'bridge'}</strong>
+                </div>
+                <div className="bridge-row">
+                  <span>Managed Mode</span>
+                  <strong>{state.bridge.managedMode}</strong>
+                </div>
+                <div className="bridge-row">
+                  <span>Managed Runtime Mode</span>
+                  <select
+                    className="glass-select"
+                    value={state.bridge.managedMode}
+                    onChange={(event) =>
+                      vscode.postMessage({
+                        type: 'setZaiRuntimeMode',
+                        mode: event.target.value as 'headless' | 'visible',
+                      })
+                    }
+                  >
+                    <option value="headless">headless</option>
+                    <option value="visible">visible</option>
+                  </select>
                 </div>
                 <div className="bridge-row">
                   <span>Local Server</span>
@@ -529,6 +555,9 @@ export function App(): JSX.Element {
                   <button className="glass-btn danger" onClick={() => vscode.postMessage({ type: 'stopBridgeCompanion' })}>Kill</button>
                 </div>
                 <div className="bridge-buttons ext-buttons">
+                  <button className="glass-btn" onClick={() => vscode.postMessage({ type: 'loginProvider', providerId: 'zai' })}>
+                    Open Managed Browser
+                  </button>
                   <button className="glass-btn" onClick={() => vscode.postMessage({ type: 'openZaiInBrowser' })}>Open Z.ai</button>
                   <button className="glass-btn" onClick={() => vscode.postMessage({ type: 'openBridgeExtensionFolder' })}>Reveal Extension</button>
                 </div>

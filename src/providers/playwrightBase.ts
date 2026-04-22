@@ -27,6 +27,7 @@ export abstract class PlaywrightWebProvider implements ProviderAdapter {
   protected page?: Page;
   protected lastResponse = '';
   protected stopped = false;
+  private launchedHeadless?: boolean;
   private pendingUserPrompt = '';
   private lastAssistantBeforeSend = '';
 
@@ -63,12 +64,16 @@ export abstract class PlaywrightWebProvider implements ProviderAdapter {
   }
 
   async login(): Promise<void> {
+    const loginHeadless = this.id === 'zai' ? false : this.getRuntimeHeadlessMode();
     await this.withRecovery(async () => {
       await this.gotoHome();
       await vscode.window.showInformationMessage(
         `Finish logging in to ${this.id} in the opened browser window. Login state is saved for future sessions.`,
       );
-    });
+    }, { headless: loginHeadless });
+    if (this.id === 'zai' && this.getRuntimeHeadlessMode()) {
+      console.log('[zai-managed] Login was opened in visible mode. Subsequent runtime will use headless mode.');
+    }
   }
 
   async logout(): Promise<boolean> {
@@ -353,7 +358,7 @@ export abstract class PlaywrightWebProvider implements ProviderAdapter {
   }
 
   async streamEvents(onEvent: (event: ProviderEvent) => void): Promise<void> {
-    await this.ensurePage(false);
+    await this.ensurePage();
     const start = Date.now();
     let stableTicks = 0;
     let lastDelivered = '';
@@ -437,22 +442,31 @@ export abstract class PlaywrightWebProvider implements ProviderAdapter {
     this.lastResponse = '';
   }
 
-  protected async ensurePage(headless = false): Promise<void> {
+  protected async ensurePage(headless?: boolean): Promise<void> {
+    const desiredHeadless = headless ?? this.getRuntimeHeadlessMode();
     if (this.context?.isClosed()) {
       this.context = undefined;
       this.page = undefined;
+      this.launchedHeadless = undefined;
     }
     if (this.page?.isClosed()) {
       this.page = undefined;
     }
 
+    if (this.context && this.launchedHeadless !== desiredHeadless) {
+      await this.resetBrowserState();
+    }
+
     if (!this.context) {
       const userDataDir = this.resolveProfileDir();
       await fs.promises.mkdir(userDataDir, { recursive: true });
-      this.context = await chromium.launchPersistentContext(userDataDir, this.getLaunchOptions(headless));
+      this.context = await chromium.launchPersistentContext(userDataDir, this.getLaunchOptions(desiredHeadless));
+      this.launchedHeadless = desiredHeadless;
+      console.log(`[${this.id}-managed] Launching browser context in ${desiredHeadless ? 'headless' : 'visible'} mode.`);
       this.context.on('close', () => {
         this.context = undefined;
         this.page = undefined;
+        this.launchedHeadless = undefined;
       });
     }
     if (!this.page) {
@@ -475,10 +489,10 @@ export abstract class PlaywrightWebProvider implements ProviderAdapter {
     };
   }
 
-  private async withRecovery<T>(operation: () => Promise<T>): Promise<T> {
+  private async withRecovery<T>(operation: () => Promise<T>, options?: { headless?: boolean }): Promise<T> {
     let lastError: unknown;
     for (let attempt = 0; attempt < 2; attempt += 1) {
-      await this.ensurePage(false);
+      await this.ensurePage(options?.headless);
       try {
         return await operation();
       } catch (error) {
@@ -596,9 +610,18 @@ export abstract class PlaywrightWebProvider implements ProviderAdapter {
     this.context = undefined;
     this.page = undefined;
     this.selectorHints = {};
+    this.launchedHeadless = undefined;
     if (context && !context.isClosed()) {
       await context.close().catch(() => undefined);
     }
+  }
+
+  protected getRuntimeHeadlessMode(): boolean {
+    if (this.id !== 'zai') {
+      return false;
+    }
+    const configured = vscode.workspace.getConfiguration('webagentCode').get<string>('zai.runtimeMode', 'headless');
+    return configured !== 'visible';
   }
 
   private isClosedTargetError(error: unknown): boolean {

@@ -93,7 +93,7 @@ export class BridgeCompanionManager implements vscode.Disposable {
   }
 
   private shouldUseBridgeTransport(): boolean {
-    const transport = vscode.workspace.getConfiguration('webagentCode').get<string>('transport.zai', 'bridge');
+    const transport = vscode.workspace.getConfiguration('webagentCode').get<string>('transport.zai', 'auto');
     return transport === 'bridge';
   }
 

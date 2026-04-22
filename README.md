@@ -44,14 +44,15 @@ z.ai additionally supports a local bridge adapter (`src/providers/zai-bridge.ts`
 1. Install deps: `cmd /c npm install`
 2. Load unpacked extension from `resources/zai-browser-extension` in Chrome/Edge Developer Mode
 3. Start companion: `cmd /c npm run bridge:companion` (optional once auto-start is enabled)
-4. In VS Code settings, keep `webagentCode.transport.zai = bridge` (default)
+4. In VS Code settings, keep `webagentCode.transport.zai = auto` (default)
 5. Optional health check: `cmd /c npm run bridge:doctor`
 
 Quick helper script: `.\scripts\install-zai-bridge.ps1`
 
 ### Transport controls
 
-- `webagentCode.transport.zai`: `bridge | playwright`
+- `webagentCode.transport.zai`: `auto | bridge | playwright` (`auto` prefers managed Playwright runtime)
+- `webagentCode.zai.runtimeMode`: `headless | visible` for managed runtime
 - `webagentCode.bridge.autoReconnect`: reconnect bridge socket automatically
 - `webagentCode.bridge.requestTimeoutMs`: RPC timeout for bridge requests
 - `webagentCode.bridge.autoStartCompanion`: start local companion automatically from extension (default `true`)
