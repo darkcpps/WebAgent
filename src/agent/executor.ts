@@ -244,7 +244,7 @@ export class ActionExecutor {
       case 'finish':
         return withRequestedSummary('Finalizing response');
       default:
-        return requestedSummary || action.type;
+        return requestedSummary || 'Running action';
     }
   }
 

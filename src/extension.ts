@@ -532,9 +532,11 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
             }
 
             if (assistantMessage) {
+              const liveLines = actionUpdates.slice(-4);
+              const liveContent = ['Working...', '', ...liveLines.map((entry, idx) => `${idx + 1}. ${entry}`)].join('\n');
               sessions.updateChatMessage(session.id, assistantMessage.id, {
-                content: 'Working...',
-                rawContent: lastRawResponse || 'Working...',
+                content: liveContent,
+                rawContent: lastRawResponse || liveContent,
               });
             }
           };
