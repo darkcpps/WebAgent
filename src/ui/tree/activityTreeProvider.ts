@@ -24,8 +24,8 @@ export class ActivityTreeProvider implements vscode.TreeDataProvider<vscode.Tree
     }
 
     const items = active.actionHistory.slice(-25).reverse().map((action) => {
-      const item = new vscode.TreeItem(`${action.type}: ${action.summary}`, vscode.TreeItemCollapsibleState.None);
-      item.description = action.status;
+      const item = new vscode.TreeItem(action.summary || action.type, vscode.TreeItemCollapsibleState.None);
+      item.description = action.status === 'running' ? 'running...' : action.status;
       item.tooltip = action.preview ?? action.summary;
       if (action.status === 'pending' && action.requiresApproval) {
         item.contextValue = 'pendingAction';

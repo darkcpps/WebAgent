@@ -27,29 +27,40 @@ export class ActionExecutor {
 
   async execute(sessionId: string, action: AgentAction): Promise<ExecutionResult> {
     const actionId = createId('action');
+    const summary = this.buildActionSummary(action);
     const preview = this.buildPreview(action);
     const decision = this.safety.evaluate(action);
 
     this.sessions.pushAction(sessionId, {
       id: actionId,
       type: action.type,
-      summary: action.summary || action.type,
+      summary,
       status: 'pending',
       requiresApproval: decision.requiresApproval,
       preview,
     });
 
     if (!decision.allowed) {
+      this.sessions.appendLog(sessionId, {
+        level: 'error',
+        source: 'agent',
+        message: `Blocked ${summary}. ${decision.reason ?? 'Not allowed by safety policy.'}`,
+      });
       this.sessions.updateAction(sessionId, actionId, { status: 'error', result: decision.reason ?? 'Action blocked.' });
       return { done: false, message: `Blocked action ${action.type}: ${decision.reason ?? 'Not allowed.'}` };
     }
 
     if (decision.requiresApproval) {
+      this.sessions.appendLog(sessionId, {
+        level: 'info',
+        source: 'agent',
+        message: `Awaiting approval for ${summary}...`,
+      });
       this.sessions.setStatus(sessionId, 'waiting-approval');
       this.sessions.setApprovalRequest(sessionId, {
         actionId,
         type: action.type,
-        summary: action.summary || action.type,
+        summary,
         preview,
       });
 
@@ -59,15 +70,30 @@ export class ActionExecutor {
       this.sessions.updateAction(sessionId, actionId, { status: approved ? 'approved' : 'rejected' });
 
       if (!approved) {
+        this.sessions.appendLog(sessionId, {
+          level: 'warning',
+          source: 'agent',
+          message: `Rejected ${summary}.`,
+        });
         return { done: false, message: `User rejected action ${action.type}.` };
       }
     }
 
     this.sessions.updateAction(sessionId, actionId, { status: 'running' });
+    this.sessions.appendLog(sessionId, {
+      level: 'info',
+      source: 'agent',
+      message: `${summary}...`,
+    });
 
     try {
       const result = await this.run(action);
       this.sessions.updateAction(sessionId, actionId, { status: 'done', result: truncate(result, 1000) });
+      this.sessions.appendLog(sessionId, {
+        level: 'success',
+        source: 'agent',
+        message: `Done ${summary}.`,
+      });
       return {
         done: action.type === 'finish',
         message: result,
@@ -75,6 +101,11 @@ export class ActionExecutor {
     } catch (error) {
       const message = (error as Error).message;
       this.sessions.updateAction(sessionId, actionId, { status: 'error', result: message });
+      this.sessions.appendLog(sessionId, {
+        level: 'error',
+        source: 'agent',
+        message: `Failed ${summary}: ${truncate(message, 220)}`,
+      });
       return {
         done: false,
         message: `Action failed: ${message}`,
@@ -181,6 +212,39 @@ export class ActionExecutor {
         return action.result;
       default:
         return action.summary || action.type;
+    }
+  }
+
+  private buildActionSummary(action: AgentAction): string {
+    const requestedSummary = action.summary?.trim();
+    const withRequestedSummary = (base: string): string =>
+      requestedSummary ? `${base} - ${truncate(requestedSummary, 100)}` : base;
+
+    switch (action.type) {
+      case 'list_files':
+        return withRequestedSummary('Listing files');
+      case 'read_file':
+        return withRequestedSummary(`Reading (${action.path})`);
+      case 'search_files':
+        return withRequestedSummary(`Searching ("${truncate(action.query, 80)}")`);
+      case 'edit_file':
+        return withRequestedSummary(`Editing (${action.path})`);
+      case 'create_file':
+        return withRequestedSummary(`Creating (${action.path})`);
+      case 'delete_file':
+        return withRequestedSummary(`Deleting (${action.path})`);
+      case 'rename_file':
+        return withRequestedSummary(`Renaming (${action.fromPath} -> ${action.toPath})`);
+      case 'run_command':
+        return withRequestedSummary(`Running command (${truncate(action.command, 80)})`);
+      case 'get_git_diff':
+        return withRequestedSummary('Reading git diff');
+      case 'ask_user':
+        return withRequestedSummary('Asking for your input');
+      case 'finish':
+        return withRequestedSummary('Finalizing response');
+      default:
+        return requestedSummary || action.type;
     }
   }
 

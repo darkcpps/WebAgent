@@ -23,6 +23,7 @@ import { buildProviderPrompt } from './agent/planner';
 import { sanitizeResponse } from './shared/utils';
 
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
+  const AUTO_FOLLOW_UP_DELAY_MS = 3000;
   const configuration = vscode.workspace.getConfiguration('webagentCode');
   const sessions = new SessionStore(context);
   const approvals = new ApprovalManager();
@@ -40,6 +41,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   const providerReady: Record<ProviderId, boolean> = {
     chatgpt: false,
     gemini: false,
+    perplexity: false,
     zai: false,
   };
 
@@ -167,39 +169,73 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         });
     });
 
-  const maybeOfferZaiPlaywrightFallback = async (sessionId: string, error: unknown): Promise<void> => {
-    if (providers.getZaiTransport(sessionId) !== 'bridge') {
-      return;
+  const normalizeProviderError = (error: unknown): { displayMessage: string; rawMessage: string; transient: boolean } => {
+    const rawMessage = error instanceof Error ? error.message : String(error);
+    const isTransientHtmlJsonError =
+      /no response,\s*please try again later/i.test(rawMessage) ||
+      /unexpected token '<'/i.test(rawMessage) ||
+      /<!doctype/i.test(rawMessage) ||
+      /not valid json/i.test(rawMessage);
+
+    if (isTransientHtmlJsonError) {
+      return {
+        displayMessage:
+          'Provider returned a temporary error page (likely rate-limited). Wait a bit before sending the next prompt, then try again.',
+        rawMessage,
+        transient: true,
+      };
     }
 
+    return {
+      displayMessage: rawMessage,
+      rawMessage,
+      transient: false,
+    };
+  };
+
+  const isLikelyZaiBridgeFailure = (error: unknown): boolean => {
     const message = error instanceof Error ? error.message : String(error);
-    if (!/\[bridge\]|companion|z\.ai bridge|socket/i.test(message)) {
-      return;
-    }
-
-    const picked = await vscode.window.showWarningMessage(
-      'z.ai bridge is unavailable for this chat. Switch this session to Playwright fallback?',
-      'Switch to Playwright',
-      'Keep Bridge',
+    return /\[bridge\]|companion|z\.ai bridge|socket|BROWSER_NOT_CONNECTED|No z\.ai tab|Receiving end does not exist|message channel closed/i.test(
+      message,
     );
+  };
 
-    if (picked !== 'Switch to Playwright') {
-      return;
+  const maybeAutoFallbackZaiToManaged = async (
+    sessionId: string,
+    error: unknown,
+    contextLabel: string,
+  ): Promise<boolean> => {
+    if (providers.resolveZaiRuntime(sessionId) !== 'bridge') {
+      return false;
+    }
+    if (!isLikelyZaiBridgeFailure(error)) {
+      return false;
     }
 
     providers.setZaiSessionTransport(sessionId, 'playwright');
     sessions.appendLog(sessionId, {
       level: 'warning',
       source: 'provider',
-      message: 'Switched this z.ai session to Playwright fallback.',
+      message: `Bridge runtime failed during ${contextLabel}. Auto-switched this session to managed runtime.`,
     });
-    const readiness = await providers.get('zai', { sessionId }).checkReady().catch(() => ({ ready: false }));
-    providerReady.zai = Boolean(readiness.ready);
+    sessions.appendLog(sessionId, {
+      level: 'info',
+      source: 'provider',
+      message: `z.ai runtime: configured=${providers.getZaiTransport(sessionId)} active=${providers.resolveZaiRuntime(
+        sessionId,
+      )} mode=${providers.getZaiManagedMode()}`,
+    });
+    console.warn(
+      `[zai-runtime] Bridge failure in ${contextLabel}. Switched session ${sessionId} to managed runtime (${providers.getZaiManagedMode()}).`,
+    );
+    return true;
   };
 
   const getBridgeState = async (): Promise<BridgeUiState> => {
     const activeSessionId = sessions.getActive()?.id;
     const transport = providers.getZaiTransport(activeSessionId);
+    const activeRuntime = providers.resolveZaiRuntime(activeSessionId);
+    const managedMode = providers.getZaiManagedMode();
     const autoStartCompanion = vscode.workspace.getConfiguration('webagentCode').get<boolean>('bridge.autoStartCompanion', true);
     const companionReachable = await bridgeCompanion.isReachable().catch(() => false);
 
@@ -208,7 +244,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     let loginRequired = false;
     let lastError: string | undefined;
 
-    if (transport === 'bridge') {
+    if (activeRuntime === 'bridge') {
       const provider = providers.get('zai', { sessionId: activeSessionId });
       if (provider.getBridgeHealth) {
         const health = await provider.getBridgeHealth().catch((error) => ({
@@ -223,10 +259,16 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         loginRequired = Boolean(health.loginRequired);
         lastError = health.error;
       }
+    } else {
+      ready = Boolean(providerReady.zai);
+      loginRequired = false;
+      browserConnected = ready;
     }
 
     return {
       transport,
+      activeRuntime,
+      managedMode,
       autoStartCompanion,
       companionReachable,
       companionOwnedByExtension: bridgeCompanion.isOwnedRunning(),
@@ -291,12 +333,42 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 
         try {
           const companionPromise = ensureBridgeCompanion(providerId, session.id);
-          const provider = providers.get(providerId, { sessionId: session.id });
+          let provider = providers.get(providerId, { sessionId: session.id });
+          let bridgeFallbackApplied = false;
+          const runWithAutoFallback = async <T>(operation: () => Promise<T>, contextLabel: string): Promise<T> => {
+            try {
+              return await operation();
+            } catch (error) {
+              if (providerId === 'zai' && !bridgeFallbackApplied) {
+                const switched = await maybeAutoFallbackZaiToManaged(session.id, error, contextLabel);
+                if (switched) {
+                  bridgeFallbackApplied = true;
+                  provider = providers.get(providerId, { sessionId: session.id });
+                  providerReady.zai = false;
+                  return operation();
+                }
+              }
+              throw error;
+            }
+          };
+
+          if (providerId === 'zai') {
+            const configured = providers.getZaiTransport(session.id);
+            const active = providers.resolveZaiRuntime(session.id);
+            const managedMode = providers.getZaiManagedMode();
+            sessions.appendLog(session.id, {
+              level: 'info',
+              source: 'provider',
+              message: `z.ai runtime selected: configured=${configured} active=${active}${
+                active === 'playwright' ? ` mode=${managedMode}` : ''
+              }`,
+            });
+          }
 
           // Only perform heavy readiness checks if we haven't checked recently or it's a new provider
           if (!providerReady[providerId] || !existing) {
             await companionPromise;
-            const readiness = await provider.checkReady();
+            const readiness = await runWithAutoFallback(() => provider.checkReady(), 'checkReady');
             providerReady[providerId] = readiness.ready;
             if (!readiness.ready) {
               if (readiness.loginRequired) {
@@ -308,7 +380,10 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 
           // --- Session navigation logic (simplified) ---
           // Step 1: Check what conversation the browser is currently on.
-          const browserConversationId = await provider.getCurrentConversationId().catch(() => undefined);
+          const browserConversationId = await runWithAutoFallback(
+            () => provider.getCurrentConversationId(),
+            'getCurrentConversationId',
+          ).catch(() => undefined);
           const sessionConversationId = sessions.get(session.id)?.providerSessionId;
 
           // Step 2: Only navigate if we MUST switch to a different conversation.
@@ -319,7 +394,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
               source: 'agent',
               message: `Switching browser to conversation ${sessionConversationId}...`,
             });
-            await provider.openConversation(sessionConversationId).catch(() => false);
+            await runWithAutoFallback(() => provider.openConversation(sessionConversationId), 'openConversation').catch(() => false);
           }
           // For a brand-new local session, never inherit a pre-existing browser conversation.
           // Force the browser back to "new chat" context if we detect an active thread URL.
@@ -329,12 +404,15 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
               source: 'agent',
               message: 'Fresh chat requested. Resetting browser to new conversation context...',
             });
-            await provider.startNewConversation().catch(() => undefined);
+            await runWithAutoFallback(() => provider.startNewConversation(), 'startNewConversation').catch(() => undefined);
 
             let clearedConversation = false;
             for (let attempt = 0; attempt < 8; attempt += 1) {
               await new Promise((resolve) => setTimeout(resolve, 250));
-              const currentConversation = await getConversationIdSafely(provider, 3000);
+              const currentConversation = await runWithAutoFallback(
+                () => getConversationIdSafely(provider, 3000),
+                'getCurrentConversationId',
+              ).catch(() => undefined);
               if (!currentConversation) {
                 clearedConversation = true;
                 break;
@@ -353,7 +431,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 
           // Model selection (non-fatal)
           if (modelId && modelId !== 'auto') {
-            const selected = await provider.selectModel(modelId).catch(() => false);
+            const selected = await runWithAutoFallback(() => provider.selectModel(modelId), 'selectModel').catch(() => false);
             if (!selected) {
               sessions.appendLog(session.id, {
                 level: 'warning',
@@ -386,16 +464,20 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
           if (!useAgentTools) {
             const prompt = buildChatAskPrompt(chatPrompt, { wasPreviouslyAgentMode });
             appendPromptPreviewLog(session.id, 'chat', prompt);
-            await provider.sendPrompt(prompt);
+            await runWithAutoFallback(() => provider.sendPrompt(prompt), 'sendPrompt(chat)');
 
-            const responseText = await collectProviderText(session.id, providerId, (delta) => {
-              if (assistantMessage) {
-                sessions.updateChatMessage(session.id, assistantMessage.id, {
-                  content: sanitizeResponse(delta) || 'Thinking...',
-                  rawContent: delta,
-                });
-              }
-            });
+            const responseText = await runWithAutoFallback(
+              () =>
+                collectProviderText(session.id, providerId, (delta) => {
+                  if (assistantMessage) {
+                    sessions.updateChatMessage(session.id, assistantMessage.id, {
+                      content: sanitizeResponse(delta) || 'Thinking...',
+                      rawContent: delta,
+                    });
+                  }
+                }),
+              'streamEvents(chat)',
+            );
             const cleaned = cleanFinalResponse(responseText);
             sessions.appendRawResponse(session.id, cleaned);
             if (assistantMessage) {
@@ -408,7 +490,10 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
             // Always capture the browser URL after the response and lock it to this session.
             // Z.ai creates the /c/UUID path during response generation.
             await new Promise((r) => setTimeout(r, 1500));
-            const conversationId = await getConversationIdSafely(provider);
+            const conversationId = await runWithAutoFallback(
+              () => getConversationIdSafely(provider),
+              'getCurrentConversationId',
+            ).catch(() => undefined);
             if (conversationId) {
               sessions.setProviderSessionId(session.id, conversationId);
               sessions.appendLog(session.id, {
@@ -470,11 +555,22 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
           };
 
           for (let round = 0; round < 25; round += 1) {
+            if (round > 0) {
+              sessions.appendLog(session.id, {
+                level: 'info',
+                source: 'provider',
+                message: `Waiting ${AUTO_FOLLOW_UP_DELAY_MS / 1000}s before automatic follow-up prompt...`,
+              });
+              await new Promise((resolve) => setTimeout(resolve, AUTO_FOLLOW_UP_DELAY_MS));
+            }
             const prompt = buildProviderPrompt(chatPrompt, repoContext, toolResults);
             appendPromptPreviewLog(session.id, 'agent', prompt, round + 1);
-            await provider.sendPrompt(prompt);
-            
-            const responseText = await collectProviderText(session.id, providerId);
+            await runWithAutoFallback(() => provider.sendPrompt(prompt), `sendPrompt(agent round ${round + 1})`);
+
+            const responseText = await runWithAutoFallback(
+              () => collectProviderText(session.id, providerId),
+              `streamEvents(agent round ${round + 1})`,
+            );
             lastRawResponse = responseText;
             
             const cleaned = cleanFinalResponse(responseText, { preferJson: true });
@@ -630,31 +726,44 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
             source: 'agent',
             message: endedByAskUser ? 'Agent is waiting for user input.' : 'Agent task completed.',
           });
-          const conversationId = await getConversationIdSafely(provider);
+          const conversationId = await runWithAutoFallback(
+            () => getConversationIdSafely(provider),
+            'getCurrentConversationId',
+          ).catch(() => undefined);
           if (conversationId) {
             sessions.setProviderSessionId(session.id, conversationId);
             sessions.appendLog(session.id, {
               level: 'info',
               source: 'agent',
-                message: `Session locked to conversation: ${conversationId}`,
-              });
-          }
-        } catch (error) {
-          if (assistantMessage) {
-            sessions.updateChatMessage(session.id, assistantMessage.id, {
-              content: error instanceof Error ? `Error: ${error.message}` : `Error: ${String(error)}`,
+              message: `Session locked to conversation: ${conversationId}`,
             });
           }
-          if (providerId === 'zai') {
-            await maybeOfferZaiPlaywrightFallback(session.id, error);
+        } catch (error) {
+          const normalizedError = normalizeProviderError(error);
+          if (assistantMessage) {
+            sessions.updateChatMessage(session.id, assistantMessage.id, {
+              content: `Error: ${normalizedError.displayMessage}`,
+            });
+          }
+          if (normalizedError.transient) {
+            sessions.appendLog(session.id, {
+              level: 'warning',
+              source: 'provider',
+              message: `Transient provider issue detected. ${normalizedError.displayMessage}`,
+            });
+            sessions.appendLog(session.id, {
+              level: 'info',
+              source: 'provider',
+              message: `Raw provider error: ${normalizedError.rawMessage}`,
+            });
           }
           sessions.setStatus(session.id, 'error');
           sessions.appendLog(session.id, {
             level: 'error',
             source: 'agent',
-            message: error instanceof Error ? error.message : String(error),
+            message: normalizedError.displayMessage,
           });
-          throw error;
+          throw new Error(normalizedError.displayMessage);
         }
       },
       stopTask: async (sessionId) => {
@@ -663,6 +772,16 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       },
       loginProvider: async (providerId) => {
         await ensureBridgeCompanion(providerId);
+        if (providerId === 'zai') {
+          const runtime = providers.resolveZaiRuntime(sessions.getActive()?.id);
+          const mode = providers.getZaiManagedMode();
+          console.log(`[zai-runtime] Login requested. activeRuntime=${runtime}${runtime === 'playwright' ? ` mode=${mode}` : ''}`);
+          if (runtime === 'playwright' && mode === 'headless') {
+            void vscode.window.showInformationMessage(
+              'z.ai login will open in visible mode once. After login, runtime returns to headless background mode.',
+            );
+          }
+        }
         await providers.get(providerId).login();
       },
       logoutProvider: async (providerId) => {
@@ -722,6 +841,14 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
           throw new Error(`Unsupported approval mode: ${mode}`);
         }
         await vscode.workspace.getConfiguration('webagentCode').update('approvalMode', mode, vscode.ConfigurationTarget.Workspace);
+      },
+      setZaiRuntimeMode: async (mode) => {
+        if (mode !== 'headless' && mode !== 'visible') {
+          throw new Error(`Unsupported z.ai runtime mode: ${mode}`);
+        }
+        await vscode.workspace
+          .getConfiguration('webagentCode')
+          .update('zai.runtimeMode', mode, vscode.ConfigurationTarget.Workspace);
       },
       previewSessionChanges: async (sessionId) => {
         const session = sessions.get(sessionId);

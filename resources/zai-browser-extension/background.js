@@ -92,10 +92,10 @@ async function queryZaiTabs() {
   return chrome.tabs.query({ url: ZAI_PATTERN });
 }
 
-async function ensureZaiTab({ createIfMissing = false, openHome = false } = {}) {
+async function ensureZaiTab({ createIfMissing = false, openHome = false, focus = false } = {}) {
   let tabs = await queryZaiTabs();
   if (!tabs.length && createIfMissing) {
-    const created = await chrome.tabs.create({ url: "https://chat.z.ai/", active: true });
+    const created = await chrome.tabs.create({ url: "https://chat.z.ai/", active: focus });
     tabs = created ? [created] : [];
   }
 
@@ -105,6 +105,8 @@ async function ensureZaiTab({ createIfMissing = false, openHome = false } = {}) 
   }
 
   if (openHome) {
+    await chrome.tabs.update(tab.id, { url: "https://chat.z.ai/", active: focus });
+  } else if (focus) {
     await chrome.tabs.update(tab.id, { active: true });
   }
 
@@ -113,7 +115,8 @@ async function ensureZaiTab({ createIfMissing = false, openHome = false } = {}) 
 
 async function sendToContent(method, params = {}) {
   try {
-    const tabId = await ensureZaiTab({ createIfMissing: method === "health", openHome: method === "health" });
+    const openHome = method === "health" && Boolean(params && params.openHome);
+    const tabId = await ensureZaiTab({ createIfMissing: true, openHome, focus: openHome });
     const response = await chrome.tabs.sendMessage(tabId, {
       type: "zai-bridge",
       method,

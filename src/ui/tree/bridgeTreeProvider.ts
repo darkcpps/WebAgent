@@ -39,10 +39,20 @@ export class BridgeTreeProvider implements vscode.TreeDataProvider<vscode.TreeIt
     const items: vscode.TreeItem[] = [];
 
     // Transport
-    const transportItem = new vscode.TreeItem('Transport');
+    const transportItem = new vscode.TreeItem('Configured Transport');
     transportItem.description = state.transport;
     transportItem.iconPath = new vscode.ThemeIcon('circuit-board');
     items.push(transportItem);
+
+    const runtimeItem = new vscode.TreeItem('Active Runtime');
+    runtimeItem.description = state.activeRuntime === 'playwright' ? 'managed' : 'bridge';
+    runtimeItem.iconPath = new vscode.ThemeIcon('debug-alt');
+    items.push(runtimeItem);
+
+    const modeItem = new vscode.TreeItem('Managed Mode');
+    modeItem.description = state.managedMode;
+    modeItem.iconPath = new vscode.ThemeIcon('window');
+    items.push(modeItem);
 
     // Companion Status
     const companionItem = new vscode.TreeItem('Companion');

@@ -9,6 +9,7 @@ import { selectorRegistry, type ProviderSelectorMap } from './selector-registry'
 import { sanitizeResponse } from '../shared/utils';
 
 type LaunchOptions = NonNullable<Parameters<typeof chromium.launchPersistentContext>[1]>;
+type BrowserChannelSetting = 'auto' | 'chrome' | 'msedge' | 'chromium';
 type SelectorGroup =
   | 'input'
   | 'submit'
@@ -27,6 +28,7 @@ export abstract class PlaywrightWebProvider implements ProviderAdapter {
   protected page?: Page;
   protected lastResponse = '';
   protected stopped = false;
+  private launchedHeadless?: boolean;
   private pendingUserPrompt = '';
   private lastAssistantBeforeSend = '';
 
@@ -63,12 +65,16 @@ export abstract class PlaywrightWebProvider implements ProviderAdapter {
   }
 
   async login(): Promise<void> {
+    const loginHeadless = this.id === 'zai' ? false : this.getRuntimeHeadlessMode();
     await this.withRecovery(async () => {
       await this.gotoHome();
       await vscode.window.showInformationMessage(
         `Finish logging in to ${this.id} in the opened browser window. Login state is saved for future sessions.`,
       );
-    });
+    }, { headless: loginHeadless });
+    if (this.id === 'zai' && this.getRuntimeHeadlessMode()) {
+      console.log('[zai-managed] Login was opened in visible mode. Subsequent runtime will use headless mode.');
+    }
   }
 
   async logout(): Promise<boolean> {
@@ -325,18 +331,15 @@ export abstract class PlaywrightWebProvider implements ProviderAdapter {
       
       await composer.focus();
       await composer.click();
-      await this.page!.waitForTimeout(200);
+      await this.page!.waitForTimeout(120);
 
-      // Clear and type
-      await composer.fill('');
-      if (fullPrompt.length < 800) {
-        await composer.pressSequentially(fullPrompt, { delay: 3 });
-      } else {
-        await composer.fill(fullPrompt);
+      const wrotePrompt = await this.writePromptWithFallback(composer, fullPrompt);
+      if (!wrotePrompt) {
+        throw new Error(`Unable to insert prompt text for provider ${this.id}.`);
       }
 
       // Small pause to let UI react
-      await this.page!.waitForTimeout(500);
+      await this.page!.waitForTimeout(220);
 
       const submitButton = await this.findFirstVisible(this.getSelectors('submit'), 4000);
       if (submitButton) {
@@ -353,7 +356,7 @@ export abstract class PlaywrightWebProvider implements ProviderAdapter {
   }
 
   async streamEvents(onEvent: (event: ProviderEvent) => void): Promise<void> {
-    await this.ensurePage(false);
+    await this.ensurePage();
     const start = Date.now();
     let stableTicks = 0;
     let lastDelivered = '';
@@ -437,22 +440,31 @@ export abstract class PlaywrightWebProvider implements ProviderAdapter {
     this.lastResponse = '';
   }
 
-  protected async ensurePage(headless = false): Promise<void> {
+  protected async ensurePage(headless?: boolean): Promise<void> {
+    const desiredHeadless = headless ?? this.getRuntimeHeadlessMode();
     if (this.context?.isClosed()) {
       this.context = undefined;
       this.page = undefined;
+      this.launchedHeadless = undefined;
     }
     if (this.page?.isClosed()) {
       this.page = undefined;
     }
 
+    if (this.context && this.launchedHeadless !== desiredHeadless) {
+      await this.resetBrowserState();
+    }
+
     if (!this.context) {
       const userDataDir = this.resolveProfileDir();
       await fs.promises.mkdir(userDataDir, { recursive: true });
-      this.context = await chromium.launchPersistentContext(userDataDir, this.getLaunchOptions(headless));
+      this.context = await this.launchContextWithFallback(userDataDir, desiredHeadless);
+      this.launchedHeadless = desiredHeadless;
+      console.log(`[${this.id}-managed] Launching browser context in ${desiredHeadless ? 'headless' : 'visible'} mode.`);
       this.context.on('close', () => {
         this.context = undefined;
         this.page = undefined;
+        this.launchedHeadless = undefined;
       });
     }
     if (!this.page) {
@@ -468,17 +480,23 @@ export abstract class PlaywrightWebProvider implements ProviderAdapter {
     }
   }
 
-  protected getLaunchOptions(headless: boolean): LaunchOptions {
-    return {
+  protected getLaunchOptions(headless: boolean, channel?: LaunchOptions['channel']): LaunchOptions {
+    const options: LaunchOptions = {
       headless,
       viewport: { width: 1440, height: 960 },
+      args: ['--disable-blink-features=AutomationControlled'],
+      ignoreDefaultArgs: ['--enable-automation'],
     };
+    if (channel) {
+      options.channel = channel;
+    }
+    return options;
   }
 
-  private async withRecovery<T>(operation: () => Promise<T>): Promise<T> {
+  private async withRecovery<T>(operation: () => Promise<T>, options?: { headless?: boolean }): Promise<T> {
     let lastError: unknown;
     for (let attempt = 0; attempt < 2; attempt += 1) {
-      await this.ensurePage(false);
+      await this.ensurePage(options?.headless);
       try {
         return await operation();
       } catch (error) {
@@ -570,6 +588,49 @@ export abstract class PlaywrightWebProvider implements ProviderAdapter {
     return legacyProfileDir;
   }
 
+  private async launchContextWithFallback(userDataDir: string, headless: boolean): Promise<BrowserContext> {
+    const channels = this.getLaunchChannelOrder();
+    let lastError: unknown;
+
+    for (const channel of channels) {
+      const options = this.getLaunchOptions(headless, channel);
+      try {
+        return await chromium.launchPersistentContext(userDataDir, options);
+      } catch (error) {
+        lastError = error;
+        if (!channel) {
+          break;
+        }
+        const message = error instanceof Error ? error.message : String(error);
+        console.warn(`[${this.id}-managed] Browser channel "${channel}" unavailable (${message}). Falling back...`);
+      }
+    }
+
+    throw lastError instanceof Error ? lastError : new Error(`Failed to launch browser context for ${this.id}.`);
+  }
+
+  private getLaunchChannelOrder(): Array<LaunchOptions['channel'] | undefined> {
+    const configured = vscode.workspace
+      .getConfiguration('webagentCode')
+      .get<BrowserChannelSetting>('playwright.browserChannel', 'auto');
+
+    if (configured === 'chrome') {
+      return ['chrome', undefined];
+    }
+    if (configured === 'msedge') {
+      return ['msedge', undefined];
+    }
+    if (configured === 'chromium') {
+      return [undefined];
+    }
+
+    // Providers that often trigger strict auth checks do better with branded channels.
+    if (this.id === 'perplexity' || this.id === 'gemini') {
+      return ['chrome', 'msedge', undefined];
+    }
+    return [undefined];
+  }
+
   private pickBestPage(pages: Page[]): Page | undefined {
     if (!pages.length) {
       return undefined;
@@ -596,9 +657,18 @@ export abstract class PlaywrightWebProvider implements ProviderAdapter {
     this.context = undefined;
     this.page = undefined;
     this.selectorHints = {};
+    this.launchedHeadless = undefined;
     if (context && !context.isClosed()) {
       await context.close().catch(() => undefined);
     }
+  }
+
+  protected getRuntimeHeadlessMode(): boolean {
+    if (this.id !== 'zai') {
+      return false;
+    }
+    const configured = vscode.workspace.getConfiguration('webagentCode').get<string>('zai.runtimeMode', 'headless');
+    return configured !== 'visible';
   }
 
   private isClosedTargetError(error: unknown): boolean {
@@ -660,6 +730,100 @@ export abstract class PlaywrightWebProvider implements ProviderAdapter {
       await this.page!.waitForTimeout(200).catch(() => undefined);
     }
     return undefined;
+  }
+
+  private async writePromptWithFallback(composer: Locator, fullPrompt: string): Promise<boolean> {
+    await this.clearComposer(composer);
+
+    if (await this.tryFastComposerWrite(composer, fullPrompt)) {
+      return true;
+    }
+
+    // Last-resort typing can fire Enter key handlers on multiline prompts.
+    if (!fullPrompt.includes('\n')) {
+      await composer.pressSequentially(fullPrompt, { delay: 1 }).catch(() => undefined);
+      if (await this.composerContainsPrompt(composer, fullPrompt)) {
+        return true;
+      }
+    }
+
+    await composer.fill(fullPrompt).catch(() => undefined);
+    return this.composerContainsPrompt(composer, fullPrompt);
+  }
+
+  private async clearComposer(composer: Locator): Promise<void> {
+    await composer.fill('').catch(() => undefined);
+
+    const modifier = process.platform === 'darwin' ? 'Meta' : 'Control';
+    await this.page!.keyboard.press(`${modifier}+A`).catch(() => undefined);
+    await this.page!.keyboard.press('Backspace').catch(() => undefined);
+  }
+
+  private async tryFastComposerWrite(composer: Locator, fullPrompt: string): Promise<boolean> {
+    const attempts: Array<() => Promise<void>> = [
+      async () => {
+        await composer.fill(fullPrompt);
+      },
+      async () => {
+        await composer.focus();
+        await this.page!.keyboard.insertText(fullPrompt);
+      },
+      async () => {
+        await this.page!.evaluate((value) => {
+          const el = document.activeElement as HTMLElement | null;
+          if (!el) {
+            return;
+          }
+
+          if (el instanceof HTMLTextAreaElement || el instanceof HTMLInputElement) {
+            el.value = value;
+            el.dispatchEvent(new Event('input', { bubbles: true }));
+            el.dispatchEvent(new Event('change', { bubbles: true }));
+            return;
+          }
+
+          if (el.isContentEditable) {
+            el.textContent = value;
+            el.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: value }));
+            el.dispatchEvent(new Event('change', { bubbles: true }));
+          }
+        }, fullPrompt);
+      },
+    ];
+
+    for (const attempt of attempts) {
+      await this.clearComposer(composer);
+      await attempt().catch(() => undefined);
+      await this.page!.waitForTimeout(60).catch(() => undefined);
+      if (await this.composerContainsPrompt(composer, fullPrompt)) {
+        return true;
+      }
+    }
+
+    return false;
+  }
+
+  private async composerContainsPrompt(composer: Locator, fullPrompt: string): Promise<boolean> {
+    const expected = fullPrompt.trim();
+    if (!expected) {
+      return true;
+    }
+
+    try {
+      const actualRaw = await composer.evaluate((node) => {
+        if (node instanceof HTMLTextAreaElement || node instanceof HTMLInputElement) {
+          return node.value || '';
+        }
+        return (node.textContent || '').trim();
+      });
+
+      const actual = actualRaw.replace(/\s+/g, ' ').trim();
+      const probe = expected.slice(0, Math.min(96, expected.length)).replace(/\s+/g, ' ').trim();
+
+      return actual.length >= Math.min(24, expected.length) && actual.includes(probe);
+    } catch {
+      return false;
+    }
   }
 
   private async extractVisibleOptionLabels(selectors: string[], timeoutMs: number): Promise<string[]> {
