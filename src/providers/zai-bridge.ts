@@ -261,6 +261,7 @@ export class ZaiBridgeAdapter implements ProviderAdapter {
       systemPrompt: input.systemPrompt,
       userPrompt: input.userPrompt,
       modelId: this.selectedModelId,
+      enableThinking: input.enableThinking,
     });
     this.lastBridgeError = undefined;
     if (this.selectedModelId) {

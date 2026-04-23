@@ -5,7 +5,15 @@ export type WebviewToExtensionMessage =
   | { type: 'newChat'; providerId: ProviderId }
   | { type: 'deleteChat'; sessionId: string }
   | { type: 'startTask'; providerId: ProviderId; task: string }
-  | { type: 'sendChat'; providerId: ProviderId; sessionId?: string; message: string; modelId?: string; agentMode?: boolean }
+  | {
+      type: 'sendChat';
+      providerId: ProviderId;
+      sessionId?: string;
+      message: string;
+      modelId?: string;
+      agentMode?: boolean;
+      enableThinking?: boolean;
+    }
   | { type: 'stopTask'; sessionId: string }
   | { type: 'loginProvider'; providerId: ProviderId }
   | { type: 'logoutProvider'; providerId: ProviderId }

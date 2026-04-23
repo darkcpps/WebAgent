@@ -4,12 +4,17 @@ import type { ProviderEvent, ProviderPrompt, ProviderReadiness } from './base';
 import { PlaywrightWebProvider } from './playwrightBase';
 
 type QueueResolver = (event: ProviderEvent) => void;
+interface PendingWaiter {
+  resolve: QueueResolver;
+  timer?: ReturnType<typeof setTimeout>;
+}
 
 export class PerplexityWebAdapter extends PlaywrightWebProvider {
+  private static readonly INITIAL_STREAM_EVENT_TIMEOUT_MS = 45000;
+  private static readonly INTER_EVENT_TIMEOUT_MS = 90000;
   private readonly queue: ProviderEvent[] = [];
-  private readonly waiters: QueueResolver[] = [];
-  private manualModelsCache: ChatModel[] = [{ id: 'auto', label: 'Auto' }];
-  private selectedModelId?: string;
+  private readonly waiters: PendingWaiter[] = [];
+  private modelCache: ChatModel[] = [{ id: 'auto', label: 'Auto' }];
   private bindingsInstalled = false;
 
   constructor(context: vscode.ExtensionContext) {
@@ -17,19 +22,41 @@ export class PerplexityWebAdapter extends PlaywrightWebProvider {
   }
 
   override listModels(): ChatModel[] {
-    return this.manualModelsCache;
+    return this.modelCache;
   }
 
   override async refreshModels(): Promise<ChatModel[]> {
-    return this.manualModelsCache;
+    const genericDiscovered = await super.refreshModels();
+    if (genericDiscovered.length > 1) {
+      this.modelCache = genericDiscovered;
+      return this.modelCache;
+    }
+
+    await this.ensurePage(false);
+    await this.ensureOnOrigin();
+
+    let labels = await this.extractRadixModelLabels();
+    if (labels.length === 0) {
+      labels = await this.openPickerAndExtractRadixLabels();
+    }
+
+    if (labels.length > 0) {
+      this.modelCache = this.toPerplexityModelList(labels);
+    }
+
+    return this.modelCache;
   }
 
   override async selectModel(modelId: string): Promise<boolean> {
-    this.selectedModelId = modelId && modelId !== 'auto' ? modelId : undefined;
-    if (this.selectedModelId && !this.manualModelsCache.some((model) => model.id === this.selectedModelId)) {
-      this.manualModelsCache = [...this.manualModelsCache, { id: this.selectedModelId, label: this.selectedModelId }];
+    const selected = await super.selectModel(modelId);
+    if (!selected || !modelId || modelId === 'auto') {
+      return selected;
     }
-    return true;
+
+    if (!this.modelCache.some((model) => model.id === modelId)) {
+      this.modelCache = [...this.modelCache, { id: modelId, label: modelId }];
+    }
+    return selected;
   }
 
   override async checkReady(): Promise<ProviderReadiness> {
@@ -97,14 +124,28 @@ export class PerplexityWebAdapter extends PlaywrightWebProvider {
   override async sendPrompt(input: ProviderPrompt): Promise<void> {
     await this.ensurePage(false);
     await this.ensureHookInstalled();
+    await this.page!
+      .evaluate((enabled) => {
+        const scope = globalThis as typeof globalThis & { __webagentPerplexityEnableThinking?: boolean };
+        if (typeof enabled === 'boolean') {
+          scope.__webagentPerplexityEnableThinking = enabled;
+          return;
+        }
+        delete scope.__webagentPerplexityEnableThinking;
+      }, input.enableThinking)
+      .catch(() => undefined);
     this.resetQueue();
     await super.sendPrompt(input);
   }
 
   override async streamEvents(onEvent: (event: ProviderEvent) => void): Promise<void> {
     onEvent({ type: 'status', message: 'Waiting for perplexity response...' });
+    let sawEvent = false;
     while (true) {
-      const event = await this.nextEvent();
+      const event = await this.nextEvent(
+        sawEvent ? PerplexityWebAdapter.INTER_EVENT_TIMEOUT_MS : PerplexityWebAdapter.INITIAL_STREAM_EVENT_TIMEOUT_MS,
+      );
+      sawEvent = true;
       onEvent(event);
       if (event.type === 'done' || event.type === 'error') {
         return;
@@ -136,6 +177,62 @@ export class PerplexityWebAdapter extends PlaywrightWebProvider {
     }
   }
 
+  private async openPickerAndExtractRadixLabels(): Promise<string[]> {
+    const pickerCandidates = [
+      'button[aria-label*="Model"]',
+      '[role="combobox"]',
+      'button[aria-haspopup="menu"]:has(span[translate="no"])',
+      'button:has-text("Best")',
+    ];
+
+    for (const selector of pickerCandidates) {
+      const trigger = this.page!.locator(selector).first();
+      try {
+        if ((await trigger.count()) === 0 || !(await trigger.isVisible())) {
+          continue;
+        }
+
+        await trigger.click().catch(() => undefined);
+        await this.page!.waitForTimeout(250);
+        const labels = await this.extractRadixModelLabels();
+        await this.page!.keyboard.press('Escape').catch(() => undefined);
+        if (labels.length > 0) {
+          return labels;
+        }
+      } catch {
+        // Ignore and continue with next candidate.
+      }
+    }
+
+    return [];
+  }
+
+  private async extractRadixModelLabels(): Promise<string[]> {
+    return this.page!
+      .evaluate(() => {
+        const labels = Array.from(document.querySelectorAll<HTMLElement>('[role="menuitemradio"] [translate="no"]'))
+          .map((node) => (node.textContent || '').trim())
+          .filter((value) => value.length >= 2 && value.length <= 80);
+        return Array.from(new Set(labels));
+      })
+      .catch(() => []);
+  }
+
+  private toPerplexityModelList(labels: string[]): ChatModel[] {
+    const deduped = new Map<string, ChatModel>();
+    for (const rawLabel of labels) {
+      const label = rawLabel.trim().replace(/\s+/g, ' ');
+      if (!label) {
+        continue;
+      }
+      const key = label.toLowerCase();
+      if (!deduped.has(key)) {
+        deduped.set(key, { id: label, label });
+      }
+    }
+    return [{ id: 'auto', label: 'Auto' }, ...deduped.values()];
+  }
+
   private getConversationIdFromUrl(url: string): string | undefined {
     try {
       const parsed = new URL(url);
@@ -155,26 +252,44 @@ export class PerplexityWebAdapter extends PlaywrightWebProvider {
   private resetQueue(): void {
     this.queue.length = 0;
     while (this.waiters.length > 0) {
-      const resolve = this.waiters.shift();
-      resolve?.({ type: 'error', message: 'Previous Perplexity stream was replaced by a new request.' });
+      const waiter = this.waiters.shift();
+      if (waiter?.timer) {
+        clearTimeout(waiter.timer);
+      }
+      waiter?.resolve({ type: 'error', message: 'Previous Perplexity stream was replaced by a new request.' });
     }
   }
 
   private pushEvent(event: ProviderEvent): void {
     const waiter = this.waiters.shift();
     if (waiter) {
-      waiter(event);
+      if (waiter.timer) {
+        clearTimeout(waiter.timer);
+      }
+      waiter.resolve(event);
       return;
     }
     this.queue.push(event);
   }
 
-  private nextEvent(): Promise<ProviderEvent> {
+  private nextEvent(timeoutMs = PerplexityWebAdapter.INTER_EVENT_TIMEOUT_MS): Promise<ProviderEvent> {
     const queued = this.queue.shift();
     if (queued) {
       return Promise.resolve(queued);
     }
-    return new Promise((resolve) => this.waiters.push(resolve));
+    return new Promise((resolve) => {
+      const waiter: PendingWaiter = { resolve };
+      if (timeoutMs > 0) {
+        waiter.timer = setTimeout(() => {
+          const index = this.waiters.indexOf(waiter);
+          if (index >= 0) {
+            this.waiters.splice(index, 1);
+          }
+          resolve({ type: 'error', message: `Perplexity response timed out after ${Math.round(timeoutMs / 1000)}s.` });
+        }, timeoutMs);
+      }
+      this.waiters.push(waiter);
+    });
   }
 
   private async ensureHookInstalled(): Promise<void> {
@@ -198,6 +313,7 @@ export class PerplexityWebAdapter extends PlaywrightWebProvider {
           __webagentPerplexityOriginalFetch?: typeof fetch;
           __webagentPerplexityAbort?: AbortController;
           __webagentPerplexityEmit?: (payload: unknown) => Promise<void>;
+          __webagentPerplexityEnableThinking?: boolean;
         };
 
         if (scope.__webagentPerplexityHookInstalled) {
@@ -214,6 +330,89 @@ export class PerplexityWebAdapter extends PlaywrightWebProvider {
           } catch {
             // Ignore callback failures.
           }
+        };
+
+        const applyThinkingPreference = (payload: unknown, enabled: boolean): boolean => {
+          const isPlainObject = (value: unknown): value is Record<string, unknown> =>
+            typeof value === 'object' && value !== null && !Array.isArray(value);
+          if (!isPlainObject(payload)) {
+            return false;
+          }
+
+          const visited = new Set<unknown>();
+          let changed = false;
+          const keyRegex = /(thinking|reasoning|reason)/i;
+
+          const patchValue = (holder: Record<string, unknown>, key: string, value: unknown): void => {
+            if (typeof value === 'boolean') {
+              if (value !== enabled) {
+                holder[key] = enabled;
+                changed = true;
+              }
+              return;
+            }
+            if (typeof value === 'number') {
+              if (value === 0 || value === 1) {
+                const next = enabled ? 1 : 0;
+                if (value !== next) {
+                  holder[key] = next;
+                  changed = true;
+                }
+              }
+              return;
+            }
+            if (typeof value === 'string') {
+              const lowered = value.trim().toLowerCase();
+              if (/^(true|false)$/.test(lowered)) {
+                const next = enabled ? 'true' : 'false';
+                if (lowered !== next) {
+                  holder[key] = next;
+                  changed = true;
+                }
+                return;
+              }
+              if (/^(enabled|disabled)$/.test(lowered)) {
+                const next = enabled ? 'enabled' : 'disabled';
+                if (lowered !== next) {
+                  holder[key] = next;
+                  changed = true;
+                }
+                return;
+              }
+              if (/^(on|off)$/.test(lowered)) {
+                const next = enabled ? 'on' : 'off';
+                if (lowered !== next) {
+                  holder[key] = next;
+                  changed = true;
+                }
+              }
+            }
+          };
+
+          const visit = (node: unknown, depth: number): void => {
+            if (depth > 6 || typeof node !== 'object' || node === null || visited.has(node)) {
+              return;
+            }
+            visited.add(node);
+
+            if (Array.isArray(node)) {
+              for (const item of node) {
+                visit(item, depth + 1);
+              }
+              return;
+            }
+
+            const record = node as Record<string, unknown>;
+            for (const [key, value] of Object.entries(record)) {
+              if (keyRegex.test(key)) {
+                patchValue(record, key, value);
+              }
+              visit(value, depth + 1);
+            }
+          };
+
+          visit(payload, 0);
+          return changed;
         };
 
         const consumeStream = async (stream: ReadableStream<Uint8Array>) => {
@@ -313,9 +512,55 @@ export class PerplexityWebAdapter extends PlaywrightWebProvider {
 
         scope.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
           const requestUrl = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
-          const response = await scope.__webagentPerplexityOriginalFetch!(input, init);
-          if (!requestUrl.includes('/rest/sse/perplexity_ask') || !response.body) {
+          const isAskRequest = requestUrl.includes('/rest/sse/perplexity_ask');
+          let nextInit = init;
+          let thinkingApplied = false;
+          const thinkingPreference =
+            typeof scope.__webagentPerplexityEnableThinking === 'boolean' ? scope.__webagentPerplexityEnableThinking : undefined;
+
+          if (isAskRequest && typeof thinkingPreference === 'boolean') {
+            try {
+              const sourceBody =
+                typeof init?.body === 'string'
+                  ? init.body
+                  : input instanceof Request
+                    ? await input.clone().text()
+                    : undefined;
+              if (sourceBody) {
+                const parsed = JSON.parse(sourceBody) as unknown;
+                thinkingApplied = applyThinkingPreference(parsed, thinkingPreference);
+                if (thinkingApplied) {
+                  nextInit = { ...(init || {}), body: JSON.stringify(parsed) };
+                  void emit({
+                    type: 'status',
+                    message: `Perplexity reasoning ${thinkingPreference ? 'enabled' : 'disabled'} for this request.`,
+                  });
+                }
+              }
+            } catch {
+              // If payload parsing fails, send the original request unchanged.
+            }
+          }
+
+          let response: Response;
+          try {
+            response = await scope.__webagentPerplexityOriginalFetch!(input, nextInit);
+          } catch (error) {
+            if (isAskRequest) {
+              const message = error instanceof Error ? error.message : String(error);
+              await emit({ type: 'error', message: `Perplexity request failed: ${message}` });
+            }
+            throw error;
+          }
+          if (!isAskRequest || !response.body) {
             return response;
+          }
+
+          if (!thinkingApplied && thinkingPreference === true) {
+            void emit({
+              type: 'status',
+              message: 'Perplexity reasoning toggle requested, but no compatible reasoning flag was detected in request payload.',
+            });
           }
 
           const branches = response.body.tee();

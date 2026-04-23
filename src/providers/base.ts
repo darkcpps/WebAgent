@@ -8,6 +8,7 @@ export interface FileAttachment {
 export interface ProviderPrompt {
   systemPrompt: string;
   userPrompt: string;
+  enableThinking?: boolean;
 }
 
 export interface ProviderReadiness {

@@ -48,6 +48,7 @@ export function App(): JSX.Element {
   const [activeTab, setActiveTab] = useState<'chat' | 'bridge' | 'settings'>('chat');
   const [expandedThinkingByMessage, setExpandedThinkingByMessage] = useState<Record<string, boolean>>({});
   const [modelByProvider, setModelByProvider] = useState<Record<string, string>>({});
+  const [thinkingByProvider, setThinkingByProvider] = useState<Record<string, boolean>>({});
   const [toast, setToast] = useState<{ level: 'info' | 'warning' | 'error' | 'success'; message: string }>();
   const [debugOpen, setDebugOpen] = useState(true);
   const [sessionContextMenu, setSessionContextMenu] = useState<{ sessionId: string; x: number; y: number } | null>(null);
@@ -152,6 +153,9 @@ export function App(): JSX.Element {
   const isRunning = activeSession?.status === 'running';
   const isBridgeMode = providerId === 'zai' && state.bridge.activeRuntime === 'bridge';
   const isLoggedIn = isBridgeMode ? state.bridge.ready : state.providerReady[providerId];
+  const supportsThinkingControl = providerId === 'zai' || providerId === 'perplexity';
+  const hasExplicitThinkingPreference = Object.prototype.hasOwnProperty.call(thinkingByProvider, providerId);
+  const enableThinking = Boolean(thinkingByProvider[providerId]);
   const canSend = message.trim().length > 0 && !isRunning && isLoggedIn;
   const debugLogs = activeSession?.logs ?? [];
   const autoApproveEnabled = state.approvalMode === 'auto-apply-safe-edits';
@@ -212,6 +216,7 @@ export function App(): JSX.Element {
       message: content,
       modelId: modelOverride ?? selectedModelId,
       agentMode,
+      enableThinking: supportsThinkingControl && hasExplicitThinkingPreference ? enableThinking : undefined,
     });
   };
 
@@ -477,11 +482,29 @@ export function App(): JSX.Element {
                   <span className="toggle-label">Agent Mode</span>
                 </label>
                 
+               <label className="toggle-switch">
+                  <input
+                    type="checkbox"
+                    checked={enableThinking}
+                    disabled={!supportsThinkingControl}
+                    onChange={(e) =>
+                      setThinkingByProvider((prev) => ({
+                        ...prev,
+                        [providerId]: e.target.checked,
+                      }))
+                    }
+                  />
+                  <span className="slider"></span>
+                  <span className="toggle-label">Enable Model Thinking</span>
+                </label>
+
                 <label className="toggle-switch">
                   <input type="checkbox" checked={showThinking} onChange={(e) => setShowThinking(e.target.checked)} />
                   <span className="slider"></span>
                   <span className="toggle-label">Auto-expand Thoughts</span>
                 </label>
+
+                {!supportsThinkingControl && <div className="auth-warning">Model thinking toggle is currently supported for z.ai and Perplexity.</div>}
 
                 {!isLoggedIn && (
                   <div className="auth-warning">

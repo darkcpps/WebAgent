@@ -10,7 +10,14 @@ interface PanelCallbacks {
   newChat(providerId: ProviderId): Promise<void>;
   deleteChat(sessionId: string): Promise<void>;
   startTask(providerId: ProviderId, task: string): Promise<void>;
-  sendChat(providerId: ProviderId, message: string, modelId?: string, sessionId?: string, agentMode?: boolean): Promise<void>;
+  sendChat(
+    providerId: ProviderId,
+    message: string,
+    modelId?: string,
+    sessionId?: string,
+    agentMode?: boolean,
+    enableThinking?: boolean,
+  ): Promise<void>;
   stopTask(sessionId: string): Promise<void>;
   loginProvider(providerId: ProviderId): Promise<void>;
   logoutProvider(providerId: ProviderId): Promise<boolean>;
@@ -33,10 +40,14 @@ interface PanelCallbacks {
 }
 
 export class WebAgentPanel {
+  private static readonly MODEL_REFRESH_TIMEOUT_MS = 12000;
+  private static readonly MODEL_REFRESH_COOLDOWN_MS = 30000;
   private panel?: vscode.WebviewPanel;
   private readonly readyToastShown = new Set<ProviderId>();
   private lastBridgeState?: BridgeUiState;
   private bridgeRefreshInProgress = false;
+  private readonly modelRefreshInFlight = new Map<ProviderId, Promise<void>>();
+  private readonly lastModelRefreshAt = new Map<ProviderId, number>();
 
   constructor(
     private readonly extensionUri: vscode.Uri,
@@ -96,7 +107,14 @@ export class WebAgentPanel {
           await this.postToast('info', `Started task with ${message.providerId}.`);
           return;
         case 'sendChat':
-          await this.callbacks.sendChat(message.providerId, message.message, message.modelId, message.sessionId, message.agentMode);
+          await this.callbacks.sendChat(
+            message.providerId,
+            message.message,
+            message.modelId,
+            message.sessionId,
+            message.agentMode,
+            message.enableThinking,
+          );
           return;
         case 'stopTask':
           await this.callbacks.stopTask(message.sessionId);
@@ -105,8 +123,8 @@ export class WebAgentPanel {
         case 'loginProvider':
           await this.callbacks.loginProvider(message.providerId);
           await this.callbacks.checkProviderReady(message.providerId);
-          await this.callbacks.refreshProviderModels(message.providerId);
           await this.postState();
+          void this.refreshProviderModelsInBackground(message.providerId, { force: true });
           await this.postToast('success', `Opened ${message.providerId} login page. Complete sign-in in browser.`);
           return;
         case 'logoutProvider': {
@@ -117,15 +135,11 @@ export class WebAgentPanel {
         }
         case 'checkProviderReady': {
           const readiness = await this.callbacks.checkProviderReady(message.providerId);
-          let refreshedModels = false;
-          try {
-            await this.callbacks.refreshProviderModels(message.providerId);
-            refreshedModels = true;
-          } catch {
-            refreshedModels = false;
-          }
-          if (readiness.ready || refreshedModels) {
-            await this.postState();
+          await this.postState();
+          if (readiness.ready) {
+            const currentModelCount = this.getCurrentModelCount(message.providerId);
+            const force = currentModelCount <= 1;
+            void this.refreshProviderModelsInBackground(message.providerId, { force });
           }
           if (!message.silent) {
             if (readiness.ready) {
@@ -278,5 +292,46 @@ export class WebAgentPanel {
       message,
     };
     await this.panel.webview.postMessage(payload);
+  }
+
+  private getCurrentModelCount(providerId: ProviderId): number {
+    const sessionId = this.sessions.getActive()?.id;
+    return this.providers.get(providerId, { sessionId }).listModels().length;
+  }
+
+  private refreshProviderModelsInBackground(providerId: ProviderId, options?: { force?: boolean }): Promise<void> {
+    const existing = this.modelRefreshInFlight.get(providerId);
+    if (existing) {
+      return existing;
+    }
+
+    const now = Date.now();
+    const lastRefresh = this.lastModelRefreshAt.get(providerId) ?? 0;
+    if (!options?.force && now - lastRefresh < WebAgentPanel.MODEL_REFRESH_COOLDOWN_MS) {
+      return Promise.resolve();
+    }
+
+    const task = (async () => {
+      let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
+      try {
+        const timeoutPromise = new Promise<void>((_, reject) => {
+          timeoutHandle = setTimeout(() => reject(new Error('Model refresh timed out.')), WebAgentPanel.MODEL_REFRESH_TIMEOUT_MS);
+        });
+        await Promise.race([this.callbacks.refreshProviderModels(providerId), timeoutPromise]);
+        this.lastModelRefreshAt.set(providerId, Date.now());
+        await this.postState(false);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        console.warn(`[webagent] Model refresh failed for ${providerId}: ${message}`);
+      } finally {
+        if (timeoutHandle) {
+          clearTimeout(timeoutHandle);
+        }
+        this.modelRefreshInFlight.delete(providerId);
+      }
+    })();
+
+    this.modelRefreshInFlight.set(providerId, task);
+    return task;
   }
 }

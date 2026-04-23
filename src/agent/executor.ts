@@ -15,6 +15,10 @@ export interface ExecutionResult {
 }
 
 export class ActionExecutor {
+  private static readonly READ_FILE_FULL_LIMIT_CHARS = 60000;
+  private static readonly READ_FILE_LARGE_HEAD_CHARS = 40000;
+  private static readonly READ_FILE_LARGE_TAIL_CHARS = 15000;
+
   constructor(
     private readonly files: WorkspaceFilesService,
     private readonly git: GitService,
@@ -121,7 +125,22 @@ export class ActionExecutor {
       }
       case 'read_file': {
         const content = await this.files.readFile(action.path);
-        return `Read ${action.path}:\n${truncate(content, 20000)}`;
+        if (content.length <= ActionExecutor.READ_FILE_FULL_LIMIT_CHARS) {
+          return `Read ${action.path} (full, ${content.length} chars):\n${content}`;
+        }
+
+        const head = content.slice(0, ActionExecutor.READ_FILE_LARGE_HEAD_CHARS);
+        const tail = content.slice(-ActionExecutor.READ_FILE_LARGE_TAIL_CHARS);
+        const omitted = Math.max(0, content.length - head.length - tail.length);
+
+        return [
+          `Read ${action.path} (truncated, ${content.length} chars total):`,
+          head,
+          '',
+          `...[omitted ${omitted} chars from middle]...`,
+          '',
+          tail,
+        ].join('\n');
       }
       case 'search_files': {
         const results = await this.files.searchFiles(action.query, action.limit ?? 20);

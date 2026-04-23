@@ -45,7 +45,14 @@ export abstract class PlaywrightWebProvider implements ProviderAdapter {
       '[class*="assistant"][class*="message"]',
     ],
     modelPicker: ['button[aria-label="Select a model"]', 'button[aria-label*="model"]', 'button[aria-label*="Model"]', '[role="combobox"]'],
-    modelOption: ['button[aria-label="model-item"][data-value]', '[data-value]', '[role="option"]', '[role="menuitem"]'],
+    modelOption: [
+      'button[aria-label="model-item"][data-value]',
+      '[data-value]',
+      '[role="option"]',
+      '[role="menuitem"]',
+      '[role="menuitemradio"]',
+      '[role="menuitemcheckbox"]',
+    ],
     modelExpand: ['button:has-text("More models")', 'button:has-text("Other models")', 'button:has-text("All models")', '[role="tab"]:has-text("Other models")'],
     newChat: ['button[aria-label*="New chat"]', 'a[href="/"]'],
     stopButton: ['button[aria-label*="Stop"]', '[data-testid*="stop"]'],
@@ -557,6 +564,8 @@ export abstract class PlaywrightWebProvider implements ProviderAdapter {
       if (/role=["']combobox["']/i.test(html)) add('modelPicker', '[role="combobox"]');
       if (/role=["']option["']/i.test(html)) add('modelOption', '[role="option"]');
       if (/role=["']menuitem["']/i.test(html)) add('modelOption', '[role="menuitem"]');
+      if (/role=["']menuitemradio["']/i.test(html)) add('modelOption', '[role="menuitemradio"]');
+      if (/role=["']menuitemcheckbox["']/i.test(html)) add('modelOption', '[role="menuitemcheckbox"]');
       if (/aria-label=["']model-item["'][^>]*data-value=/i.test(html)) add('modelOption', 'button[aria-label="model-item"][data-value]');
       if (/more models|other models|all models/i.test(html)) add('modelExpand', 'button:has-text("More models")');
 
@@ -840,7 +849,8 @@ export abstract class PlaywrightWebProvider implements ProviderAdapter {
               continue;
             }
             const dataValue = (await option.getAttribute('data-value'))?.trim();
-            const textRaw = dataValue || (await option.innerText()).trim();
+            const translatedLabel = (await option.locator('[translate="no"]').first().innerText().catch(() => '')).trim();
+            const textRaw = translatedLabel || dataValue || (await option.innerText()).trim();
             const text = this.normalizeModelLabel(textRaw);
             if (text.length < 2 || text.length > 80) {
               continue;
@@ -1083,6 +1093,13 @@ export abstract class PlaywrightWebProvider implements ProviderAdapter {
         return [...new Set(regexValues.map((value) => this.normalizeModelLabel(value)).filter(Boolean))].slice(0, 48);
       }
 
+      const regexRadixValues = [...html.matchAll(/role=["']menuitemradio["'][\s\S]*?<span[^>]*translate=["']no["'][^>]*>([^<]+)<\/span>/gi)]
+        .map((match) => (match[1] || '').trim())
+        .filter(Boolean);
+      if (regexRadixValues.length > 0) {
+        return [...new Set(regexRadixValues.map((value) => this.normalizeModelLabel(value)).filter(Boolean))].slice(0, 48);
+      }
+
       const values = await this.page!.evaluate(() => {
         const fromModelItems = Array.from(document.querySelectorAll<HTMLButtonElement>('button[aria-label="model-item"][data-value]'))
           .map((node) => node.getAttribute('data-value') || '')
@@ -1091,6 +1108,13 @@ export abstract class PlaywrightWebProvider implements ProviderAdapter {
 
         if (fromModelItems.length > 0) {
           return fromModelItems;
+        }
+
+        const fromRadixModels = Array.from(document.querySelectorAll<HTMLElement>('[role="menuitemradio"] [translate="no"]'))
+          .map((node) => (node.textContent || '').trim())
+          .filter(Boolean);
+        if (fromRadixModels.length > 0) {
+          return fromRadixModels;
         }
 
         return Array.from(document.querySelectorAll<HTMLElement>('[data-value]'))

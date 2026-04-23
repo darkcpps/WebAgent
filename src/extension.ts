@@ -193,6 +193,21 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     };
   };
 
+  const withTimeoutFallback = async <T>(operation: () => Promise<T>, timeoutMs: number, fallbackValue: T): Promise<T> => {
+    let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
+    const timeoutPromise = new Promise<T>((resolve) => {
+      timeoutHandle = setTimeout(() => resolve(fallbackValue), timeoutMs);
+    });
+
+    try {
+      return await Promise.race([operation(), timeoutPromise]);
+    } finally {
+      if (timeoutHandle) {
+        clearTimeout(timeoutHandle);
+      }
+    }
+  };
+
   const isLikelyZaiBridgeFailure = (error: unknown): boolean => {
     const message = error instanceof Error ? error.message : String(error);
     return /\[bridge\]|companion|z\.ai bridge|socket|BROWSER_NOT_CONNECTED|No z\.ai tab|Receiving end does not exist|message channel closed/i.test(
@@ -310,7 +325,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         await ensureBridgeCompanion(providerId, session.id);
         void orchestrator.start(session.id, providerId, task);
       },
-      sendChat: async (providerId, message, modelId, sessionId, agentMode) => {
+      sendChat: async (providerId, message, modelId, sessionId, agentMode, enableThinking) => {
         const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
         const existing = sessionId ? sessions.get(sessionId) : undefined;
         const wasEmptySession = (existing?.chatHistory.length ?? 0) === 0;
@@ -429,14 +444,19 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
             sessions.setProviderSessionId(session.id, browserConversationId);
           }
 
+          const supportsThinkingControl = providerId === 'zai' || providerId === 'perplexity';
+
           // Model selection (non-fatal)
           if (modelId && modelId !== 'auto') {
-            const selected = await runWithAutoFallback(() => provider.selectModel(modelId), 'selectModel').catch(() => false);
+            const selected = await runWithAutoFallback(
+              () => withTimeoutFallback(() => provider.selectModel(modelId), 12000, false),
+              'selectModel',
+            ).catch(() => false);
             if (!selected) {
               sessions.appendLog(session.id, {
                 level: 'warning',
                 source: 'provider',
-                message: `Could not select model ${modelId}. Proceeding with default.`,
+                message: `Could not select model ${modelId} quickly. Proceeding with current/default model.`,
               });
             } else {
               const selectedModelLabel =
@@ -446,7 +466,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
                 source: 'provider',
                 message:
                   providerId === 'zai'
-                    ? `Model selected: ${selectedModelLabel} (${modelId}). Request payload override armed for /api/v1/chats/new and /api/v2/chat/completions.`
+                    ? `Model selected: ${selectedModelLabel} (${modelId}). Thinking=${enableThinking === true ? 'on' : 'off'}. Request payload override armed for /api/v1/chats/new and /api/v2/chat/completions.`
+                    : providerId === 'perplexity'
+                      ? `Model selected: ${selectedModelLabel} (${modelId}). Thinking=${enableThinking === true ? 'on' : 'off'}. Perplexity ask payload will apply reasoning flags when available.`
                     : `Model selected: ${selectedModelLabel} (${modelId})`,
               });
             }
@@ -455,6 +477,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
           const trimmedMessage = message.trim();
           const useAgentTools = Boolean(agentMode) || /^\/agent\s+/i.test(trimmedMessage);
           const chatPrompt = /^\/agent\s+/i.test(trimmedMessage) ? trimmedMessage.replace(/^\/agent\s+/i, '').trim() : trimmedMessage;
+          const requestThinking = supportsThinkingControl ? enableThinking : undefined;
           const wasPreviouslyAgentMode = sessions.get(session.id)?.lastPromptMode === 'agent';
           sessions.update(session.id, { lastPromptMode: useAgentTools ? 'agent' : 'chat' });
           if (!chatPrompt) {
@@ -464,7 +487,10 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
           if (!useAgentTools) {
             const prompt = buildChatAskPrompt(chatPrompt, { wasPreviouslyAgentMode });
             appendPromptPreviewLog(session.id, 'chat', prompt);
-            await runWithAutoFallback(() => provider.sendPrompt(prompt), 'sendPrompt(chat)');
+            await runWithAutoFallback(
+              () => provider.sendPrompt({ ...prompt, enableThinking: requestThinking }),
+              'sendPrompt(chat)',
+            );
 
             const responseText = await runWithAutoFallback(
               () =>
@@ -516,6 +542,12 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
           let endedByAskUser = false;
           let invalidToolResponseCount = 0;
           let autoCorrectionCount = 0;
+          let codeChangesApplied = false;
+          let verificationAttempted = false;
+          let verificationPassed = false;
+          let needsVerification = false;
+          let verificationSummary = '';
+          let verificationFailureDetail = '';
 
           const compact = (value: string, limit = 220): string => {
             const normalized = value.replace(/\s+/g, ' ').trim();
@@ -523,6 +555,151 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
               return normalized;
             }
             return `${normalized.slice(0, limit)}...`;
+          };
+
+          const isCodeMutationAction = (actionType: string): boolean =>
+            ['edit_file', 'create_file', 'delete_file', 'rename_file'].includes(actionType);
+
+          const isFailedActionMessage = (message: string): boolean =>
+            /^(Action failed:|Blocked action |User rejected action )/i.test(message.trim());
+
+          const parseExitCode = (message: string): number | undefined => {
+            const raw = message.match(/Exit code:\s*([^\n]+)/i)?.[1]?.trim();
+            if (!raw) {
+              return undefined;
+            }
+            const parsed = Number(raw);
+            return Number.isFinite(parsed) ? parsed : undefined;
+          };
+
+          const detectVerificationCommands = async (): Promise<string[]> => {
+            try {
+              const packageJsonRaw = await files.readFile('package.json');
+              const parsed = JSON.parse(packageJsonRaw) as { scripts?: Record<string, unknown> };
+              const scripts = parsed?.scripts ?? {};
+              const commands: string[] = [];
+
+              if (typeof scripts.check === 'string') {
+                commands.push('cmd /c npm run check');
+              }
+              if (typeof scripts.test === 'string') {
+                commands.push('cmd /c npm run test');
+              }
+              if (typeof scripts.build === 'string') {
+                commands.push('cmd /c npm run build');
+              }
+
+              if (commands.length > 0) {
+                return commands.slice(0, 2);
+              }
+            } catch {
+              // Not a Node workspace or package.json is unavailable.
+            }
+
+            try {
+              const pyproject = await files.readFile('pyproject.toml');
+              if (/\[tool\.pytest|pytest/i.test(pyproject)) {
+                return ['python -m pytest'];
+              }
+            } catch {
+              // Ignore.
+            }
+
+            try {
+              await files.readFile('requirements.txt');
+              return ['python -m pytest'];
+            } catch {
+              // Ignore.
+            }
+
+            return [];
+          };
+
+          const describeAction = (action: {
+            type: string;
+            summary?: string;
+            path?: string;
+            query?: string;
+            command?: string;
+            fromPath?: string;
+            toPath?: string;
+          }): string => {
+            const summary = action.summary?.trim();
+            const withSummary = (base: string): string => (summary ? `${base} - ${compact(summary, 90)}` : base);
+
+            switch (action.type) {
+              case 'read_file':
+                return withSummary(`Reading (${action.path ?? 'file'})`);
+              case 'edit_file':
+                return withSummary(`Editing (${action.path ?? 'file'})`);
+              case 'create_file':
+                return withSummary(`Creating (${action.path ?? 'file'})`);
+              case 'delete_file':
+                return withSummary(`Deleting (${action.path ?? 'file'})`);
+              case 'rename_file':
+                return withSummary(`Renaming (${action.fromPath ?? 'source'} -> ${action.toPath ?? 'target'})`);
+              case 'search_files':
+                return withSummary(`Searching ("${compact(action.query ?? '', 80)}")`);
+              case 'list_files':
+                return withSummary('Listing files');
+              case 'run_command':
+                return withSummary(`Running command (${compact(action.command ?? '', 80)})`);
+              case 'get_git_diff':
+                return withSummary('Reading git diff');
+              case 'ask_user':
+                return withSummary('Asking for your input');
+              case 'finish':
+                return withSummary('Finalizing response');
+              default:
+                return withSummary(action.type);
+            }
+          };
+
+          const describeActionOutcome = (
+            action: {
+              type: string;
+              path?: string;
+              fromPath?: string;
+              toPath?: string;
+              command?: string;
+            },
+            resultMessage: string,
+          ): string => {
+            const trimmed = resultMessage.trim();
+            if (/^(Action failed:|Blocked action )/i.test(trimmed)) {
+              const detail = trimmed.replace(/^(Action failed:|Blocked action )/i, '').trim();
+              return `Failed: ${compact(detail, 130)}`;
+            }
+
+            switch (action.type) {
+              case 'read_file':
+                return `Read ${action.path ?? 'file'}`;
+              case 'edit_file':
+                return `Edited ${action.path ?? 'file'}`;
+              case 'create_file':
+                return `Created ${action.path ?? 'file'}`;
+              case 'delete_file':
+                return `Deleted ${action.path ?? 'file'}`;
+              case 'rename_file':
+                return `Renamed ${action.fromPath ?? 'source'} -> ${action.toPath ?? 'target'}`;
+              case 'search_files':
+                return 'Search complete';
+              case 'list_files':
+                return 'File list ready';
+              case 'run_command': {
+                const exitCode = trimmed.match(/Exit code:\s*([^\n]+)/i)?.[1]?.trim();
+                const cmd = compact(action.command ?? '', 60);
+                return exitCode ? `Command finished (${cmd}) [exit ${exitCode}]` : `Command finished (${cmd})`;
+              }
+              case 'get_git_diff':
+                return 'Git diff ready';
+              case 'ask_user':
+                return 'Waiting for user input';
+              case 'finish':
+                return 'Finished';
+              default:
+                return compact(trimmed, 140) || 'Done';
+            }
           };
 
           const pushActionUpdate = (line: string): void => {
@@ -543,7 +720,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 
           const trimForToolPrompt = (actionType: string, value: string): string => {
             const limitByAction: Record<string, number> = {
-              read_file: 14000,
+              read_file: 70000,
               search_files: 6000,
               list_files: 5000,
               run_command: 8000,
@@ -567,7 +744,10 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
             }
             const prompt = buildProviderPrompt(chatPrompt, repoContext, toolResults);
             appendPromptPreviewLog(session.id, 'agent', prompt, round + 1);
-            await runWithAutoFallback(() => provider.sendPrompt(prompt), `sendPrompt(agent round ${round + 1})`);
+            await runWithAutoFallback(
+              () => provider.sendPrompt({ ...prompt, enableThinking: requestThinking }),
+              `sendPrompt(agent round ${round + 1})`,
+            );
 
             const responseText = await runWithAutoFallback(
               () => collectProviderText(session.id, providerId),
@@ -627,7 +807,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 
             if (parsed.summary) {
               sessions.appendLog(session.id, { level: 'info', source: 'provider', message: parsed.summary });
-              pushActionUpdate(`AI plan: ${compact(parsed.summary, 160)}`);
+              pushActionUpdate(`Planning: ${compact(parsed.summary, 160)}`);
             }
 
             const hasNonTerminalActions = parsed.actions.some((action) => action.type !== 'ask_user' && action.type !== 'finish');
@@ -645,19 +825,35 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 
               const result = await executor.execute(session.id, action);
               executedActionCount += 1;
-              if (/^(Action failed:|Blocked action )/i.test(result.message.trim())) {
+              if (isFailedActionMessage(result.message)) {
                 failedActionCount += 1;
+              }
+              if (isCodeMutationAction(action.type) && !isFailedActionMessage(result.message)) {
+                codeChangesApplied = true;
+                needsVerification = true;
+                verificationPassed = false;
+              }
+              if (action.type === 'run_command' && codeChangesApplied) {
+                verificationAttempted = true;
+                const exitCode = parseExitCode(result.message);
+                if (!isFailedActionMessage(result.message) && exitCode === 0) {
+                  verificationPassed = true;
+                  needsVerification = false;
+                  verificationSummary = 'Verification command completed successfully.';
+                } else {
+                  verificationFailureDetail = compact(result.message, 180);
+                }
               }
               toolResults.push(`${action.type}: ${trimForToolPrompt(action.type, result.message)}`);
               if (toolResults.length > 10) {
                 toolResults.shift();
               }
-              const summaryLabel = action.summary?.trim();
-              const label = summaryLabel && summaryLabel.length > 0 ? `${action.type} (${summaryLabel})` : action.type;
-              pushActionUpdate(`${label} -> ${compact(result.message)}`);
+              const actionLabel = describeAction(action);
+              const outcomeLabel = describeActionOutcome(action, result.message);
+              pushActionUpdate(`${actionLabel}... ${outcomeLabel}`);
               finalText = result.message;
 
-              if (/^(Action failed:|Blocked action )/i.test(result.message.trim())) {
+              if (isFailedActionMessage(result.message)) {
                 if (autoCorrectionCount < 4) {
                   autoCorrectionCount += 1;
                   toolResults.push(
@@ -685,6 +881,46 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
             }
           }
 
+          if (!endedByAskUser && codeChangesApplied && needsVerification && !verificationPassed) {
+            const verificationCommands = await detectVerificationCommands();
+            if (verificationCommands.length === 0) {
+              verificationAttempted = true;
+              verificationFailureDetail = 'No project verification command was detected automatically.';
+              pushActionUpdate('Verification skipped: no test/build/check command detected.');
+            } else {
+              for (const command of verificationCommands) {
+                const verificationAction = {
+                  type: 'run_command' as const,
+                  command,
+                  summary: 'Automatic verification before final response',
+                };
+                const verifyResult = await executor.execute(session.id, verificationAction);
+                executedActionCount += 1;
+                if (isFailedActionMessage(verifyResult.message)) {
+                  failedActionCount += 1;
+                }
+                toolResults.push(`run_command: ${trimForToolPrompt('run_command', verifyResult.message)}`);
+                if (toolResults.length > 10) {
+                  toolResults.shift();
+                }
+
+                const verificationOutcome = describeActionOutcome(verificationAction, verifyResult.message);
+                pushActionUpdate(`Verification... ${verificationOutcome}`);
+                verificationAttempted = true;
+
+                const exitCode = parseExitCode(verifyResult.message);
+                if (!isFailedActionMessage(verifyResult.message) && exitCode === 0) {
+                  verificationPassed = true;
+                  needsVerification = false;
+                  verificationSummary = `Verified with "${command}".`;
+                  break;
+                }
+
+                verificationFailureDetail = compact(verifyResult.message, 180);
+              }
+            }
+          }
+
           if (endedByAskUser) {
             const followUpQuestion = compact(finalText || 'I need your input to continue.', 360);
             const recentUpdates = actionUpdates.slice(-5);
@@ -702,11 +938,18 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
               failedActionCount > 0
                 ? `${failedActionCount} action${failedActionCount === 1 ? '' : 's'} failed or were blocked.`
                 : '';
+            const verificationLine = codeChangesApplied
+              ? verificationPassed
+                ? `Verification: ${verificationSummary || 'completed successfully.'}`
+                : 'Verification: could not be completed automatically. Please test locally.'
+              : '';
             const outcome = finalText ? compact(finalText, 300) : '';
             const recentUpdates = actionUpdates.slice(-6);
             finalText = [
               completionLine,
               ...(failureLine ? [failureLine] : []),
+              ...(verificationLine ? [verificationLine] : []),
+              ...(!verificationPassed && verificationFailureDetail ? [`Verification detail: ${compact(verificationFailureDetail, 220)}`] : []),
               ...(recentUpdates.length > 0 ? ['', 'Recent actions:', ...recentUpdates.map((entry, idx) => `${idx + 1}. ${entry}`)] : []),
               ...(outcome ? ['', `Result: ${outcome}`] : []),
             ].join('\n');
@@ -799,7 +1042,17 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       },
       refreshProviderModels: async (providerId) => {
         await ensureBridgeCompanion(providerId);
-        await providers.get(providerId).refreshModels();
+        const refreshed = await withTimeoutFallback(
+          async () => {
+            await providers.get(providerId).refreshModels();
+            return true;
+          },
+          12000,
+          false,
+        );
+        if (!refreshed) {
+          throw new Error(`${providerId} model refresh timed out.`);
+        }
       },
       resetConversation: async (providerId) => {
         await ensureBridgeCompanion(providerId);
