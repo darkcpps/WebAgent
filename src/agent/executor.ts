@@ -42,8 +42,10 @@ export class ActionExecutor {
       requiresApproval: decision.requiresApproval,
       preview,
     });
+    this.updateLatestAssistantToolStatus(sessionId, `${summary}...`);
 
     if (!decision.allowed) {
+      this.updateLatestAssistantToolStatus(sessionId, `Blocked ${summary}.`);
       this.sessions.appendLog(sessionId, {
         level: 'error',
         source: 'agent',
@@ -54,6 +56,7 @@ export class ActionExecutor {
     }
 
     if (decision.requiresApproval) {
+      this.updateLatestAssistantToolStatus(sessionId, `Awaiting approval for ${summary}...`);
       this.sessions.appendLog(sessionId, {
         level: 'info',
         source: 'agent',
@@ -73,6 +76,7 @@ export class ActionExecutor {
       this.sessions.updateAction(sessionId, actionId, { status: approved ? 'approved' : 'rejected' });
 
       if (!approved) {
+        this.updateLatestAssistantToolStatus(sessionId, `Rejected ${summary}.`);
         this.sessions.appendLog(sessionId, {
           level: 'warning',
           source: 'agent',
@@ -83,6 +87,7 @@ export class ActionExecutor {
     }
 
     this.sessions.updateAction(sessionId, actionId, { status: 'running' });
+    this.updateLatestAssistantToolStatus(sessionId, `${summary}...`);
     this.sessions.appendLog(sessionId, {
       level: 'info',
       source: 'agent',
@@ -92,6 +97,7 @@ export class ActionExecutor {
     try {
       const result = await this.run(action);
       this.sessions.updateAction(sessionId, actionId, { status: 'done', result: truncate(result, 1000) });
+      this.updateLatestAssistantToolStatus(sessionId, `Done ${summary}.`);
       this.sessions.appendLog(sessionId, {
         level: 'success',
         source: 'agent',
@@ -104,6 +110,7 @@ export class ActionExecutor {
     } catch (error) {
       const message = (error as Error).message;
       this.sessions.updateAction(sessionId, actionId, { status: 'error', result: message });
+      this.updateLatestAssistantToolStatus(sessionId, `Failed ${summary}: ${truncate(message, 220)}`);
       this.sessions.appendLog(sessionId, {
         level: 'error',
         source: 'agent',
@@ -149,7 +156,7 @@ export class ActionExecutor {
         }
 
         if (charTruncated) {
-          parts.push(`This window was character-truncated. Retry with a smaller limit.`);
+          parts.push('This window was character-truncated. Retry with a smaller limit.');
         }
 
         parts.push('', body);
@@ -285,6 +292,22 @@ export class ActionExecutor {
       default:
         return requestedSummary || 'Running action';
     }
+  }
+
+  private updateLatestAssistantToolStatus(sessionId: string, content: string): void {
+    const session = this.sessions.get(sessionId);
+    const latestAssistant = [...(session?.chatHistory ?? [])]
+      .reverse()
+      .find((entry) => entry.role === 'assistant');
+
+    if (!latestAssistant) {
+      return;
+    }
+
+    this.sessions.updateChatMessage(sessionId, latestAssistant.id, {
+      content,
+      rawContent: content,
+    });
   }
 
   private escapeRegex(value: string): string {
