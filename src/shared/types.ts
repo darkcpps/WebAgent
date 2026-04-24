@@ -1,7 +1,4 @@
-export type ProviderId = 'chatgpt' | 'gemini' | 'zai' | 'perplexity';
-export type ZaiTransport = 'auto' | 'bridge' | 'playwright';
-export type ZaiRuntime = 'bridge' | 'playwright';
-export type ZaiManagedMode = 'headless' | 'visible';
+export type ProviderId = 'chatgpt' | 'gemini' | 'perplexity';
 
 export type ApprovalMode = 'view-only' | 'ask-before-action' | 'auto-apply-safe-edits';
 
@@ -76,19 +73,6 @@ export interface ApprovalRequest {
   preview?: string;
 }
 
-export interface BridgeUiState {
-  transport: ZaiTransport;
-  activeRuntime: ZaiRuntime;
-  managedMode: ZaiManagedMode;
-  autoStartCompanion: boolean;
-  companionReachable: boolean;
-  companionOwnedByExtension: boolean;
-  browserConnected: boolean;
-  ready: boolean;
-  loginRequired: boolean;
-  lastError?: string;
-}
-
 export interface WebviewState {
   sessions: SessionState[];
   activeSessionId?: string;
@@ -97,5 +81,4 @@ export interface WebviewState {
   modelRefreshStatus: Record<ProviderId, ProviderModelRefreshStatus>;
   providerReady: Record<ProviderId, boolean>;
   approvalMode: ApprovalMode;
-  bridge: BridgeUiState;
 }
