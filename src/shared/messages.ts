@@ -18,6 +18,7 @@ export type WebviewToExtensionMessage =
   | { type: 'loginProvider'; providerId: ProviderId }
   | { type: 'logoutProvider'; providerId: ProviderId }
   | { type: 'checkProviderReady'; providerId: ProviderId; silent?: boolean }
+  | { type: 'refreshProviderModels'; providerId: ProviderId }
   | { type: 'resetConversation'; providerId: ProviderId }
   | { type: 'approve'; sessionId: string; actionId: string }
   | { type: 'reject'; sessionId: string; actionId: string }

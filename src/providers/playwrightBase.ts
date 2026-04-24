@@ -29,6 +29,7 @@ export abstract class PlaywrightWebProvider implements ProviderAdapter {
   protected lastResponse = '';
   protected stopped = false;
   private launchedHeadless?: boolean;
+  private ensurePagePromise?: Promise<void>;
   private pendingUserPrompt = '';
   private lastAssistantBeforeSend = '';
 
@@ -448,43 +449,55 @@ export abstract class PlaywrightWebProvider implements ProviderAdapter {
   }
 
   protected async ensurePage(headless?: boolean): Promise<void> {
+    if (this.ensurePagePromise) {
+      await this.ensurePagePromise;
+      return;
+    }
+
     const desiredHeadless = headless ?? this.getRuntimeHeadlessMode();
-    if (this.context?.isClosed()) {
-      this.context = undefined;
-      this.page = undefined;
-      this.launchedHeadless = undefined;
-    }
-    if (this.page?.isClosed()) {
-      this.page = undefined;
-    }
-
-    if (this.context && this.launchedHeadless !== desiredHeadless) {
-      await this.resetBrowserState();
-    }
-
-    if (!this.context) {
-      const userDataDir = this.resolveProfileDir();
-      await fs.promises.mkdir(userDataDir, { recursive: true });
-      this.context = await this.launchContextWithFallback(userDataDir, desiredHeadless);
-      this.launchedHeadless = desiredHeadless;
-      console.log(`[${this.id}-managed] Launching browser context in ${desiredHeadless ? 'headless' : 'visible'} mode.`);
-      this.context.on('close', () => {
+    this.ensurePagePromise = (async () => {
+      if (this.context?.isClosed()) {
         this.context = undefined;
         this.page = undefined;
         this.launchedHeadless = undefined;
-      });
-    }
-    if (!this.page) {
-      this.page = this.pickBestPage(this.context.pages()) ?? (await this.context.newPage());
-      this.page.on('close', () => {
-        this.page = undefined;
-      });
-    } else {
-      const preferred = this.pickBestPage(this.context.pages());
-      if (preferred && preferred !== this.page) {
-        this.page = preferred;
       }
-    }
+      if (this.page?.isClosed()) {
+        this.page = undefined;
+      }
+
+      if (this.context && this.launchedHeadless !== desiredHeadless) {
+        await this.resetBrowserState();
+      }
+
+      if (!this.context) {
+        const userDataDir = this.resolveProfileDir();
+        await fs.promises.mkdir(userDataDir, { recursive: true });
+        this.context = await this.launchContextWithFallback(userDataDir, desiredHeadless);
+        this.launchedHeadless = desiredHeadless;
+        console.log(`[${this.id}-managed] Launching browser context in ${desiredHeadless ? 'headless' : 'visible'} mode.`);
+        this.context.on('close', () => {
+          this.context = undefined;
+          this.page = undefined;
+          this.launchedHeadless = undefined;
+        });
+      }
+      if (!this.page) {
+        this.page = this.pickBestPage(this.context.pages()) ?? (await this.context.newPage());
+        this.page.on('close', () => {
+          this.page = undefined;
+        });
+      } else {
+        const preferred = this.pickBestPage(this.context.pages());
+        if (preferred && preferred !== this.page) {
+          this.page = preferred;
+        }
+      }
+      await this.closeExtraneousBlankPages().catch(() => undefined);
+    })().finally(() => {
+      this.ensurePagePromise = undefined;
+    });
+
+    await this.ensurePagePromise;
   }
 
   protected getLaunchOptions(headless: boolean, channel?: LaunchOptions['channel']): LaunchOptions {
@@ -601,6 +614,8 @@ export abstract class PlaywrightWebProvider implements ProviderAdapter {
     const channels = this.getLaunchChannelOrder();
     let lastError: unknown;
 
+    await this.cleanupStaleSingletonLocks(userDataDir);
+
     for (const channel of channels) {
       const options = this.getLaunchOptions(headless, channel);
       try {
@@ -615,7 +630,51 @@ export abstract class PlaywrightWebProvider implements ProviderAdapter {
       }
     }
 
+    if (this.shouldRetryWithRecoveryProfile(lastError)) {
+      await this.cleanupStaleSingletonLocks(userDataDir);
+      console.warn(`[${this.id}-managed] Primary profile launch failed. Retrying primary profile after lock cleanup.`);
+      await new Promise((resolve) => setTimeout(resolve, 180));
+
+      for (const channel of channels) {
+        const options = this.getLaunchOptions(headless, channel);
+        try {
+          return await chromium.launchPersistentContext(userDataDir, options);
+        } catch (error) {
+          lastError = error;
+          if (!channel) {
+            break;
+          }
+          const message = error instanceof Error ? error.message : String(error);
+          console.warn(
+            `[${this.id}-managed] Primary-profile retry failed for channel "${channel}" (${message}). Falling back...`,
+          );
+        }
+      }
+    }
+
     throw lastError instanceof Error ? lastError : new Error(`Failed to launch browser context for ${this.id}.`);
+  }
+
+  private shouldRetryWithRecoveryProfile(error: unknown): boolean {
+    const message = error instanceof Error ? error.message : String(error);
+    return /Opening in existing browser session|Target page, context or browser has been closed|Browser has been closed|profile|user data dir|singleton|already in use|processsingleton/i.test(
+      message,
+    );
+  }
+
+  private async cleanupStaleSingletonLocks(userDataDir: string): Promise<void> {
+    const lockNames = ['SingletonLock', 'SingletonCookie', 'SingletonSocket'];
+    for (const lockName of lockNames) {
+      const lockPath = path.join(userDataDir, lockName);
+      try {
+        await fs.promises.unlink(lockPath);
+      } catch (error) {
+        const code = (error as NodeJS.ErrnoException | undefined)?.code;
+        if (code && code !== 'ENOENT' && code !== 'EPERM' && code !== 'EACCES') {
+          console.warn(`[${this.id}-managed] Unable to remove stale lock file ${lockPath}: ${String(error)}`);
+        }
+      }
+    }
   }
 
   private getLaunchChannelOrder(): Array<LaunchOptions['channel'] | undefined> {
@@ -669,6 +728,22 @@ export abstract class PlaywrightWebProvider implements ProviderAdapter {
     this.launchedHeadless = undefined;
     if (context && !context.isClosed()) {
       await context.close().catch(() => undefined);
+    }
+  }
+
+  private async closeExtraneousBlankPages(): Promise<void> {
+    if (!this.context || !this.page || this.context.isClosed() || this.page.isClosed()) {
+      return;
+    }
+
+    for (const candidate of this.context.pages()) {
+      if (candidate === this.page || candidate.isClosed()) {
+        continue;
+      }
+      const url = candidate.url();
+      if (url === 'about:blank') {
+        await candidate.close().catch(() => undefined);
+      }
     }
   }
 

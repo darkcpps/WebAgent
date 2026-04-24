@@ -445,31 +445,64 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
           }
 
           const supportsThinkingControl = providerId === 'zai' || providerId === 'perplexity';
+          let requestedModelId = modelId;
 
-          // Model selection (non-fatal)
-          if (modelId && modelId !== 'auto') {
+          if (providerId === 'perplexity') {
+            if (requestedModelId && requestedModelId !== 'auto') {
+              sessions.appendLog(session.id, {
+                level: 'info',
+                source: 'provider',
+                message:
+                  'Perplexity model selection is controlled in the browser. To select a model, choose it in the Perplexity browser window opened by the IDE.',
+              });
+            }
+            requestedModelId = undefined;
+          }
+
+          // Model selection
+          const shouldAttemptModelSelection =
+            Boolean(requestedModelId) && requestedModelId !== 'auto';
+          if (shouldAttemptModelSelection && requestedModelId) {
+            const modelSelectTimeoutMs = providerId === 'perplexity' ? 20000 : 12000;
             const selected = await runWithAutoFallback(
-              () => withTimeoutFallback(() => provider.selectModel(modelId), 12000, false),
+              () => withTimeoutFallback(() => provider.selectModel(requestedModelId!), modelSelectTimeoutMs, false),
               'selectModel',
             ).catch(() => false);
             if (!selected) {
+              const failureMessage =
+                providerId === 'perplexity' && requestedModelId !== 'auto'
+                  ? `Perplexity model switch failed for "${requestedModelId}". Attempting Auto fallback.`
+                  : `Could not select model ${requestedModelId} quickly. Proceeding with current/default model.`;
               sessions.appendLog(session.id, {
-                level: 'warning',
+                level: providerId === 'perplexity' && requestedModelId !== 'auto' ? 'error' : 'warning',
                 source: 'provider',
-                message: `Could not select model ${modelId} quickly. Proceeding with current/default model.`,
+                message: failureMessage,
               });
+              if (providerId === 'perplexity' && requestedModelId !== 'auto') {
+                const recoveredToAuto = await runWithAutoFallback(
+                  () => withTimeoutFallback(() => provider.selectModel('auto'), 8000, false),
+                  'selectModel(auto-fallback)',
+                ).catch(() => false);
+                sessions.appendLog(session.id, {
+                  level: recoveredToAuto ? 'warning' : 'error',
+                  source: 'provider',
+                  message: recoveredToAuto
+                    ? `Perplexity failed to switch to "${requestedModelId}", fell back to Auto for this send.`
+                    : 'Perplexity model switch failed and Auto fallback could not be confirmed. Proceeding with current browser model.',
+                });
+              }
             } else {
               const selectedModelLabel =
-                provider.listModels().find((entry) => entry.id === modelId)?.label || modelId;
+                provider.listModels().find((entry) => entry.id === requestedModelId)?.label || requestedModelId;
               sessions.appendLog(session.id, {
                 level: 'info',
                 source: 'provider',
                 message:
                   providerId === 'zai'
-                    ? `Model selected: ${selectedModelLabel} (${modelId}). Thinking=${enableThinking === true ? 'on' : 'off'}. Request payload override armed for /api/v1/chats/new and /api/v2/chat/completions.`
+                    ? `Model selected: ${selectedModelLabel} (${requestedModelId}). Thinking=${enableThinking === true ? 'on' : 'off'}. Request payload override armed for /api/v1/chats/new and /api/v2/chat/completions.`
                     : providerId === 'perplexity'
-                      ? `Model selected: ${selectedModelLabel} (${modelId}). Thinking=${enableThinking === true ? 'on' : 'off'}. Perplexity ask payload will apply reasoning flags when available.`
-                    : `Model selected: ${selectedModelLabel} (${modelId})`,
+                      ? `Model selected: ${selectedModelLabel} (${requestedModelId}). Thinking=${enableThinking === true ? 'on' : 'off'}. Perplexity ask payload will apply reasoning flags when available.`
+                    : `Model selected: ${selectedModelLabel} (${requestedModelId})`,
               });
             }
           }
@@ -1042,17 +1075,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       },
       refreshProviderModels: async (providerId) => {
         await ensureBridgeCompanion(providerId);
-        const refreshed = await withTimeoutFallback(
-          async () => {
-            await providers.get(providerId).refreshModels();
-            return true;
-          },
-          12000,
-          false,
-        );
-        if (!refreshed) {
-          throw new Error(`${providerId} model refresh timed out.`);
-        }
+        const refreshed = await providers.get(providerId).refreshModels();
+        return refreshed.length;
       },
       resetConversation: async (providerId) => {
         await ensureBridgeCompanion(providerId);

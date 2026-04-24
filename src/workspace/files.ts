@@ -88,7 +88,15 @@ export class WorkspaceFilesService {
   }
 
   private fromRelativePath(relativePath: string): vscode.Uri {
-    return vscode.Uri.file(path.join(this.getWorkspaceRoot(), relativePath));
+    const root = this.getWorkspaceRoot();
+    const resolved = path.resolve(root, relativePath);
+    const relative = path.relative(root, resolved);
+
+    if (relative.startsWith('..') || path.isAbsolute(relative)) {
+      throw new Error(`Path is outside the workspace: ${relativePath}`);
+    }
+
+    return vscode.Uri.file(resolved);
   }
 
   private toRelativePath(uri: vscode.Uri): string {

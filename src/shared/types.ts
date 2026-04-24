@@ -12,6 +12,12 @@ export interface ChatModel {
   label: string;
 }
 
+export interface ProviderModelRefreshStatus {
+  status: 'idle' | 'loading' | 'success' | 'error';
+  message?: string;
+  lastUpdated?: number;
+}
+
 export interface ChatMessage {
   id: string;
   role: 'user' | 'assistant' | 'system';
@@ -81,6 +87,7 @@ export interface WebviewState {
   activeSessionId?: string;
   providers: ProviderId[];
   providerModels: Record<ProviderId, ChatModel[]>;
+  modelRefreshStatus: Record<ProviderId, ProviderModelRefreshStatus>;
   providerReady: Record<ProviderId, boolean>;
   approvalMode: ApprovalMode;
   bridge: BridgeUiState;

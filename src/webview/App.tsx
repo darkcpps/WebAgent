@@ -19,6 +19,12 @@ const initialState: WebviewState = {
     perplexity: [{ id: 'auto', label: 'Auto' }],
     zai: [{ id: 'auto', label: 'Auto' }],
   },
+  modelRefreshStatus: {
+    chatgpt: { status: 'idle' },
+    gemini: { status: 'idle' },
+    perplexity: { status: 'idle' },
+    zai: { status: 'idle' },
+  },
   providerReady: {
     chatgpt: false,
     gemini: false,
@@ -209,12 +215,13 @@ export function App(): JSX.Element {
       return;
     }
     const targetSessionId = activeSession?.providerId === providerId ? activeSession.id : undefined;
+    const outgoingModelId = providerId === 'perplexity' ? 'auto' : modelOverride ?? selectedModelId;
     vscode.postMessage({
       type: 'sendChat',
       providerId,
       sessionId: targetSessionId,
       message: content,
-      modelId: modelOverride ?? selectedModelId,
+      modelId: outgoingModelId,
       agentMode,
       enableThinking: supportsThinkingControl && hasExplicitThinkingPreference ? enableThinking : undefined,
     });
@@ -281,22 +288,28 @@ export function App(): JSX.Element {
               </option>
             ))}
           </select>
-          <select
-            className="glass-select"
-            value={selectedModelId}
-            onChange={(event) =>
-              setModelByProvider((prev) => ({
-                ...prev,
-                [providerId]: event.target.value,
-              }))
-            }
-          >
-            {providerModels.map((model) => (
-              <option key={model.id} value={model.id}>
-                {model.label}
-              </option>
-            ))}
-          </select>
+          {providerId === 'perplexity' ? (
+            <div className="model-browser-note">
+              To select a Perplexity model, choose it in the Perplexity browser window opened by the IDE.
+            </div>
+          ) : (
+            <select
+              className="glass-select"
+              value={selectedModelId}
+              onChange={(event) =>
+                setModelByProvider((prev) => ({
+                  ...prev,
+                  [providerId]: event.target.value,
+                }))
+              }
+            >
+              {providerModels.map((model) => (
+                <option key={model.id} value={model.id}>
+                  {model.label}
+                </option>
+              ))}
+            </select>
+          )}
           <div className="button-row">
             {isLoggedIn ? (
               <button className="auth-btn sign-out" onClick={() => vscode.postMessage({ type: 'logoutProvider', providerId })}>Sign Out</button>
