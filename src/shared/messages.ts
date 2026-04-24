@@ -1,4 +1,4 @@
-import type { ApprovalMode, ProviderId, WebviewState, ZaiManagedMode } from './types';
+import type { ApprovalMode, ProviderId, WebviewState } from './types';
 
 export type WebviewToExtensionMessage =
   | { type: 'ready' }
@@ -34,14 +34,7 @@ export type WebviewToExtensionMessage =
   | { type: 'approve'; sessionId: string; actionId: string }
   | { type: 'reject'; sessionId: string; actionId: string }
   | { type: 'setActiveSession'; sessionId: string }
-  | { type: 'refreshBridgeStatus' }
-  | { type: 'startBridgeCompanion' }
-  | { type: 'stopBridgeCompanion' }
-  | { type: 'restartBridgeCompanion' }
-  | { type: 'openBridgeExtensionFolder' }
-  | { type: 'openZaiInBrowser' }
   | { type: 'setApprovalMode'; mode: ApprovalMode }
-  | { type: 'setZaiRuntimeMode'; mode: ZaiManagedMode }
   | { type: 'previewSessionChanges'; sessionId: string }
   | { type: 'refreshState' };
 
