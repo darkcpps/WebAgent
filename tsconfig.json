@@ -11,7 +11,16 @@
     "skipLibCheck": true,
     "sourceMap": true,
     "outDir": "dist",
-    "rootDir": "src",
+    "rootDir": "src"
   },
-  "include": ["src/**/*.ts", "src/**/*.tsx", "esbuild.js"]
+  "include": ["src/**/*.ts", "src/**/*.tsx"],
+  "exclude": [
+    "src/extension.ts",
+    "src/webview/App.tsx",
+    "src/providers/zai-web.ts",
+    "src/providers/zai-bridge.ts",
+    "src/providers/bridge/**/*.ts",
+    "src/services/bridgeCompanionManager.ts",
+    "src/ui/tree/bridgeTreeProvider.ts"
+  ]
 }
