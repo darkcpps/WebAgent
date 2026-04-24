@@ -2,21 +2,17 @@ import * as path from 'path';
 import * as vscode from 'vscode';
 import { unique } from '../shared/utils';
 import { WorkspaceFilesService } from './files';
-import { GitService } from './git';
 
 export interface RepoContext {
   workspaceRoot: string;
   summary: string;
   relevantFiles: Array<{ path: string; content: string }>;
-  gitStatus: string;
-  gitDiff: string;
   openEditors: string[];
 }
 
 export class WorkspaceContextService {
   constructor(
     private readonly files: WorkspaceFilesService,
-    private readonly git: GitService,
   ) {}
 
   async build(task: string): Promise<RepoContext> {
@@ -31,16 +27,12 @@ export class WorkspaceContextService {
       })),
     );
 
-    const gitStatus = await this.safeGit(async () => this.git.getStatus(), 'Unavailable');
-    const gitDiff = await this.safeGit(async () => this.git.getDiff(), 'Unavailable');
-    const summary = this.buildSummary(task, candidateFiles, openEditors, workspaceRoot, gitStatus);
+    const summary = this.buildSummary(task, candidateFiles, openEditors, workspaceRoot);
 
     return {
       workspaceRoot,
       summary,
       relevantFiles,
-      gitStatus,
-      gitDiff,
       openEditors,
     };
   }
@@ -74,7 +66,7 @@ export class WorkspaceContextService {
     return unique(scores.sort((a, b) => b.score - a.score).map((item) => item.file));
   }
 
-  private buildSummary(task: string, files: string[], openEditors: string[], workspaceRoot: string, gitStatus: string): string {
+  private buildSummary(task: string, files: string[], openEditors: string[], workspaceRoot: string): string {
     const frameworkHints = [
       files.includes('package.json') ? 'Node/JavaScript project' : undefined,
       files.some((file) => file.endsWith('.tsx')) ? 'React or TSX present' : undefined,
@@ -89,7 +81,6 @@ export class WorkspaceContextService {
       `File count scanned: ${files.length}`,
       `Open editors: ${openEditors.join(', ') || 'None'}`,
       `Detected hints: ${frameworkHints.join(', ') || 'No strong hints'}`,
-      `Git status: ${gitStatus}`,
     ].join('\n');
   }
 
@@ -99,14 +90,6 @@ export class WorkspaceContextService {
       return content.length > 5000 ? `${content.slice(0, 5000)}\n...` : content;
     } catch (error) {
       return `Unable to read ${file}: ${(error as Error).message}`;
-    }
-  }
-
-  private async safeGit(getter: () => Promise<string>, fallback: string): Promise<string> {
-    try {
-      return await getter();
-    } catch {
-      return fallback;
     }
   }
 

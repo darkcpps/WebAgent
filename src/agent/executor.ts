@@ -268,21 +268,21 @@ export class ActionExecutor {
       case 'read_file':
         return withRequestedSummary(
           action.startLine || action.limit
-            ? `Reading (${action.path}:${action.startLine ?? 1}${action.limit ? `+${action.limit}` : ''})`
-            : `Reading (${action.path})`,
+            ? `Reading ${action.path}:${action.startLine ?? 1}${action.limit ? `+${action.limit}` : ''}`
+            : `Reading ${action.path}`,
         );
       case 'search_files':
-        return withRequestedSummary(`Searching ("${truncate(action.query, 80)}")`);
+        return withRequestedSummary(`Searching "${truncate(action.query, 80)}"`);
       case 'edit_file':
-        return withRequestedSummary(`Editing (${action.path})`);
+        return withRequestedSummary(`Writing ${action.path}`);
       case 'create_file':
-        return withRequestedSummary(`Creating (${action.path})`);
+        return withRequestedSummary(`Writing ${action.path}`);
       case 'delete_file':
-        return withRequestedSummary(`Deleting (${action.path})`);
+        return withRequestedSummary(`Deleting ${action.path}`);
       case 'rename_file':
-        return withRequestedSummary(`Renaming (${action.fromPath} -> ${action.toPath})`);
+        return withRequestedSummary(`Renaming ${action.fromPath} -> ${action.toPath}`);
       case 'run_command':
-        return withRequestedSummary(`Running command (${truncate(action.command, 80)})`);
+        return withRequestedSummary(`Running command ${truncate(action.command, 80)}`);
       case 'get_git_diff':
         return withRequestedSummary('Reading git diff');
       case 'ask_user':
@@ -295,19 +295,8 @@ export class ActionExecutor {
   }
 
   private updateLatestAssistantToolStatus(sessionId: string, content: string): void {
-    const session = this.sessions.get(sessionId);
-    const latestAssistant = [...(session?.chatHistory ?? [])]
-      .reverse()
-      .find((entry) => entry.role === 'assistant');
-
-    if (!latestAssistant) {
-      return;
-    }
-
-    this.sessions.updateChatMessage(sessionId, latestAssistant.id, {
-      content,
-      rawContent: content,
-    });
+    void sessionId;
+    void content;
   }
 
   private escapeRegex(value: string): string {

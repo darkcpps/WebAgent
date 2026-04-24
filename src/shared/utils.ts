@@ -90,6 +90,8 @@ export function sanitizeResponse(text: string, options: SanitizeResponseOptions 
       return jsonCandidate;
     }
   }
+
+  cleaned = stripAgentProtocolJson(cleaned);
   
   const final = cleaned.trim();
   if (!final && text.trim().length > 0) {
@@ -122,11 +124,13 @@ function tryExtractReadableFromAgentJson(text: string): string | undefined {
   }
 
   // Try to extract the JSON (could be wrapped in ```json ... ```)
-  let jsonStr = text;
-  const fenced = text.match(/```(?:json)?\s*([\s\S]*?)```/i);
+  let jsonStr = extractJsonCandidate(text) ?? text;
+  const fenced = text.match(/`{2,3}(?:json)?\s*([\s\S]*?)`{2,3}/i);
   if (fenced) {
     jsonStr = fenced[1].trim();
   }
+
+  jsonStr = jsonStr.replace(/^`{2,3}(?:json)?\s*/i, '').replace(/`{2,3}\s*$/i, '').trim();
 
   try {
     const parsed = JSON.parse(jsonStr);
@@ -136,12 +140,8 @@ function tryExtractReadableFromAgentJson(text: string): string | undefined {
 
     const parts: string[] = [];
 
-    // Extract summary
-    if (typeof parsed.summary === 'string' && parsed.summary.trim()) {
-      parts.push(parsed.summary.trim());
-    }
-
-    // Extract readable content from actions
+    // Prefer the actual final result over protocol summaries. The IDE should
+    // never display raw agent JSON to users.
     if (Array.isArray(parsed.actions)) {
       for (const action of parsed.actions) {
         if (!action || typeof action !== 'object') {
@@ -155,6 +155,10 @@ function tryExtractReadableFromAgentJson(text: string): string | undefined {
       }
     }
 
+    if (parts.length === 0 && typeof parsed.summary === 'string' && parsed.summary.trim()) {
+      parts.push(parsed.summary.trim());
+    }
+
     if (parts.length > 0) {
       return parts.join('\n\n');
     }
@@ -165,8 +169,52 @@ function tryExtractReadableFromAgentJson(text: string): string | undefined {
   return undefined;
 }
 
+function stripAgentProtocolJson(input: string): string {
+  let output = input;
+  const extractedFromWhole = tryExtractReadableFromAgentJson(output);
+
+  output = output.replace(/```json\s*([\s\S]*?)```/gi, (whole, inner: string) => {
+    return isAgentProtocolJson(inner) ? '' : whole;
+  });
+
+  output = output.replace(/```\s*([\s\S]*?)```/gi, (whole, inner: string) => {
+    return isAgentProtocolJson(inner) ? '' : whole;
+  });
+
+  const segments = extractBalancedJsonSegments(output)
+    .filter(isAgentProtocolJson)
+    .sort((left, right) => right.length - left.length);
+
+  for (const segment of segments) {
+    output = output.replace(segment, '');
+  }
+
+  output = output.replace(/^\s*json\s*$/gim, '');
+  output = output.replace(/\n{3,}/g, '\n\n').trim();
+
+  if (output) {
+    return output;
+  }
+
+  return extractedFromWhole ?? '';
+}
+
+function isAgentProtocolJson(text: string): boolean {
+  const candidate = text.trim();
+  if (!candidate || !/"actions"\s*:/.test(candidate)) {
+    return false;
+  }
+
+  try {
+    const parsed = JSON.parse(candidate);
+    return Boolean(parsed && typeof parsed === 'object' && Array.isArray(parsed.actions));
+  } catch {
+    return false;
+  }
+}
+
 function extractJsonCandidate(input: string): string | undefined {
-  const fencedMatches = [...input.matchAll(/```(?:json)?\s*([\s\S]*?)```/gi)]
+  const fencedMatches = [...input.matchAll(/`{2,3}(?:json)?\s*([\s\S]*?)`{2,3}/gi)]
     .map((match) => match[1]?.trim() || '')
     .filter(Boolean);
 

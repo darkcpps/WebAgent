@@ -30,7 +30,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   const safety = new SafetyPolicy(configuration);
   const diffPreview = new DiffPreviewService();
   const terminal = new TerminalRunner();
-  const workspaceContext = new WorkspaceContextService(files, git);
+  const workspaceContext = new WorkspaceContextService(files);
   const executor = new ActionExecutor(files, git, safety, approvals, sessions, diffPreview, terminal);
   const orchestrator = new AgentOrchestrator(providers, workspaceContext, executor, sessions);
   const parser = new AgentResponseParser();
@@ -169,7 +169,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       const session = existing && existing.providerId === providerId ? existing : sessions.create(providerId, 'Chat session', workspaceRoot);
       sessions.setActive(session.id);
       sessions.appendChatMessage(session.id, { role: 'user', content: message, modelId });
-      const assistantMessage = sessions.appendChatMessage(session.id, { role: 'assistant', content: 'Thinking...', modelId: modelId && modelId !== 'auto' ? modelId : undefined, rawContent: '' });
+      const assistantMessage = sessions.appendChatMessage(session.id, { role: 'assistant', content: 'Working...', modelId: modelId && modelId !== 'auto' ? modelId : undefined, rawContent: '' });
       sessions.setStatus(session.id, 'running');
 
       try {
@@ -218,10 +218,10 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         if (usePlanningMode) {
           const repoContext = await workspaceContext.build(chatPrompt);
           const existingPlan = activePendingPlan ? { originalRequest: activePendingPlan.originalRequest, plan: activePendingPlan.plan } : undefined;
-          const prompt = buildPlanningPrompt(chatPrompt, repoContext, existingPlan, { budgetProfile: promptBudgetProfile });
+          const prompt = buildPlanningPrompt(chatPrompt, repoContext, existingPlan);
           appendPromptPreviewLog(session.id, 'plan', prompt);
           await provider.sendPrompt({ ...prompt, enableThinking: requestThinking });
-          const responseText = await collectProviderText(session.id, providerId, (delta) => assistantMessage && sessions.updateChatMessage(session.id, assistantMessage.id, { content: sanitizeResponse(delta) || 'Planning...', rawContent: delta }));
+          const responseText = await collectProviderText(session.id, providerId);
           const cleaned = cleanFinalResponse(responseText);
           sessions.appendRawResponse(session.id, cleaned);
           sessions.update(session.id, { pendingPlan: { originalRequest: activePendingPlan?.originalRequest ?? chatPrompt, plan: cleaned, createdAt: Date.now() } });
@@ -236,7 +236,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
           const prompt = buildChatAskPrompt(chatPrompt, { wasPreviouslyAgentMode });
           appendPromptPreviewLog(session.id, 'chat', prompt);
           await provider.sendPrompt({ ...prompt, enableThinking: requestThinking });
-          const responseText = await collectProviderText(session.id, providerId, (delta) => assistantMessage && sessions.updateChatMessage(session.id, assistantMessage.id, { content: sanitizeResponse(delta) || 'Thinking...', rawContent: delta }));
+          const responseText = await collectProviderText(session.id, providerId);
           const cleaned = cleanFinalResponse(responseText);
           sessions.appendRawResponse(session.id, cleaned);
           if (assistantMessage) sessions.updateChatMessage(session.id, assistantMessage.id, { content: cleaned, rawContent: responseText });
@@ -249,22 +249,21 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         const repoContext = await workspaceContext.build(contextTask);
         const toolResults: string[] = [];
         for (let round = 0; round < 25; round += 1) {
-          const prompt = buildProviderPrompt(chatPrompt, repoContext, toolResults, { budgetProfile: promptBudgetProfile });
+          const prompt = buildProviderPrompt(chatPrompt, repoContext, toolResults);
           appendPromptPreviewLog(session.id, 'agent', prompt, round + 1);
           await provider.sendPrompt({ ...prompt, enableThinking: requestThinking });
-          const responseText = await collectProviderText(session.id, providerId, (delta) => assistantMessage && sessions.updateChatMessage(session.id, assistantMessage.id, { content: sanitizeResponse(delta) || 'Thinking...', rawContent: delta }));
+          const responseText = await collectProviderText(session.id, providerId);
           sessions.appendRawResponse(session.id, responseText);
           let parsed;
           try {
             parsed = parser.parse(responseText);
           } catch {
-            const cleaned = cleanFinalResponse(responseText, { preferJson: true });
+            const cleaned = cleanFinalResponse(responseText);
             if (assistantMessage) sessions.updateChatMessage(session.id, assistantMessage.id, { content: cleaned, rawContent: responseText });
             sessions.setStatus(session.id, 'done');
             return;
           }
           sessions.appendLog(session.id, { level: 'info', source: 'provider', message: parsed.summary || `Round ${round + 1} response received.` });
-          if (assistantMessage) sessions.updateChatMessage(session.id, assistantMessage.id, { content: parsed.summary || `Round ${round + 1} response received.`, rawContent: responseText });
           for (const action of parsed.actions) {
             const result = await executor.execute(session.id, action);
             toolResults.push(`${action.type}: ${result.message}`);
@@ -362,6 +361,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       if (active?.approvalRequest) approvals.reject(active.approvalRequest.actionId);
     }),
   );
+
+  panel.show();
 }
 
 export function deactivate(): void {}

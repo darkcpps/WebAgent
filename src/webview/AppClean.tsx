@@ -1,6 +1,7 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import type { ExtensionToWebviewMessage, WebviewToExtensionMessage } from '../shared/messages';
 import type { ProviderId, WebviewState } from '../shared/types';
+import { sanitizeResponse } from '../shared/utils';
 
 declare global {
   interface Window {
@@ -41,6 +42,7 @@ export function App(): JSX.Element {
   const [agentMode, setAgentMode] = useState(false);
   const [planningMode, setPlanningMode] = useState(false);
   const [showThinking, setShowThinking] = useState(false);
+  const [settingsOpen, setSettingsOpen] = useState(false);
   const [expandedThinkingByMessage, setExpandedThinkingByMessage] = useState<Record<string, boolean>>({});
   const [modelByProvider, setModelByProvider] = useState<Record<string, string>>({});
   const [thinkingByProvider, setThinkingByProvider] = useState<Record<string, boolean>>({});
@@ -231,14 +233,40 @@ export function App(): JSX.Element {
         {toast ? <div className={`toast-banner ${toast.level}`}>{toast.message}</div> : null}
         <header className="chat-header">
           <div className="header-tabs"><button className="tab-btn active">Chat</button></div>
-          <button className="debug-toggle" onClick={() => setDebugOpen((value) => !value)}>{debugOpen ? 'Hide Logs' : 'View Logs'}</button>
+          <div className="header-actions">
+            <button
+              className={`settings-toggle ${autoApproveEnabled ? 'auto-on' : ''}`}
+              title="Workflow settings"
+              onClick={() => setSettingsOpen((value) => !value)}
+            >
+              <span className="settings-gear">⚙</span>
+              <span>Settings</span>
+              {autoApproveEnabled ? <span className="settings-pill">Auto approve</span> : null}
+            </button>
+            <button className="debug-toggle" onClick={() => setDebugOpen((value) => !value)}>{debugOpen ? 'Hide Logs' : 'View Logs'}</button>
+          </div>
         </header>
 
         <section className="chat-scroll">
+          {settingsOpen ? (
+            <div className="settings-panel">
+              <div>
+                <div className="settings-title">Workflow Settings</div>
+                <div className="settings-help">Safe edits can run without manual approval. Higher risk actions still use the safety policy.</div>
+              </div>
+              <label className="toggle-switch">
+                <input type="checkbox" checked={autoApproveEnabled} onChange={(event) => onSetAutoApprove(event.target.checked)} />
+                <span className="slider"></span>
+                <span className="toggle-label">Auto Approve</span>
+              </label>
+            </div>
+          ) : null}
+
           {activeSession?.chatHistory.length ? activeSession.chatHistory.map((entry, index) => {
             const thoughtView = getThoughtView(entry.rawContent, entry.content);
             const thinkingExpanded = Boolean(expandedThinkingByMessage[entry.id]) || showThinking;
-            const contentToRender = entry.role === 'assistant' && thoughtView.answer.trim().length > 0 ? thoughtView.answer : entry.content;
+            const rawContentToRender = entry.role === 'assistant' && thoughtView.answer.trim().length > 0 ? thoughtView.answer : entry.content;
+            const contentToRender = entry.role === 'assistant' ? sanitizeResponse(rawContentToRender) || rawContentToRender : rawContentToRender;
             return (
               <article key={entry.id} className={`chat-bubble ${entry.role}`}>
                 <div className="bubble-avatar">{entry.role === 'user' ? 'U' : 'AI'}</div>
@@ -303,11 +331,25 @@ function getThoughtView(rawContent: string | undefined, fallbackAnswer: string):
 }
 
 function MarkdownContent({ content }: { content: string }): JSX.Element {
-  const html = content
+  const hasFencedCode = /```[\s\S]*?```/.test(content);
+  const escaped = content
     .replace(/&/g, '&amp;')
     .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/`([^`]+)`/g, '<code>$1</code>')
+    .replace(/>/g, '&gt;');
+
+  if (hasFencedCode) {
+    const html = escaped
+      .replace(/```([a-zA-Z0-9_-]+)?\r?\n?([\s\S]*?)```/g, (_match, lang: string, code: string) => {
+        const label = lang ? `<div class="md-code-lang">${lang}</div>` : '';
+        return `<pre class="md-code">${label}<code>${code.replace(/\n$/, '')}</code></pre>`;
+      })
+      .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
+      .replace(/\n/g, '<br />');
+    return <div dangerouslySetInnerHTML={{ __html: html }} />;
+  }
+
+  const html = escaped
+    .replace(/`([^`\r\n]+)`/g, '<code>$1</code>')
     .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
     .replace(/\n/g, '<br />');
   return <div dangerouslySetInnerHTML={{ __html: html }} />;

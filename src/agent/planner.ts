@@ -5,6 +5,9 @@ const TOOL_RESULT_ITEM_MAX_CHARS = 3000;
 
 export function buildProviderPrompt(task: string, context: RepoContext, toolResults: string[] = []): { systemPrompt: string; userPrompt: string } {
   const systemPrompt = [
+    'OUTPUT CONTRACT: Reply with one raw JSON object only. The first character must be `{` and the last character must be `}`.',
+    'Do not output prose, Markdown, code fences, headings, bullet lists, XML tags, or explanatory text outside the JSON object.',
+    '',
     'You are operating as a coding agent inside an IDE.',
     'You must think like a safe, objective, tool-using software engineering agent.',
     'Your goal is to complete the user task end-to-end using the provided tools.',
@@ -33,7 +36,10 @@ export function buildProviderPrompt(task: string, context: RepoContext, toolResu
     'Finish only after the requested behavior is implemented, verified where possible, and summarized clearly.',
     '',
     '### TOOL USAGE RULES',
-    '1. Return ONLY valid JSON with this exact shape: {"summary":"concise description","actions":[{"type":"tool_name", ...}]}',
+    '1. Return ONLY one valid raw JSON object with this exact shape: {"summary":"concise description","actions":[{"type":"tool_name", ...}]}',
+    '1a. Your response must start with `{` and end with `}`. No text may appear before or after the JSON object.',
+    '1b. Do not use Markdown fences, headings, bullets, XML tags, or conversational prose.',
+    '1c. Never respond with intent-only prose such as "Now I have enough", "Let me build", "I will create", or "I can implement". Those are invalid because the IDE cannot execute them.',
     '2. You can perform multiple actions in one turn if they are independent.',
     '3. For sequential actions (e.g., read then edit), wait for the tool result of the first action before emitting the second.',
     '4. You do not directly access the user filesystem from the model runtime. You access the repository only by emitting JSON tool actions such as `list_files`, `search_files`, and `read_file`; the IDE will run them and return results.',
@@ -42,6 +48,7 @@ export function buildProviderPrompt(task: string, context: RepoContext, toolResu
     '7. Never hallucinate file paths. Use `list_files` or `search_files` if you are unsure.',
     '8. Prefer targeted edits using `oldString` and `newString` for large files to avoid data loss.',
     '9. When the task is complete, use the `finish` action.',
+    '9a. Do not use `finish` to announce what you are about to do. Use `finish` only after the IDE has successfully executed the needed tool actions.',
     '10. Do not include your internal reasoning or thought process in the JSON. Put it in the "summary" field if necessary.',
     '11. Use workspace-relative paths only (e.g. "src/app.ts"). Do not use absolute paths like "C:\\\\...".',
     '12. Discovery-first behavior: if the task is not a clearly single-file change, start by exploring with `list_files`/`search_files`, then `read_file` on likely targets.',
@@ -60,21 +67,20 @@ export function buildProviderPrompt(task: string, context: RepoContext, toolResu
     '- delete_file: {"type":"delete_file", "path": "obsolete.ts"} - Delete a file.',
     '- rename_file: {"type":"rename_file", "fromPath": "old.ts", "toPath": "new.ts"} - Rename/move a file.',
     '- run_command: {"type":"run_command", "command": "npm test"} - Execute shell commands.',
-    '- get_git_diff: {"type":"get_git_diff"} - Get current unstaged changes.',
     '- ask_user: {"type":"ask_user", "question": "..."} - Ask the user for clarification.',
     '- finish: {"type":"finish", "result": "summary of work done"} - Finalize the task.',
     '',
     '### CRITICAL: RESPONSE FORMAT',
-    'Your response must be a single JSON object. Do not wrap it in conversational prose. If you must explain, use the "summary" field inside the JSON.',
-    'Example:',
-    '```json',
+    'Your response must be a single raw JSON object. Do not wrap it in conversational prose. Do not wrap it in a ```json code block. If you must explain, use the "summary" field inside the JSON.',
+    'If the user asks you to build or modify files, the first executable response must include file/tool actions, not a narrative statement about building.',
+    'Valid response example:',
     '{"summary":"Searching for the bug","actions":[{"type":"search_files","query":"buggyFunction"}]}',
-    '```',
+    'Any non-JSON text outside that object is invalid.',
   ].join('\n');
 
-  const relevantFiles = context.relevantFiles
-    .map((file) => `### ${file.path}\n${file.content}`)
-    .join('\n\n');
+  const relevantFileHints = context.relevantFiles
+    .map((file) => `- ${file.path}`)
+    .join('\n');
 
   const compactedToolResults = compactToolResults(toolResults);
   const observations = compactedToolResults.length
@@ -85,7 +91,10 @@ export function buildProviderPrompt(task: string, context: RepoContext, toolResu
     `Task:\n${task}`,
     '',
     'Important operating note:',
-    '- The "Relevant files" section may be incomplete or truncated.',
+    '- OUTPUT JSON ONLY. Your reply must be one raw JSON object and nothing else.',
+    '- The first character of your reply must be `{`; the last character must be `}`.',
+    '- The "Relevant file hints" section intentionally lists paths only, not code.',
+    '- Use `read_file` to inspect exact file contents before relying on code details or editing.',
     '- `read_file` returns a bounded line window by default. For large files, read only the specific ranges you need with `startLine` and `limit`, then continue with the suggested next `startLine` when necessary.',
     '- In medium/large repos, narrow scope with `search_files` and then `read_file` specific files or line ranges before editing.',
     '- If you need repository access, emit JSON tool calls. Do not say the files are unavailable based on your model/runtime environment.',
@@ -96,11 +105,7 @@ export function buildProviderPrompt(task: string, context: RepoContext, toolResu
     '',
     `Open editors:\n${context.openEditors.join(', ') || 'None'}`,
     '',
-    `Git status:\n${context.gitStatus}`,
-    '',
-    `Git diff:\n${context.gitDiff}`,
-    '',
-    `Relevant files:\n${relevantFiles || 'No relevant files selected.'}`,
+    `Relevant file hints:\n${relevantFileHints || 'No relevant file hints selected.'}`,
     observations,
   ].join('\n');
 
@@ -185,10 +190,6 @@ export function buildPlanningPrompt(
     `Workspace summary:\n${context.summary}`,
     '',
     `Open editors:\n${context.openEditors.join(', ') || 'None'}`,
-    '',
-    `Git status:\n${context.gitStatus}`,
-    '',
-    `Git diff:\n${context.gitDiff}`,
     '',
     `Relevant files:\n${relevantFiles || 'No relevant files selected.'}`,
     '',

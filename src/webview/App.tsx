@@ -1,6 +1,7 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import type { ExtensionToWebviewMessage, WebviewToExtensionMessage } from '../shared/messages';
 import type { WebviewState } from '../shared/types';
+import { sanitizeResponse } from '../shared/utils';
 
 declare global {
   interface Window {
@@ -174,6 +175,7 @@ export function App(): JSX.Element {
   const enableThinking = Boolean(thinkingByProvider[providerId]);
   const canSend = message.trim().length > 0 && !isRunning && isLoggedIn;
   const debugLogs = activeSession?.logs ?? [];
+  const visibleActions = activeSession?.actionHistory.slice(-6) ?? [];
   const autoApproveEnabled = state.approvalMode === 'auto-apply-safe-edits';
   const modifiedActionTypes = new Set(['edit_file', 'create_file', 'delete_file', 'rename_file']);
   const hasCompletedCodeChanges = Boolean(
@@ -448,8 +450,11 @@ export function App(): JSX.Element {
                 activeSession.chatHistory.map((entry, index) => {
                   const thoughtView = getThoughtView(entry.rawContent, entry.content);
                   const thinkingExpanded = Boolean(expandedThinkingByMessage[entry.id]) || showThinking;
-                  const contentToRender =
+                  const rawContentToRender =
                     entry.role === 'assistant' && thoughtView.answer.trim().length > 0 ? thoughtView.answer : entry.content;
+                  const contentToRender = entry.role === 'assistant'
+                    ? sanitizeResponse(rawContentToRender) || rawContentToRender
+                    : rawContentToRender;
 
                   return (
                     <article key={entry.id} className={`chat-bubble ${entry.role}`}>
@@ -520,11 +525,23 @@ export function App(): JSX.Element {
                 })
               ) : (
                 <div className="empty-state">
-                  <div className="empty-icon">✧</div>
+                  <div className="empty-icon">*</div>
                   <h3>Ready to assist</h3>
                   <p>Send a message below or start an agentic task to begin.</p>
                 </div>
               )}
+
+              {visibleActions.length > 0 ? (
+                <div className="activity-strip" aria-label="IDE activity">
+                  {isRunning ? <div className="activity-heading">Working...</div> : null}
+                  {visibleActions.map((action) => (
+                    <div key={action.id} className={`activity-chip ${action.status}`}>
+                      <span className="activity-dot"></span>
+                      <span className="activity-label">{action.summary}</span>
+                    </div>
+                  ))}
+                </div>
+              ) : null}
               
               {activeSession?.approvalRequest ? (
                 <div className="approval-card">

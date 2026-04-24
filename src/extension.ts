@@ -34,7 +34,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   const safety = new SafetyPolicy(configuration);
   const diffPreview = new DiffPreviewService();
   const terminal = new TerminalRunner();
-  const workspaceContext = new WorkspaceContextService(files, git);
+  const workspaceContext = new WorkspaceContextService(files);
   const executor = new ActionExecutor(files, git, safety, approvals, sessions, diffPreview, terminal);
   const orchestrator = new AgentOrchestrator(providers, workspaceContext, executor, sessions);
   const parser = new AgentResponseParser();
@@ -481,7 +481,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         });
         const assistantMessage = sessions.appendChatMessage(session.id, {
           role: 'assistant',
-          content: 'Thinking...',
+          content: 'Working...',
           modelId: modelId && modelId !== 'auto' ? modelId : undefined,
           rawContent: '',
         });
@@ -700,15 +700,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
             );
 
             const responseText = await runWithAutoFallback(
-              () =>
-                collectProviderText(session.id, providerId, (delta) => {
-                  if (assistantMessage) {
-                    sessions.updateChatMessage(session.id, assistantMessage.id, {
-                      content: sanitizeResponse(delta) || 'Planning...',
-                      rawContent: delta,
-                    });
-                  }
-                }),
+              () => collectProviderText(session.id, providerId),
               'streamEvents(plan)',
             );
             const cleaned = cleanFinalResponse(responseText);
@@ -752,15 +744,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
             );
 
             const responseText = await runWithAutoFallback(
-              () =>
-                collectProviderText(session.id, providerId, (delta) => {
-                  if (assistantMessage) {
-                    sessions.updateChatMessage(session.id, assistantMessage.id, {
-                      content: sanitizeResponse(delta) || 'Thinking...',
-                      rawContent: delta,
-                    });
-                  }
-                }),
+              () => collectProviderText(session.id, providerId),
               'streamEvents(chat)',
             );
             const cleaned = cleanFinalResponse(responseText);
@@ -824,6 +808,11 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 
           const isPrematureAccessBlocker = (message: string): boolean =>
             /(files?|workspace|repository|repo).{0,80}(unavailable|not available|inaccessible|not accessible|not present|missing)|sandbox only exposes|could not safely implement|provide the actual project files/i.test(
+              message,
+            );
+
+          const isPrematureIntentFinish = (message: string): boolean =>
+            /\b(now\s+i\s+have\s+enough|let\s+me\s+build|i(?:'ll| will)\s+(?:build|create|implement|modify|edit|make)|i\s+can\s+(?:build|create|implement|modify|edit|make)|going\s+to\s+(?:build|create|implement|modify|edit|make))\b/i.test(
               message,
             );
 
@@ -896,21 +885,21 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 
             switch (action.type) {
               case 'read_file':
-                return withSummary(`Reading (${action.path ?? 'file'})`);
+                return withSummary(`Reading ${action.path ?? 'file'}`);
               case 'edit_file':
-                return withSummary(`Editing (${action.path ?? 'file'})`);
+                return withSummary(`Modifying ${action.path ?? 'file'}`);
               case 'create_file':
-                return withSummary(`Creating (${action.path ?? 'file'})`);
+                return withSummary(`Creating ${action.path ?? 'file'}`);
               case 'delete_file':
-                return withSummary(`Deleting (${action.path ?? 'file'})`);
+                return withSummary(`Deleting ${action.path ?? 'file'}`);
               case 'rename_file':
-                return withSummary(`Renaming (${action.fromPath ?? 'source'} -> ${action.toPath ?? 'target'})`);
+                return withSummary(`Renaming ${action.fromPath ?? 'source'} -> ${action.toPath ?? 'target'}`);
               case 'search_files':
-                return withSummary(`Searching ("${compact(action.query ?? '', 80)}")`);
+                return withSummary(`Searching "${compact(action.query ?? '', 80)}"`);
               case 'list_files':
                 return withSummary('Listing files');
               case 'run_command':
-                return withSummary(`Running command (${compact(action.command ?? '', 80)})`);
+                return withSummary(`Running command ${compact(action.command ?? '', 80)}`);
               case 'get_git_diff':
                 return withSummary('Reading git diff');
               case 'ask_user':
@@ -976,11 +965,11 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
             }
 
             if (assistantMessage) {
-              const liveLines = actionUpdates.slice(-4);
+              const liveLines = actionUpdates.slice(-6);
               const liveContent = ['Working...', '', ...liveLines.map((entry, idx) => `${idx + 1}. ${entry}`)].join('\n');
               sessions.updateChatMessage(session.id, assistantMessage.id, {
                 content: liveContent,
-                rawContent: lastRawResponse || liveContent,
+                rawContent: liveContent,
               });
             }
           };
@@ -1047,9 +1036,11 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
                     [
                       'SYSTEM_FEEDBACK: Your previous response did not use a valid executable tool JSON object.',
                       `Parse error: ${parseErrorMessage}`,
-                      'Respond ONLY with this exact shape:',
-                      '{"summary":"...","actions":[{"type":"list_files|read_file|search_files|edit_file|create_file|delete_file|rename_file|run_command|get_git_diff|ask_user|finish", ...}]}',
-                      'Use only allowed tool names. Do not include prose outside JSON. If uncertain, use read_file/search_files first.',
+                      'Your next response must be raw JSON only. The first character must be `{` and the last character must be `}`.',
+                      'Do not include prose, Markdown fences, headings, bullets, XML tags, or explanations outside the JSON object.',
+                      'Respond with exactly this shape:',
+                      '{"summary":"...","actions":[{"type":"list_files|read_file|search_files|edit_file|create_file|delete_file|rename_file|run_command|ask_user|finish", ...}]}',
+                      'Use only allowed tool names. If uncertain, use read_file/search_files first.',
                       `Previous invalid response (truncated): ${responsePreview || '[empty]'}`,
                     ].join('\n'),
                   );
@@ -1099,6 +1090,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
                 toolResults.push(
                   [
                     'SYSTEM_FEEDBACK: Do not finish by saying repository files are unavailable based on your model/runtime environment.',
+                    'Your next response must be raw JSON only. No prose or Markdown outside the JSON object.',
                     'You are inside an IDE agent loop. To access the workspace, emit JSON tool calls and the IDE will return results.',
                     'Start with {"type":"list_files","limit":100} or {"type":"search_files","query":"<relevant term>"} before deciding files are missing.',
                     `Rejected finish result: ${compact(action.result, 500)}`,
@@ -1108,6 +1100,28 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
                   toolResults.shift();
                 }
                 pushActionUpdate('Auto-recovery: rejected premature no-access finish and requested file discovery.');
+                continue;
+              }
+
+              if (action.type === 'finish' && executedActionCount === 0 && isPrematureIntentFinish(action.result)) {
+                sessions.appendLog(session.id, {
+                  level: 'warning',
+                  source: 'agent',
+                  message: 'Rejected intent-only finish; asking model to emit executable tool actions.',
+                });
+                toolResults.push(
+                  [
+                    'SYSTEM_FEEDBACK: Do not finish with a statement about what you are about to build or edit.',
+                    'Your next response must be raw JSON only. No prose or Markdown outside the JSON object.',
+                    'The IDE can only execute JSON tool actions. Emit list_files/search_files/read_file/create_file/edit_file/run_command actions as needed.',
+                    'Use finish only after the requested work has actually been completed by prior tool actions.',
+                    `Rejected finish result: ${compact(action.result, 500)}`,
+                  ].join('\n'),
+                );
+                if (toolResults.length > 10) {
+                  toolResults.shift();
+                }
+                pushActionUpdate('Auto-recovery: rejected intent-only finish and requested executable actions.');
                 continue;
               }
 
@@ -1148,6 +1162,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
                     [
                       'SYSTEM_FEEDBACK: The previous action failed or was blocked in IDE execution.',
                       `Failure detail: ${result.message}`,
+                      'Your next response must be raw JSON only. No prose or Markdown outside the JSON object.',
                       'Adjust your next action to use valid workspace-relative paths and supported tools.',
                       'If editing, ensure you read_file the exact target first.',
                     ].join('\n'),
@@ -1250,7 +1265,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
           if (assistantMessage) {
             sessions.updateChatMessage(session.id, assistantMessage.id, {
               content: finalText,
-              rawContent: lastRawResponse || finalText || '',
+              rawContent: finalText,
             });
           }
           sessions.setStatus(session.id, 'done');

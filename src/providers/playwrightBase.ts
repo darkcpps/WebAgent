@@ -73,14 +73,15 @@ export abstract class PlaywrightWebProvider implements ProviderAdapter {
   }
 
   async login(): Promise<void> {
-    const loginHeadless = this.id === 'zai' ? false : this.getRuntimeHeadlessMode();
+    const isZaiProvider = (this.id as string) === 'zai';
+    const loginHeadless = isZaiProvider ? false : this.getRuntimeHeadlessMode();
     await this.withRecovery(async () => {
       await this.gotoHome();
       await vscode.window.showInformationMessage(
         `Finish logging in to ${this.id} in the opened browser window. Login state is saved for future sessions.`,
       );
     }, { headless: loginHeadless });
-    if (this.id === 'zai' && this.getRuntimeHeadlessMode()) {
+    if (isZaiProvider && this.getRuntimeHeadlessMode()) {
       console.log('[zai-managed] Login was opened in visible mode. Subsequent runtime will use headless mode.');
     }
   }
@@ -748,7 +749,7 @@ export abstract class PlaywrightWebProvider implements ProviderAdapter {
   }
 
   protected getRuntimeHeadlessMode(): boolean {
-    if (this.id !== 'zai') {
+    if ((this.id as string) !== 'zai') {
       return false;
     }
     const configured = vscode.workspace.getConfiguration('webagentCode').get<string>('zai.runtimeMode', 'headless');
