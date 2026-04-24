@@ -71,3 +71,67 @@ export function buildProviderPrompt(task: string, context: RepoContext, toolResu
 
   return { systemPrompt, userPrompt };
 }
+
+export function buildPlanningPrompt(
+  task: string,
+  context: RepoContext,
+  existingPlan?: { originalRequest: string; plan: string },
+): { systemPrompt: string; userPrompt: string } {
+  const systemPrompt = [
+    'You are operating in Planning Mode inside an IDE.',
+    'Your job is to inspect the provided codebase context and produce a descriptive, detailed implementation plan only.',
+    'Do not write or modify code. Do not output executable tool JSON.',
+    'Ground the plan in the actual repository structure and mention specific files or modules when relevant.',
+    'You have creative liberty to propose thoughtful features, product details, UI/UX behavior, empty/loading/error states, polish, and implementation details that the user likely wants but did not explicitly mention.',
+    'Separate explicit user requirements from inferred enhancements so the user can revise or decline anything speculative.',
+    'Prefer plans that feel complete from a real user workflow perspective: include interaction states, edge cases, accessibility, copy, visual hierarchy, and verification when relevant.',
+    'If the request is ambiguous, include a short "Questions" section, but still provide a best-effort plan with sensible defaults.',
+    'End by asking whether the user wants to implement the plan or revise it with more details.',
+  ].join('\n');
+
+  const relevantFiles = context.relevantFiles
+    .map((file) => `### ${file.path}\n${file.content}`)
+    .join('\n\n');
+
+  const revisionContext = existingPlan
+    ? [
+        'Existing planning context:',
+        `Original request:\n${existingPlan.originalRequest}`,
+        '',
+        `Current plan to revise:\n${existingPlan.plan}`,
+        '',
+        'Use the new user message as requested changes or extra detail, then return a revised complete plan.',
+      ].join('\n')
+    : '';
+
+  const userPrompt = [
+    revisionContext,
+    `User request:\n${task}`,
+    '',
+    `Workspace summary:\n${context.summary}`,
+    '',
+    `Open editors:\n${context.openEditors.join(', ') || 'None'}`,
+    '',
+    `Git status:\n${context.gitStatus}`,
+    '',
+    `Git diff:\n${context.gitDiff}`,
+    '',
+    `Relevant files:\n${relevantFiles || 'No relevant files selected.'}`,
+    '',
+    [
+      'Return an actionable plan with sections for:',
+      '- Goal and intended user experience',
+      '- Explicit requirements from the user',
+      '- Inferred enhancements and creative additions',
+      '- Codebase findings',
+      '- UI/UX and interaction details, when relevant',
+      '- Implementation steps',
+      '- Risks, tradeoffs, and open questions',
+      '- Verification',
+      '',
+      'Be detailed enough that another coding agent could implement the plan without guessing the product behavior.',
+    ].join('\n'),
+  ].filter(Boolean).join('\n');
+
+  return { systemPrompt, userPrompt };
+}

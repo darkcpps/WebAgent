@@ -50,6 +50,7 @@ export function App(): JSX.Element {
   const [providerId, setProviderId] = useState<WebviewState['providers'][number]>('zai');
   const [message, setMessage] = useState('');
   const [agentMode, setAgentMode] = useState(false);
+  const [planningMode, setPlanningMode] = useState(false);
   const [showThinking, setShowThinking] = useState(false);
   const [activeTab, setActiveTab] = useState<'chat' | 'bridge' | 'settings'>('chat');
   const [expandedThinkingByMessage, setExpandedThinkingByMessage] = useState<Record<string, boolean>>({});
@@ -59,6 +60,7 @@ export function App(): JSX.Element {
   const [debugOpen, setDebugOpen] = useState(true);
   const [sessionContextMenu, setSessionContextMenu] = useState<{ sessionId: string; x: number; y: number } | null>(null);
   const hasPerformedStartupReadyCheck = useRef(false);
+  const composerRef = useRef<HTMLTextAreaElement>(null);
 
   useEffect(() => {
     const handler = (event: MessageEvent<ExtensionToWebviewMessage>) => {
@@ -173,7 +175,9 @@ export function App(): JSX.Element {
     activeSession?.chatHistory
       .filter((entry) => entry.role === 'assistant')
       .at(-1)?.id ?? undefined;
-  const composerPlaceholder = agentMode
+  const composerPlaceholder = planningMode
+    ? 'Describe what you want planned, or add details to revise the current plan...'
+    : agentMode
     ? 'Describe an agent task (files, goals, constraints)...'
     : 'Ask a question about your code, recent changes, or next steps...';
 
@@ -210,19 +214,22 @@ export function App(): JSX.Element {
     vscode.postMessage({ type: 'previewSessionChanges', sessionId: activeSession.id });
   };
 
-  const sendMessage = (content: string, modelOverride?: string) => {
+  const sendMessage = (content: string, modelOverride?: string, modeOverride?: 'chat' | 'agent' | 'plan') => {
     if (!content) {
       return;
     }
     const targetSessionId = activeSession?.providerId === providerId ? activeSession.id : undefined;
     const outgoingModelId = providerId === 'perplexity' ? 'auto' : modelOverride ?? selectedModelId;
+    const outgoingPlanningMode = modeOverride === 'plan' ? true : modeOverride === 'agent' ? false : planningMode;
+    const outgoingAgentMode = modeOverride === 'agent' ? true : modeOverride === 'plan' ? false : agentMode;
     vscode.postMessage({
       type: 'sendChat',
       providerId,
       sessionId: targetSessionId,
       message: content,
       modelId: outgoingModelId,
-      agentMode,
+      agentMode: outgoingAgentMode,
+      planningMode: outgoingPlanningMode,
       enableThinking: supportsThinkingControl && hasExplicitThinkingPreference ? enableThinking : undefined,
     });
   };
@@ -234,6 +241,26 @@ export function App(): JSX.Element {
     }
     sendMessage(content);
     setMessage('');
+  };
+
+  const onImplementPlan = () => {
+    if (!activeSession?.pendingPlan || isRunning || !isLoggedIn) {
+      return;
+    }
+    setPlanningMode(false);
+    setAgentMode(true);
+    sendMessage('Implement this plan', undefined, 'agent');
+  };
+
+  const onRevisePlan = () => {
+    if (!activeSession?.pendingPlan || isRunning) {
+      return;
+    }
+    setPlanningMode(true);
+    setAgentMode(false);
+    window.requestAnimationFrame(() => {
+      composerRef.current?.focus();
+    });
   };
 
   const isCapacityMessage = (content: string): boolean => /model is currently at capacity/i.test(content);
@@ -412,6 +439,19 @@ export function App(): JSX.Element {
                         ) : null}
                         {entry.role === 'assistant' &&
                         !isRunning &&
+                        activeSession?.pendingPlan &&
+                        latestAssistantMessageId === entry.id ? (
+                          <div className="response-actions">
+                            <button className="glass-btn primary" onClick={onImplementPlan} disabled={!isLoggedIn}>
+                              Implement Plan
+                            </button>
+                            <button className="glass-btn" onClick={onRevisePlan}>
+                              Revise Plan
+                            </button>
+                          </div>
+                        ) : null}
+                        {entry.role === 'assistant' &&
+                        !isRunning &&
                         hasCompletedCodeChanges &&
                         latestAssistantMessageId === entry.id ? (
                           <div className="response-actions">
@@ -467,6 +507,7 @@ export function App(): JSX.Element {
             <footer className="chat-composer">
                <div className="composer-input-area">
                  <textarea
+                   ref={composerRef}
                    rows={1}
                     placeholder={composerPlaceholder}
                     value={message}
@@ -490,9 +531,33 @@ export function App(): JSX.Element {
 
                <div className="composer-toolbar">
                 <label className="toggle-switch">
-                  <input type="checkbox" checked={agentMode} onChange={(e) => setAgentMode(e.target.checked)} />
+                  <input
+                    type="checkbox"
+                    checked={agentMode}
+                    onChange={(e) => {
+                      setAgentMode(e.target.checked);
+                      if (e.target.checked) {
+                        setPlanningMode(false);
+                      }
+                    }}
+                  />
                   <span className="slider"></span>
                   <span className="toggle-label">Agent Mode</span>
+                </label>
+
+                <label className="toggle-switch">
+                  <input
+                    type="checkbox"
+                    checked={planningMode}
+                    onChange={(e) => {
+                      setPlanningMode(e.target.checked);
+                      if (e.target.checked) {
+                        setAgentMode(false);
+                      }
+                    }}
+                  />
+                  <span className="slider"></span>
+                  <span className="toggle-label">Planning Mode</span>
                 </label>
                 
                <label className="toggle-switch">

@@ -45,11 +45,17 @@ export interface ActionRecord {
   result?: string;
 }
 
+export interface PendingPlan {
+  originalRequest: string;
+  plan: string;
+  createdAt: number;
+}
+
 export interface SessionState {
   id: string;
   providerId: ProviderId;
   providerSessionId?: string;
-  lastPromptMode?: 'chat' | 'agent';
+  lastPromptMode?: 'chat' | 'agent' | 'plan';
   task: string;
   workspaceRoot?: string;
   status: SessionStatus;
@@ -58,6 +64,7 @@ export interface SessionState {
   logs: LogEntry[];
   actionHistory: ActionRecord[];
   approvalRequest?: ApprovalRequest;
+  pendingPlan?: PendingPlan;
   rawResponses: string[];
   chatHistory: ChatMessage[];
 }

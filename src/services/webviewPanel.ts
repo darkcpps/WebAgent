@@ -16,6 +16,7 @@ interface PanelCallbacks {
     modelId?: string,
     sessionId?: string,
     agentMode?: boolean,
+    planningMode?: boolean,
     enableThinking?: boolean,
   ): Promise<void>;
   stopTask(sessionId: string): Promise<void>;
@@ -123,6 +124,7 @@ export class WebAgentPanel {
             message.modelId,
             message.sessionId,
             message.agentMode,
+            message.planningMode,
             message.enableThinking,
           );
           return;

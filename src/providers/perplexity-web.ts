@@ -21,8 +21,6 @@ interface ScrapeModelOptionsResult {
 }
 
 export class PerplexityWebAdapter extends PlaywrightWebProvider {
-  private static readonly INITIAL_STREAM_EVENT_TIMEOUT_MS = 45000;
-  private static readonly INTER_EVENT_TIMEOUT_MS = 90000;
   private static readonly LOG_PREFIX = '[perplexity-models]';
   private static readonly MODEL_OPTION_SELECTOR =
     '[role="menuitemradio"], [role="option"], button[aria-label="model-item"], button[data-value], [cmdk-item][data-value], [data-value][role="menuitem"], [data-value][role="option"]';
@@ -267,12 +265,8 @@ export class PerplexityWebAdapter extends PlaywrightWebProvider {
 
   override async streamEvents(onEvent: (event: ProviderEvent) => void): Promise<void> {
     onEvent({ type: 'status', message: 'Waiting for perplexity response...' });
-    let sawEvent = false;
     while (true) {
-      const event = await this.nextEvent(
-        sawEvent ? PerplexityWebAdapter.INTER_EVENT_TIMEOUT_MS : PerplexityWebAdapter.INITIAL_STREAM_EVENT_TIMEOUT_MS,
-      );
-      sawEvent = true;
+      const event = await this.nextEvent();
       onEvent(event);
       if (event.type === 'done' || event.type === 'error') {
         return;
@@ -1261,22 +1255,13 @@ export class PerplexityWebAdapter extends PlaywrightWebProvider {
     this.queue.push(event);
   }
 
-  private nextEvent(timeoutMs = PerplexityWebAdapter.INTER_EVENT_TIMEOUT_MS): Promise<ProviderEvent> {
+  private nextEvent(): Promise<ProviderEvent> {
     const queued = this.queue.shift();
     if (queued) {
       return Promise.resolve(queued);
     }
     return new Promise((resolve) => {
       const waiter: PendingWaiter = { resolve };
-      if (timeoutMs > 0) {
-        waiter.timer = setTimeout(() => {
-          const index = this.waiters.indexOf(waiter);
-          if (index >= 0) {
-            this.waiters.splice(index, 1);
-          }
-          resolve({ type: 'error', message: `Perplexity response timed out after ${Math.round(timeoutMs / 1000)}s.` });
-        }, timeoutMs);
-      }
       this.waiters.push(waiter);
     });
   }

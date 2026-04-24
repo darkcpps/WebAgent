@@ -12,6 +12,7 @@ export type WebviewToExtensionMessage =
       message: string;
       modelId?: string;
       agentMode?: boolean;
+      planningMode?: boolean;
       enableThinking?: boolean;
     }
   | { type: 'stopTask'; sessionId: string }

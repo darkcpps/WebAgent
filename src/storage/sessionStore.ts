@@ -18,6 +18,7 @@ export class SessionStore {
         ...session,
         providerSessionId: session.providerSessionId,
         lastPromptMode: session.lastPromptMode ?? 'chat',
+        pendingPlan: session.pendingPlan,
         rawResponses: session.rawResponses ?? [],
         chatHistory: session.chatHistory ?? [],
       });

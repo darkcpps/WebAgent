@@ -19,7 +19,7 @@ import { GitService } from './workspace/git';
 import type { ApprovalMode, BridgeUiState, ProviderId } from './shared/types';
 import type { ProviderAdapter, ProviderPrompt } from './providers/base';
 import { AgentResponseParser } from './agent/parser';
-import { buildProviderPrompt } from './agent/planner';
+import { buildPlanningPrompt, buildProviderPrompt } from './agent/planner';
 import { sanitizeResponse } from './shared/utils';
 
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
@@ -134,13 +134,24 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     };
   };
 
+  const buildAgentTaskFromPlan = (originalRequest: string, plan: string): string =>
+    [
+      'Implement the approved Planning Mode plan below.',
+      '',
+      `Original request:\n${originalRequest}`,
+      '',
+      `Approved plan:\n${plan}`,
+      '',
+      'Follow the plan, adapt if the codebase requires it, and verify the result before finishing.',
+    ].join('\n');
+
   const appendPromptPreviewLog = (
     sessionId: string,
-    mode: 'chat' | 'agent',
+    mode: 'chat' | 'agent' | 'plan',
     prompt: ProviderPrompt,
     round?: number,
   ): void => {
-    const label = mode === 'chat' ? 'Chat/Ask' : round ? `Agent (round ${round})` : 'Agent';
+    const label = mode === 'chat' ? 'Chat/Ask' : mode === 'plan' ? 'Planning' : round ? `Agent (round ${round})` : 'Agent';
     const systemPreview = truncatePromptPreview(prompt.systemPrompt);
     const userPreview = truncatePromptPreview(prompt.userPrompt);
 
@@ -325,7 +336,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         await ensureBridgeCompanion(providerId, session.id);
         void orchestrator.start(session.id, providerId, task);
       },
-      sendChat: async (providerId, message, modelId, sessionId, agentMode, enableThinking) => {
+      sendChat: async (providerId, message, modelId, sessionId, agentMode, planningMode, enableThinking) => {
         const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
         const existing = sessionId ? sessions.get(sessionId) : undefined;
         const wasEmptySession = (existing?.chatHistory.length ?? 0) === 0;
@@ -508,16 +519,92 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
           }
 
           const trimmedMessage = message.trim();
-          const useAgentTools = Boolean(agentMode) || /^\/agent\s+/i.test(trimmedMessage);
-          const chatPrompt = /^\/agent\s+/i.test(trimmedMessage) ? trimmedMessage.replace(/^\/agent\s+/i, '').trim() : trimmedMessage;
+          const explicitAgent = /^\/agent\s+/i.test(trimmedMessage);
+          const explicitPlan = /^\/plan\s+/i.test(trimmedMessage);
+          const activePendingPlan = sessions.get(session.id)?.pendingPlan;
+          const promptWithoutCommand = explicitAgent
+            ? trimmedMessage.replace(/^\/agent\s+/i, '').trim()
+            : explicitPlan
+              ? trimmedMessage.replace(/^\/plan\s+/i, '').trim()
+              : trimmedMessage;
+          const isImplementPlanRequest = /^implement\s+(this\s+|the\s+)?plan$/i.test(promptWithoutCommand);
+          const usePlanningMode = (Boolean(planningMode) || explicitPlan) && !(isImplementPlanRequest && activePendingPlan);
+          const useAgentTools = !usePlanningMode && (Boolean(agentMode) || explicitAgent);
+          const chatPrompt =
+            isImplementPlanRequest && activePendingPlan
+              ? buildAgentTaskFromPlan(activePendingPlan.originalRequest, activePendingPlan.plan)
+              : promptWithoutCommand;
           const requestThinking = supportsThinkingControl ? enableThinking : undefined;
           const wasPreviouslyAgentMode = sessions.get(session.id)?.lastPromptMode === 'agent';
-          sessions.update(session.id, { lastPromptMode: useAgentTools ? 'agent' : 'chat' });
+          const resolvedAgentTools = useAgentTools || (isImplementPlanRequest && Boolean(activePendingPlan));
+          sessions.update(session.id, {
+            lastPromptMode: usePlanningMode ? 'plan' : resolvedAgentTools ? 'agent' : 'chat',
+            pendingPlan: resolvedAgentTools ? undefined : activePendingPlan,
+          });
           if (!chatPrompt) {
             throw new Error('Empty message.');
           }
 
-          if (!useAgentTools) {
+          if (usePlanningMode) {
+            const repoContext = await workspaceContext.build(chatPrompt);
+            const existingPlan = activePendingPlan
+              ? {
+                  originalRequest: activePendingPlan.originalRequest,
+                  plan: activePendingPlan.plan,
+                }
+              : undefined;
+            const prompt = buildPlanningPrompt(chatPrompt, repoContext, existingPlan);
+            appendPromptPreviewLog(session.id, 'plan', prompt);
+            await runWithAutoFallback(
+              () => provider.sendPrompt({ ...prompt, enableThinking: requestThinking }),
+              'sendPrompt(plan)',
+            );
+
+            const responseText = await runWithAutoFallback(
+              () =>
+                collectProviderText(session.id, providerId, (delta) => {
+                  if (assistantMessage) {
+                    sessions.updateChatMessage(session.id, assistantMessage.id, {
+                      content: sanitizeResponse(delta) || 'Planning...',
+                      rawContent: delta,
+                    });
+                  }
+                }),
+              'streamEvents(plan)',
+            );
+            const cleaned = cleanFinalResponse(responseText);
+            sessions.appendRawResponse(session.id, cleaned);
+            sessions.update(session.id, {
+              pendingPlan: {
+                originalRequest: activePendingPlan?.originalRequest ?? chatPrompt,
+                plan: cleaned,
+                createdAt: Date.now(),
+              },
+            });
+            if (assistantMessage) {
+              sessions.updateChatMessage(session.id, assistantMessage.id, {
+                content: cleaned,
+                rawContent: responseText,
+              });
+            }
+            sessions.setStatus(session.id, 'done');
+            await new Promise((r) => setTimeout(r, 1500));
+            const conversationId = await runWithAutoFallback(
+              () => getConversationIdSafely(provider),
+              'getCurrentConversationId',
+            ).catch(() => undefined);
+            if (conversationId) {
+              sessions.setProviderSessionId(session.id, conversationId);
+              sessions.appendLog(session.id, {
+                level: 'info',
+                source: 'agent',
+                message: `Session locked to conversation: ${conversationId}`,
+              });
+            }
+            return;
+          }
+
+          if (!resolvedAgentTools) {
             const prompt = buildChatAskPrompt(chatPrompt, { wasPreviouslyAgentMode });
             appendPromptPreviewLog(session.id, 'chat', prompt);
             await runWithAutoFallback(
