@@ -16,7 +16,7 @@ import { WebAgentPanel } from './services/webviewPanel';
 import { WorkspaceContextService } from './workspace/context';
 import { WorkspaceFilesService } from './workspace/files';
 import { GitService } from './workspace/git';
-import type { ApprovalMode, BridgeUiState, ProviderId } from './shared/types';
+import type { ApprovalMode, BridgeUiState, ChatMessage, ProviderId, SessionState } from './shared/types';
 import type { ProviderAdapter, ProviderPrompt } from './providers/base';
 import { AgentResponseParser } from './agent/parser';
 import { buildPlanningPrompt, buildProviderPrompt } from './agent/planner';
@@ -117,6 +117,91 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     return `${value.slice(0, limit)}\n\n...[truncated ${value.length - limit} chars]`;
   };
 
+  const compactText = (value: string, limit: number): string => {
+    const normalized = value
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter(Boolean)
+      .join('\n')
+      .trim();
+    if (normalized.length <= limit) {
+      return normalized;
+    }
+    return `${normalized.slice(0, limit).trim()}\n...[truncated ${normalized.length - limit} chars]`;
+  };
+
+  const buildRegenerationHandoffPrompt = (sourceSession: SessionState, retryMessage: string): string => {
+    const targetUserIndex = (() => {
+      for (let index = sourceSession.chatHistory.length - 1; index >= 0; index -= 1) {
+        const entry = sourceSession.chatHistory[index];
+        if (entry?.role === 'user' && entry.content.trim() === retryMessage.trim()) {
+          return index;
+        }
+      }
+      for (let index = sourceSession.chatHistory.length - 1; index >= 0; index -= 1) {
+        if (sourceSession.chatHistory[index]?.role === 'user') {
+          return index;
+        }
+      }
+      return -1;
+    })();
+
+    const priorMessages =
+      targetUserIndex >= 0 ? sourceSession.chatHistory.slice(Math.max(0, targetUserIndex - 12), targetUserIndex) : [];
+    const summarizedTurns = priorMessages
+      .map((entry: ChatMessage) => {
+        const role = entry.role === 'assistant' ? 'Assistant' : entry.role === 'user' ? 'User' : 'System';
+        const content = sanitizeResponse(entry.rawContent || entry.content);
+        if (!content || /^thinking\.\.\.$/i.test(content.trim())) {
+          return undefined;
+        }
+        return `- ${role}: ${compactText(content, role === 'Assistant' ? 900 : 700)}`;
+      })
+      .filter((entry): entry is string => Boolean(entry));
+
+    const recentActions = sourceSession.actionHistory
+      .filter((action) => action.status === 'done' || action.status === 'error')
+      .slice(-8)
+      .map((action) => {
+        const result = action.result ? ` Result: ${compactText(action.result, 240)}` : '';
+        return `- ${action.type}: ${compactText(action.summary || action.type, 180)} (${action.status}).${result}`;
+      });
+
+    const contextBlocks: string[] = [];
+    if (sourceSession.pendingPlan?.plan) {
+      contextBlocks.push(
+        [
+          'Pending plan from previous chat:',
+          compactText(
+            `Original request: ${sourceSession.pendingPlan.originalRequest}\n\nPlan:\n${sourceSession.pendingPlan.plan}`,
+            2200,
+          ),
+        ].join('\n'),
+      );
+    }
+    if (summarizedTurns.length > 0) {
+      contextBlocks.push(['Recent conversation summary:', ...summarizedTurns].join('\n'));
+    }
+    if (recentActions.length > 0) {
+      contextBlocks.push(['Recent IDE action summary:', ...recentActions].join('\n'));
+    }
+
+    if (contextBlocks.length === 0) {
+      return retryMessage;
+    }
+
+    return [
+      'The previous chat response took longer than 5 minutes, so this is a retry in a new chat.',
+      'Use the compact context below only as background. The user prompt after the separator is the task to answer now.',
+      '',
+      compactText(contextBlocks.join('\n\n'), 8500),
+      '',
+      '---',
+      'User prompt to retry:',
+      retryMessage,
+    ].join('\n');
+  };
+
   const buildChatAskPrompt = (userPrompt: string, options: { wasPreviouslyAgentMode: boolean }): ProviderPrompt => {
     const systemLines = [
       'You are in Chat/Ask mode inside an IDE conversation.',
@@ -134,16 +219,66 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     };
   };
 
-  const buildAgentTaskFromPlan = (originalRequest: string, plan: string): string =>
-    [
+  const compactPlanForImplementation = (plan: string, limit = 7000): { text: string; truncated: boolean } => {
+    const normalized = plan
+      .split(/\r?\n/)
+      .map((line) => line.trimEnd())
+      .join('\n')
+      .replace(/\n{4,}/g, '\n\n\n')
+      .trim();
+
+    if (normalized.length <= limit) {
+      return { text: normalized, truncated: false };
+    }
+
+    const sectionOrder = [
+      /goal|intended user experience/i,
+      /explicit requirements/i,
+      /inferred enhancements|creative additions/i,
+      /assumptions|defaults/i,
+      /codebase findings/i,
+      /ui\/ux|interaction/i,
+      /implementation steps/i,
+      /verification/i,
+      /risks|tradeoffs|open questions/i,
+    ];
+    const lines = normalized.split(/\r?\n/);
+    const selected: string[] = [];
+
+    for (const pattern of sectionOrder) {
+      const index = lines.findIndex((line) => pattern.test(line));
+      if (index === -1) {
+        continue;
+      }
+      const nextHeadingIndex = lines.findIndex((line, lineIndex) => lineIndex > index && /^#{1,4}\s+|\*\*[^*]+\*\*:?\s*$|^[A-Z][A-Za-z /&-]+:\s*$/.test(line.trim()));
+      const end = nextHeadingIndex === -1 ? Math.min(lines.length, index + 18) : Math.min(nextHeadingIndex, index + 18);
+      selected.push(lines.slice(index, end).join('\n'));
+    }
+
+    const compacted = selected.join('\n\n').trim();
+    const fallback = normalized.slice(0, limit);
+    const text = (compacted || fallback).slice(0, limit).trim();
+    return {
+      text: `${text}\n\n[Plan compacted for provider prompt budget. Continue by inspecting files and following the stored plan intent.]`,
+      truncated: true,
+    };
+  };
+
+  const buildAgentTaskFromPlan = (originalRequest: string, plan: string): { task: string; planWasCompacted: boolean } => {
+    const compactPlan = compactPlanForImplementation(plan);
+    return {
+      task: [
       'Implement the approved Planning Mode plan below.',
       '',
       `Original request:\n${originalRequest}`,
       '',
-      `Approved plan:\n${plan}`,
+        `Approved plan excerpt:\n${compactPlan.text}`,
       '',
       'Follow the plan, adapt if the codebase requires it, and verify the result before finishing.',
-    ].join('\n');
+      ].join('\n'),
+      planWasCompacted: compactPlan.truncated,
+    };
+  };
 
   const appendPromptPreviewLog = (
     sessionId: string,
@@ -305,12 +440,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     };
   };
 
-  const panel = new WebAgentPanel(
-    context.extensionUri,
-    sessions,
-    providers,
-    () => safety.approvalMode,
-    {
+  const panelCallbacks = {
       newChat: async (providerId) => {
         const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
         const session = sessions.create(providerId, 'Chat session', workspaceRoot);
@@ -528,21 +658,30 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
               ? trimmedMessage.replace(/^\/plan\s+/i, '').trim()
               : trimmedMessage;
           const isImplementPlanRequest = /^implement\s+(this\s+|the\s+)?plan$/i.test(promptWithoutCommand);
-          const usePlanningMode = (Boolean(planningMode) || explicitPlan) && !(isImplementPlanRequest && activePendingPlan);
-          const useAgentTools = !usePlanningMode && (Boolean(agentMode) || explicitAgent);
-          const chatPrompt =
+          const implementationTask =
             isImplementPlanRequest && activePendingPlan
               ? buildAgentTaskFromPlan(activePendingPlan.originalRequest, activePendingPlan.plan)
-              : promptWithoutCommand;
+              : undefined;
+          const usePlanningMode = (Boolean(planningMode) || explicitPlan) && !(isImplementPlanRequest && activePendingPlan);
+          const useAgentTools = !usePlanningMode && (Boolean(agentMode) || explicitAgent);
+          const chatPrompt = implementationTask ? implementationTask.task : promptWithoutCommand;
+          const contextTask = implementationTask && activePendingPlan ? activePendingPlan.originalRequest : chatPrompt;
           const requestThinking = supportsThinkingControl ? enableThinking : undefined;
           const wasPreviouslyAgentMode = sessions.get(session.id)?.lastPromptMode === 'agent';
           const resolvedAgentTools = useAgentTools || (isImplementPlanRequest && Boolean(activePendingPlan));
           sessions.update(session.id, {
             lastPromptMode: usePlanningMode ? 'plan' : resolvedAgentTools ? 'agent' : 'chat',
-            pendingPlan: resolvedAgentTools ? undefined : activePendingPlan,
+            pendingPlan: activePendingPlan,
           });
           if (!chatPrompt) {
             throw new Error('Empty message.');
+          }
+          if (implementationTask?.planWasCompacted) {
+            sessions.appendLog(session.id, {
+              level: 'info',
+              source: 'agent',
+              message: 'Approved plan was compacted before implementation to stay within provider prompt limits.',
+            });
           }
 
           if (usePlanningMode) {
@@ -652,7 +791,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
           }
 
 
-          const repoContext = await workspaceContext.build(chatPrompt);
+          const repoContext = await workspaceContext.build(contextTask);
           const toolResults: string[] = [];
           let finalText = '';
           let lastRawResponse = '';
@@ -682,6 +821,14 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 
           const isFailedActionMessage = (message: string): boolean =>
             /^(Action failed:|Blocked action |User rejected action )/i.test(message.trim());
+
+          const isPrematureAccessBlocker = (message: string): boolean =>
+            /(files?|workspace|repository|repo).{0,80}(unavailable|not available|inaccessible|not accessible|not present|missing)|sandbox only exposes|could not safely implement|provide the actual project files/i.test(
+              message,
+            );
+
+          const hasWorkspaceDiscoveryResult = (): boolean =>
+            toolResults.some((result) => /^(list_files|search_files|read_file):/i.test(result.trim()));
 
           const parseExitCode = (message: string): number | undefined => {
             const raw = message.match(/Exit code:\s*([^\n]+)/i)?.[1]?.trim();
@@ -943,6 +1090,27 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
                 continue;
               }
 
+              if (action.type === 'finish' && isPrematureAccessBlocker(action.result) && !hasWorkspaceDiscoveryResult()) {
+                sessions.appendLog(session.id, {
+                  level: 'warning',
+                  source: 'agent',
+                  message: 'Rejected premature no-access finish; asking model to use IDE file tools first.',
+                });
+                toolResults.push(
+                  [
+                    'SYSTEM_FEEDBACK: Do not finish by saying repository files are unavailable based on your model/runtime environment.',
+                    'You are inside an IDE agent loop. To access the workspace, emit JSON tool calls and the IDE will return results.',
+                    'Start with {"type":"list_files","limit":100} or {"type":"search_files","query":"<relevant term>"} before deciding files are missing.',
+                    `Rejected finish result: ${compact(action.result, 500)}`,
+                  ].join('\n'),
+                );
+                if (toolResults.length > 10) {
+                  toolResults.shift();
+                }
+                pushActionUpdate('Auto-recovery: rejected premature no-access finish and requested file discovery.');
+                continue;
+              }
+
               const result = await executor.execute(session.id, action);
               executedActionCount += 1;
               if (isFailedActionMessage(result.message)) {
@@ -1086,6 +1254,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
             });
           }
           sessions.setStatus(session.id, 'done');
+          if (!endedByAskUser && implementationTask) {
+            sessions.update(session.id, { pendingPlan: undefined });
+          }
           sessions.appendLog(session.id, {
             level: endedByAskUser ? 'info' : 'success',
             source: 'agent',
@@ -1131,8 +1302,35 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
           throw new Error(normalizedError.displayMessage);
         }
       },
+      regenerateChatInNewSession: async (
+        providerId: ProviderId,
+        sourceSessionId: string,
+        message: string,
+        modelId?: string,
+        agentMode?: boolean,
+        planningMode?: boolean,
+        enableThinking?: boolean,
+      ) => {
+        const sourceSession = sessions.get(sourceSessionId);
+        const regeneratedMessage = sourceSession ? buildRegenerationHandoffPrompt(sourceSession, message) : message;
+        if (sourceSession?.status === 'running') {
+          orchestrator.stop(sourceSessionId);
+          await providers.get(providerId, { sessionId: sourceSessionId }).stop().catch(() => undefined);
+          sessions.setStatus(sourceSessionId, 'stopped');
+          sessions.appendLog(sourceSessionId, {
+            level: 'warning',
+            source: 'agent',
+            message: 'Stopped long-running response before regenerating in a new chat.',
+          });
+        }
+        await panelCallbacks.sendChat(providerId, regeneratedMessage, modelId, undefined, agentMode, planningMode, enableThinking);
+      },
       stopTask: async (sessionId) => {
         orchestrator.stop(sessionId);
+        const session = sessions.get(sessionId);
+        if (session) {
+          await providers.get(session.providerId, { sessionId }).stop().catch(() => undefined);
+        }
         sessions.setStatus(sessionId, 'stopped');
       },
       loginProvider: async (providerId) => {
@@ -1239,7 +1437,14 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         );
         await diffPreview.showSessionChangePreview(session.task || 'Chat session', actionSummaries, gitDiff);
       },
-    },
+    };
+
+  const panel = new WebAgentPanel(
+    context.extensionUri,
+    sessions,
+    providers,
+    () => safety.approvalMode,
+    panelCallbacks,
   );
 
   const sessionTreeProvider = new SessionTreeProvider(sessions);

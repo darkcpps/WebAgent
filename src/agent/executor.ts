@@ -15,9 +15,8 @@ export interface ExecutionResult {
 }
 
 export class ActionExecutor {
-  private static readonly READ_FILE_FULL_LIMIT_CHARS = 60000;
-  private static readonly READ_FILE_LARGE_HEAD_CHARS = 40000;
-  private static readonly READ_FILE_LARGE_TAIL_CHARS = 15000;
+  private static readonly READ_FILE_DEFAULT_LIMIT_LINES = 250;
+  private static readonly READ_FILE_MAX_CHARS = 30000;
 
   constructor(
     private readonly files: WorkspaceFilesService,
@@ -125,22 +124,36 @@ export class ActionExecutor {
       }
       case 'read_file': {
         const content = await this.files.readFile(action.path);
-        if (content.length <= ActionExecutor.READ_FILE_FULL_LIMIT_CHARS) {
-          return `Read ${action.path} (full, ${content.length} chars):\n${content}`;
+        const lines = content.split(/\r?\n/);
+        const totalLines = lines.length;
+        const requestedStartLine = action.startLine ?? 1;
+        const startLine = Math.min(Math.max(requestedStartLine, 1), Math.max(totalLines, 1));
+        const limit = action.limit ?? ActionExecutor.READ_FILE_DEFAULT_LIMIT_LINES;
+        const endLine = Math.min(startLine + limit - 1, totalLines);
+        const selectedLines = lines.slice(startLine - 1, endLine);
+        let body = selectedLines.map((line, index) => `${startLine + index}: ${line}`).join('\n');
+        let charTruncated = false;
+
+        if (body.length > ActionExecutor.READ_FILE_MAX_CHARS) {
+          body = body.slice(0, ActionExecutor.READ_FILE_MAX_CHARS);
+          charTruncated = true;
         }
 
-        const head = content.slice(0, ActionExecutor.READ_FILE_LARGE_HEAD_CHARS);
-        const tail = content.slice(-ActionExecutor.READ_FILE_LARGE_TAIL_CHARS);
-        const omitted = Math.max(0, content.length - head.length - tail.length);
+        const nextStartLine = endLine < totalLines ? endLine + 1 : undefined;
+        const parts = [
+          `Read ${action.path} lines ${startLine}-${endLine} of ${totalLines} (${content.length} chars total).`,
+        ];
 
-        return [
-          `Read ${action.path} (truncated, ${content.length} chars total):`,
-          head,
-          '',
-          `...[omitted ${omitted} chars from middle]...`,
-          '',
-          tail,
-        ].join('\n');
+        if (nextStartLine) {
+          parts.push(`More content is available. Continue with {"type":"read_file","path":"${action.path}","startLine":${nextStartLine},"limit":${limit}}.`);
+        }
+
+        if (charTruncated) {
+          parts.push(`This window was character-truncated. Retry with a smaller limit.`);
+        }
+
+        parts.push('', body);
+        return parts.join('\n');
       }
       case 'search_files': {
         const results = await this.files.searchFiles(action.query, action.limit ?? 20);
@@ -223,6 +236,9 @@ export class ActionExecutor {
       case 'rename_file':
         return `${action.fromPath} -> ${action.toPath}`;
       case 'read_file':
+        return action.startLine || action.limit
+          ? `${action.path} lines ${action.startLine ?? 1}-${action.limit ? (action.startLine ?? 1) + action.limit - 1 : 'default'}`
+          : action.path;
       case 'delete_file':
         return action.path;
       case 'search_files':
@@ -243,7 +259,11 @@ export class ActionExecutor {
       case 'list_files':
         return withRequestedSummary('Listing files');
       case 'read_file':
-        return withRequestedSummary(`Reading (${action.path})`);
+        return withRequestedSummary(
+          action.startLine || action.limit
+            ? `Reading (${action.path}:${action.startLine ?? 1}${action.limit ? `+${action.limit}` : ''})`
+            : `Reading (${action.path})`,
+        );
       case 'search_files':
         return withRequestedSummary(`Searching ("${truncate(action.query, 80)}")`);
       case 'edit_file':

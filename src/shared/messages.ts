@@ -15,6 +15,16 @@ export type WebviewToExtensionMessage =
       planningMode?: boolean;
       enableThinking?: boolean;
     }
+  | {
+      type: 'regenerateChatInNewSession';
+      providerId: ProviderId;
+      sourceSessionId: string;
+      message: string;
+      modelId?: string;
+      agentMode?: boolean;
+      planningMode?: boolean;
+      enableThinking?: boolean;
+    }
   | { type: 'stopTask'; sessionId: string }
   | { type: 'loginProvider'; providerId: ProviderId }
   | { type: 'logoutProvider'; providerId: ProviderId }

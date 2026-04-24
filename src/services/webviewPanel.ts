@@ -19,6 +19,15 @@ interface PanelCallbacks {
     planningMode?: boolean,
     enableThinking?: boolean,
   ): Promise<void>;
+  regenerateChatInNewSession(
+    providerId: ProviderId,
+    sourceSessionId: string,
+    message: string,
+    modelId?: string,
+    agentMode?: boolean,
+    planningMode?: boolean,
+    enableThinking?: boolean,
+  ): Promise<void>;
   stopTask(sessionId: string): Promise<void>;
   loginProvider(providerId: ProviderId): Promise<void>;
   logoutProvider(providerId: ProviderId): Promise<boolean>;
@@ -127,6 +136,18 @@ export class WebAgentPanel {
             message.planningMode,
             message.enableThinking,
           );
+          return;
+        case 'regenerateChatInNewSession':
+          await this.callbacks.regenerateChatInNewSession(
+            message.providerId,
+            message.sourceSessionId,
+            message.message,
+            message.modelId,
+            message.agentMode,
+            message.planningMode,
+            message.enableThinking,
+          );
+          await this.postToast('info', 'Regenerated prompt in a new chat.');
           return;
         case 'stopTask':
           await this.callbacks.stopTask(message.sessionId);

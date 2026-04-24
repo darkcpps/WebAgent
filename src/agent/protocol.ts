@@ -12,6 +12,8 @@ export const listFilesActionSchema = baseAction.extend({
 export const readFileActionSchema = baseAction.extend({
   type: z.literal('read_file'),
   path: z.string().min(1),
+  startLine: z.number().int().positive().optional(),
+  limit: z.number().int().positive().max(500).optional(),
 });
 
 export const searchFilesActionSchema = baseAction.extend({

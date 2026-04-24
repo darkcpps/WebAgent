@@ -9,6 +9,7 @@ declare global {
 }
 
 const vscode = window.acquireVsCodeApi();
+const LONG_RESPONSE_THRESHOLD_MS = 5 * 60 * 1000;
 
 const initialState: WebviewState = {
   sessions: [],
@@ -59,6 +60,8 @@ export function App(): JSX.Element {
   const [toast, setToast] = useState<{ level: 'info' | 'warning' | 'error' | 'success'; message: string }>();
   const [debugOpen, setDebugOpen] = useState(true);
   const [sessionContextMenu, setSessionContextMenu] = useState<{ sessionId: string; x: number; y: number } | null>(null);
+  const [dismissedLongRunningBySession, setDismissedLongRunningBySession] = useState<Record<string, boolean>>({});
+  const [now, setNow] = useState(Date.now());
   const hasPerformedStartupReadyCheck = useRef(false);
   const composerRef = useRef<HTMLTextAreaElement>(null);
 
@@ -115,6 +118,11 @@ export function App(): JSX.Element {
     const timeoutId = window.setTimeout(() => setToast(undefined), 4000);
     return () => window.clearTimeout(timeoutId);
   }, [toast]);
+
+  useEffect(() => {
+    const timer = window.setInterval(() => setNow(Date.now()), 1000);
+    return () => window.clearInterval(timer);
+  }, []);
 
   useEffect(() => {
     const closeMenu = () => setSessionContextMenu(null);
@@ -175,6 +183,28 @@ export function App(): JSX.Element {
     activeSession?.chatHistory
       .filter((entry) => entry.role === 'assistant')
       .at(-1)?.id ?? undefined;
+  const latestAssistantMessage =
+    activeSession?.chatHistory
+      .filter((entry) => entry.role === 'assistant')
+      .at(-1) ?? undefined;
+  const latestUserBeforeAssistant = latestAssistantMessage
+    ? activeSession?.chatHistory
+        .slice(
+          0,
+          activeSession.chatHistory.findIndex((entry) => entry.id === latestAssistantMessage.id),
+        )
+        .reverse()
+        .find((entry) => entry.role === 'user' && entry.content.trim().length > 0)
+    : undefined;
+  const showLongRunningPrompt =
+    Boolean(
+      activeSession &&
+        latestAssistantMessage &&
+        latestUserBeforeAssistant &&
+        activeSession.status === 'running' &&
+        now - latestAssistantMessage.timestamp >= LONG_RESPONSE_THRESHOLD_MS &&
+        !dismissedLongRunningBySession[activeSession.id],
+    );
   const composerPlaceholder = planningMode
     ? 'Describe what you want planned, or add details to revise the current plan...'
     : agentMode
@@ -286,6 +316,30 @@ export function App(): JSX.Element {
     }
 
     sendMessage(previousUserMessage.content, modelOverride);
+  };
+
+  const onRegenerateLongRunningInNewChat = () => {
+    if (!activeSession || !latestUserBeforeAssistant || !isLoggedIn) {
+      return;
+    }
+    setDismissedLongRunningBySession((prev) => ({ ...prev, [activeSession.id]: true }));
+    vscode.postMessage({
+      type: 'regenerateChatInNewSession',
+      providerId,
+      sourceSessionId: activeSession.id,
+      message: latestUserBeforeAssistant.content,
+      modelId: providerId === 'perplexity' ? 'auto' : selectedModelId,
+      agentMode,
+      planningMode,
+      enableThinking: supportsThinkingControl && hasExplicitThinkingPreference ? enableThinking : undefined,
+    });
+  };
+
+  const onDismissLongRunningPrompt = () => {
+    if (!activeSession) {
+      return;
+    }
+    setDismissedLongRunningBySession((prev) => ({ ...prev, [activeSession.id]: true }));
   };
 
   const toggleThoughtDetails = (messageId: string) => {
@@ -498,6 +552,23 @@ export function App(): JSX.Element {
                       }
                     >
                       Reject
+                    </button>
+                  </div>
+                </div>
+              ) : null}
+
+              {showLongRunningPrompt ? (
+                <div className="long-running-card">
+                  <div>
+                    <strong>This response is taking longer than 5 minutes.</strong>
+                    <p>You can keep waiting, or retry the same prompt in a fresh chat.</p>
+                  </div>
+                  <div className="long-running-actions">
+                    <button className="glass-btn" onClick={onDismissLongRunningPrompt}>
+                      Keep Waiting
+                    </button>
+                    <button className="glass-btn primary" onClick={onRegenerateLongRunningInNewChat} disabled={!isLoggedIn}>
+                      Regenerate in New Chat
                     </button>
                   </div>
                 </div>

@@ -669,6 +669,38 @@ textarea::placeholder { color: #525964; }
 .approve-btn:hover { background: #059669; }
 .reject-btn { background: var(--error-bg); color: var(--error); border-color: rgba(239, 68, 68, 0.3); }
 
+.long-running-card {
+  align-self: center;
+  width: 100%;
+  max-width: 860px;
+  border: 1px solid rgba(245, 158, 11, 0.42);
+  border-radius: 10px;
+  background: rgba(245, 158, 11, 0.08);
+  padding: 14px;
+  display: flex;
+  justify-content: space-between;
+  gap: 16px;
+  align-items: center;
+}
+
+.long-running-card strong {
+  color: #fcd34d;
+  font-size: 14px;
+}
+
+.long-running-card p {
+  margin: 4px 0 0;
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.4;
+}
+
+.long-running-actions {
+  display: flex;
+  gap: 10px;
+  flex-shrink: 0;
+}
+
 .debug-console {
   border-top: 1px solid var(--border);
   background: var(--bg);
