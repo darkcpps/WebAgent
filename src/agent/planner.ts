@@ -2,9 +2,66 @@ import type { RepoContext } from '../workspace/context';
 
 const TOOL_RESULT_MAX_CHARS = 12000;
 const TOOL_RESULT_ITEM_MAX_CHARS = 3000;
+const COMPACT_TOOL_RESULT_MAX_CHARS = 5000;
+const COMPACT_TOOL_RESULT_ITEM_MAX_CHARS = 1200;
+const COMPACT_RELEVANT_FILES_MAX_CHARS = 10000;
+const COMPACT_RELEVANT_FILE_MAX_CHARS = 1800;
+const COMPACT_GIT_DIFF_MAX_CHARS = 2500;
+const COMPACT_SUMMARY_MAX_CHARS = 1800;
 
-export function buildProviderPrompt(task: string, context: RepoContext, toolResults: string[] = []): { systemPrompt: string; userPrompt: string } {
-  const systemPrompt = [
+type PromptBudgetProfile = 'default' | 'compact';
+
+interface PromptBuildOptions {
+  budgetProfile?: PromptBudgetProfile;
+}
+
+export function buildProviderPrompt(
+  task: string,
+  context: RepoContext,
+  toolResults: string[] = [],
+  options: PromptBuildOptions = {},
+): { systemPrompt: string; userPrompt: string } {
+  const compact = options.budgetProfile === 'compact';
+  const systemPrompt = compact ? buildCompactAgentSystemPrompt() : buildDefaultAgentSystemPrompt();
+
+  const relevantFiles = compact
+    ? compactRelevantFiles(context.relevantFiles, COMPACT_RELEVANT_FILES_MAX_CHARS, COMPACT_RELEVANT_FILE_MAX_CHARS)
+    : context.relevantFiles
+        .map((file) => `### ${file.path}\n${file.content}`)
+        .join('\n\n');
+
+  const compactedToolResults = compact
+    ? compactToolResults(toolResults, COMPACT_TOOL_RESULT_MAX_CHARS, COMPACT_TOOL_RESULT_ITEM_MAX_CHARS)
+    : compactToolResults(toolResults);
+  const observations = compactedToolResults.length
+    ? `\n\nLatest tool results:\n${compactedToolResults.map((result, index) => `${index + 1}. ${result}`).join('\n\n')}`
+    : '';
+
+  const userPrompt = [
+    `Task:\n${task}`,
+    '',
+    'Important operating note:',
+    '- Relevant files, git diff, and tool results may be partial or truncated.',
+    '- Use JSON tool calls to inspect exact files and focused ranges before editing.',
+    '- Verify with the most relevant command or manual check before finishing, when possible.',
+    '',
+    `Workspace summary:\n${truncateText(context.summary, compact ? COMPACT_SUMMARY_MAX_CHARS : Number.POSITIVE_INFINITY)}`,
+    '',
+    `Open editors:\n${context.openEditors.join(', ') || 'None'}`,
+    '',
+    `Git status:\n${context.gitStatus}`,
+    '',
+    `Git diff:\n${truncateText(context.gitDiff, compact ? COMPACT_GIT_DIFF_MAX_CHARS : Number.POSITIVE_INFINITY)}`,
+    '',
+    `Relevant files:\n${relevantFiles || 'No relevant files selected.'}`,
+    observations,
+  ].join('\n');
+
+  return { systemPrompt, userPrompt };
+}
+
+function buildDefaultAgentSystemPrompt(): string {
+  return [
     'You are operating as a coding agent inside an IDE.',
     'You must think like a safe, objective, tool-using software engineering agent.',
     'Your goal is to complete the user task end-to-end using the provided tools.',
@@ -71,52 +128,49 @@ export function buildProviderPrompt(task: string, context: RepoContext, toolResu
     '{"summary":"Searching for the bug","actions":[{"type":"search_files","query":"buggyFunction"}]}',
     '```',
   ].join('\n');
-
-  const relevantFiles = context.relevantFiles
-    .map((file) => `### ${file.path}\n${file.content}`)
-    .join('\n\n');
-
-  const compactedToolResults = compactToolResults(toolResults);
-  const observations = compactedToolResults.length
-    ? `\n\nLatest tool results:\n${compactedToolResults.map((result, index) => `${index + 1}. ${result}`).join('\n\n')}`
-    : '';
-
-  const userPrompt = [
-    `Task:\n${task}`,
-    '',
-    'Important operating note:',
-    '- The "Relevant files" section may be incomplete or truncated.',
-    '- `read_file` returns a bounded line window by default. For large files, read only the specific ranges you need with `startLine` and `limit`, then continue with the suggested next `startLine` when necessary.',
-    '- In medium/large repos, narrow scope with `search_files` and then `read_file` specific files or line ranges before editing.',
-    '- If you need repository access, emit JSON tool calls. Do not say the files are unavailable based on your model/runtime environment.',
-    '- Implement complete user-facing behavior, including states and edge cases implied by the task.',
-    '- Verify with the most relevant command or manual check before finishing, when the repository supports it.',
-    '',
-    `Workspace summary:\n${context.summary}`,
-    '',
-    `Open editors:\n${context.openEditors.join(', ') || 'None'}`,
-    '',
-    `Git status:\n${context.gitStatus}`,
-    '',
-    `Git diff:\n${context.gitDiff}`,
-    '',
-    `Relevant files:\n${relevantFiles || 'No relevant files selected.'}`,
-    observations,
-  ].join('\n');
-
-  return { systemPrompt, userPrompt };
 }
 
-function compactToolResults(toolResults: string[]): string[] {
+function buildCompactAgentSystemPrompt(): string {
+  return [
+    'You are an IDE coding agent. Complete the user task with JSON tool actions only.',
+    'Be correct, inspect files before edits, preserve unrelated changes, and verify after code changes when possible.',
+    '',
+    'Rules:',
+    '1. Return only JSON: {"summary":"concise description","actions":[{"type":"tool_name", ...}]}',
+    '2. Use workspace-relative paths only.',
+    '3. Start with list_files/search_files/read_file unless the task is clearly single-file and the exact file content is already shown.',
+    '4. Before edit_file/delete_file/rename_file, read that exact target file in this run. create_file is allowed for new files.',
+    '5. Use read_file with startLine/limit for large files. Treat provided snippets as hints, not exact truth.',
+    '6. Never mix finish with other actions. Use finish only when no more tool actions are needed.',
+    '7. Do not include prose, markdown fences, or hidden reasoning outside the JSON object.',
+    '',
+    'Actions:',
+    '- list_files: {"type":"list_files","limit":100}',
+    '- search_files: {"type":"search_files","query":"pattern"}',
+    '- read_file: {"type":"read_file","path":"src/app.ts","startLine":1,"limit":250}',
+    '- edit_file: {"type":"edit_file","path":"file.ts","oldString":"old","newString":"new"} or {"type":"edit_file","path":"file.ts","content":"full file"}',
+    '- create_file/delete_file/rename_file',
+    '- run_command: {"type":"run_command","command":"npm test"}',
+    '- get_git_diff: {"type":"get_git_diff"}',
+    '- ask_user: {"type":"ask_user","question":"..."}',
+    '- finish: {"type":"finish","result":"summary of work done"}',
+  ].join('\n');
+}
+
+function compactToolResults(
+  toolResults: string[],
+  totalLimit = TOOL_RESULT_MAX_CHARS,
+  itemLimit = TOOL_RESULT_ITEM_MAX_CHARS,
+): string[] {
   const compacted: string[] = [];
-  let remainingBudget = TOOL_RESULT_MAX_CHARS;
+  let remainingBudget = totalLimit;
 
   for (const result of [...toolResults].reverse()) {
     if (remainingBudget <= 0) {
       break;
     }
 
-    const maxForItem = Math.min(TOOL_RESULT_ITEM_MAX_CHARS, remainingBudget);
+    const maxForItem = Math.min(itemLimit, remainingBudget);
     const text = result.length > maxForItem
       ? `${result.slice(0, maxForItem)}\n...[tool result truncated for prompt budget]`
       : result;
@@ -132,15 +186,63 @@ function compactToolResults(toolResults: string[]): string[] {
   return compacted;
 }
 
+function compactRelevantFiles(
+  files: Array<{ path: string; content: string }>,
+  totalLimit: number,
+  itemLimit: number,
+): string {
+  const blocks: string[] = [];
+  let remainingBudget = totalLimit;
+
+  for (const file of files) {
+    if (remainingBudget <= 0) {
+      break;
+    }
+
+    const header = `### ${file.path}\n`;
+    const contentBudget = Math.max(0, Math.min(itemLimit, remainingBudget - header.length));
+    if (contentBudget <= 0) {
+      break;
+    }
+
+    const content = truncateText(file.content, contentBudget);
+    const block = `${header}${content}`;
+    blocks.push(block);
+    remainingBudget -= block.length + 2;
+  }
+
+  if (blocks.length < files.length) {
+    blocks.push(`[${files.length - blocks.length} relevant file(s) omitted for prompt budget]`);
+  }
+
+  return blocks.join('\n\n');
+}
+
+function truncateText(value: string, limit: number): string {
+  if (!Number.isFinite(limit) || value.length <= limit) {
+    return value;
+  }
+  return `${value.slice(0, limit).trimEnd()}\n...[truncated ${value.length - limit} chars]`;
+}
+
 export function buildPlanningPrompt(
   task: string,
   context: RepoContext,
   existingPlan?: { originalRequest: string; plan: string },
+  options: PromptBuildOptions = {},
 ): { systemPrompt: string; userPrompt: string } {
-  const systemPrompt = [
-    'You are operating in Planning Mode inside an IDE.',
-    'Your job is to inspect the provided codebase context and produce a descriptive, detailed implementation plan only.',
-    'Do not write or modify code. Do not output executable tool JSON.',
+  const compact = options.budgetProfile === 'compact';
+  const systemPrompt = compact
+    ? [
+        'You are in IDE Planning Mode. Produce an actionable implementation plan only.',
+        'Do not write code and do not output executable tool JSON.',
+        'Ground the plan in provided repository evidence, label assumptions, and include concrete files/modules when known.',
+        'Keep it concise but complete: requirements, findings, steps, risks/questions, and verification.',
+      ].join('\n')
+    : [
+        'You are operating in Planning Mode inside an IDE.',
+        'Your job is to inspect the provided codebase context and produce a descriptive, detailed implementation plan only.',
+        'Do not write or modify code. Do not output executable tool JSON.',
     '',
     '### PLANNING STYLE',
     'Plan like a senior software engineering agent preparing work for execution.',
@@ -161,11 +263,13 @@ export function buildPlanningPrompt(
     'Include a verification checklist with specific commands or manual checks inferred from the repo.',
     'If the request is ambiguous, include a short "Questions" section, but still provide a best-effort plan with sensible defaults.',
     'End by asking whether the user wants to implement the plan or revise it with more details.',
-  ].join('\n');
+      ].join('\n');
 
-  const relevantFiles = context.relevantFiles
-    .map((file) => `### ${file.path}\n${file.content}`)
-    .join('\n\n');
+  const relevantFiles = compact
+    ? compactRelevantFiles(context.relevantFiles, COMPACT_RELEVANT_FILES_MAX_CHARS, COMPACT_RELEVANT_FILE_MAX_CHARS)
+    : context.relevantFiles
+        .map((file) => `### ${file.path}\n${file.content}`)
+        .join('\n\n');
 
   const revisionContext = existingPlan
     ? [
@@ -188,7 +292,7 @@ export function buildPlanningPrompt(
     '',
     `Git status:\n${context.gitStatus}`,
     '',
-    `Git diff:\n${context.gitDiff}`,
+    `Git diff:\n${truncateText(context.gitDiff, compact ? COMPACT_GIT_DIFF_MAX_CHARS : Number.POSITIVE_INFINITY)}`,
     '',
     `Relevant files:\n${relevantFiles || 'No relevant files selected.'}`,
     '',

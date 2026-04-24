@@ -667,6 +667,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
           const chatPrompt = implementationTask ? implementationTask.task : promptWithoutCommand;
           const contextTask = implementationTask && activePendingPlan ? activePendingPlan.originalRequest : chatPrompt;
           const requestThinking = supportsThinkingControl ? enableThinking : undefined;
+          const promptBudgetProfile = providerId === 'perplexity' ? 'compact' : 'default';
           const wasPreviouslyAgentMode = sessions.get(session.id)?.lastPromptMode === 'agent';
           const resolvedAgentTools = useAgentTools || (isImplementPlanRequest && Boolean(activePendingPlan));
           sessions.update(session.id, {
@@ -692,7 +693,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
                   plan: activePendingPlan.plan,
                 }
               : undefined;
-            const prompt = buildPlanningPrompt(chatPrompt, repoContext, existingPlan);
+            const prompt = buildPlanningPrompt(chatPrompt, repoContext, existingPlan, { budgetProfile: promptBudgetProfile });
             appendPromptPreviewLog(session.id, 'plan', prompt);
             await runWithAutoFallback(
               () => provider.sendPrompt({ ...prompt, enableThinking: requestThinking }),
@@ -1009,7 +1010,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
               });
               await new Promise((resolve) => setTimeout(resolve, AUTO_FOLLOW_UP_DELAY_MS));
             }
-            const prompt = buildProviderPrompt(chatPrompt, repoContext, toolResults);
+            const prompt = buildProviderPrompt(chatPrompt, repoContext, toolResults, { budgetProfile: promptBudgetProfile });
             appendPromptPreviewLog(session.id, 'agent', prompt, round + 1);
             await runWithAutoFallback(
               () => provider.sendPrompt({ ...prompt, enableThinking: requestThinking }),
