@@ -16,8 +16,7 @@
     "onStartupFinished",
     "onCommand:webagentCode.open",
     "onView:webagentCode.sessions",
-    "onView:webagentCode.activity",
-    "onView:webagentCode.bridge"
+    "onView:webagentCode.activity"
   ],
   "main": "./dist/extension.js",
   "contributes": {
@@ -41,18 +40,6 @@
       {
         "command": "webagentCode.resetConversation",
         "title": "WebAgent Code: Reset Provider Conversation"
-      },
-      {
-        "command": "webagentCode.startBridgeCompanion",
-        "title": "WebAgent Code: Start Bridge Companion"
-      },
-      {
-        "command": "webagentCode.stopBridgeCompanion",
-        "title": "WebAgent Code: Stop Bridge Companion"
-      },
-      {
-        "command": "webagentCode.restartBridgeCompanion",
-        "title": "WebAgent Code: Restart Bridge Companion"
       },
       {
         "command": "webagentCode.approvePendingAction",
@@ -81,10 +68,6 @@
         {
           "id": "webagentCode.activity",
           "name": "Activity"
-        },
-        {
-          "id": "webagentCode.bridge",
-          "name": "Bridge"
         }
       ]
     },
@@ -126,25 +109,6 @@
           "default": false,
           "description": "Whether hidden files should be considered during repo scans."
         },
-        "webagentCode.transport.zai": {
-          "type": "string",
-          "enum": [
-            "auto",
-            "bridge",
-            "playwright"
-          ],
-          "default": "auto",
-          "description": "Transport for z.ai provider. Auto prefers managed Playwright runtime, bridge uses local browser extension companion."
-        },
-        "webagentCode.zai.runtimeMode": {
-          "type": "string",
-          "enum": [
-            "headless",
-            "visible"
-          ],
-          "default": "headless",
-          "description": "Managed z.ai runtime mode. Headless runs in background after login; visible keeps browser window open."
-        },
         "webagentCode.playwright.browserChannel": {
           "type": "string",
           "enum": [
@@ -155,22 +119,6 @@
           ],
           "default": "auto",
           "description": "Browser channel used for managed Playwright sessions. Auto prefers Chrome/Edge for providers with strict sign-in checks, then falls back to bundled Chromium."
-        },
-        "webagentCode.bridge.autoReconnect": {
-          "type": "boolean",
-          "default": true,
-          "description": "Whether bridge transport should auto-reconnect to the local companion."
-        },
-        "webagentCode.bridge.requestTimeoutMs": {
-          "type": "number",
-          "default": 15000,
-          "minimum": 1000,
-          "description": "Request timeout in milliseconds for z.ai bridge RPC calls."
-        },
-        "webagentCode.bridge.autoStartCompanion": {
-          "type": "boolean",
-          "default": true,
-          "description": "Automatically start the local z.ai bridge companion when bridge transport is active."
         }
       }
     }
@@ -179,15 +127,12 @@
     "build": "node esbuild.js",
     "watch": "node esbuild.js --watch",
     "check": "tsc --noEmit",
-    "package": "npm run build && vsce package",
-    "bridge:companion": "node resources/zai-bridge-companion/server.js",
-    "bridge:doctor": "node resources/zai-bridge-companion/doctor.js"
+    "package": "npm run build && vsce package"
   },
   "dependencies": {
     "playwright": "^1.54.1",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
-    "ws": "^8.18.3",
     "zod": "^3.24.1"
   },
   "devDependencies": {
