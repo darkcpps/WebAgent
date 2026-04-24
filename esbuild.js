@@ -17,7 +17,7 @@ async function main() {
     format: 'cjs',
     target: 'node20',
     external: ['vscode', 'playwright'],
-    entryPoints: ['src/extension.ts'],
+    entryPoints: ['src/extensionClean.ts'],
     outfile: 'dist/extension.js',
   };
 
