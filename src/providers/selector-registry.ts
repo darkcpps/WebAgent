@@ -20,9 +20,28 @@ export interface ProviderSelectorMap {
 export const selectorRegistry: Record<ProviderId, ProviderSelectorMap> = {
   chatgpt: {
     homeUrl: 'https://chatgpt.com/',
-    input: ['textarea', '[data-testid="composer-input"] textarea', '#prompt-textarea'],
-    submit: ['button[data-testid="send-button"]', 'button[aria-label="Send prompt"]'],
-    assistantMessages: ['[data-message-author-role="assistant"]', '[data-testid^="conversation-turn-"] [data-message-author-role="assistant"]'],
+    input: [
+      '#prompt-textarea',
+      '[data-testid="composer-input"]',
+      '[data-testid="composer-input"] textarea',
+      '[data-testid="composer-input"][contenteditable="true"]',
+      'div.ProseMirror[contenteditable="true"]',
+      'textarea',
+    ],
+    submit: [
+      'button[data-testid="composer-submit-button"]',
+      'button[data-testid="send-button"]',
+      'button[aria-label="Send prompt"]',
+      'button[aria-label*="Send"]',
+      '[data-testid*="send-button"]',
+      '[data-testid*="submit-button"]',
+      'button[type="submit"]',
+    ],
+    assistantMessages: [
+      '[data-message-author-role="assistant"]',
+      '[data-testid^="conversation-turn-"] [data-message-author-role="assistant"]',
+      '[data-testid^="conversation-turn-"]:has([data-message-author-role="assistant"])',
+    ],
     models: [{ id: 'auto', label: 'Auto' }],
     stopButton: ['button[data-testid="stop-button"]'],
     newChat: ['a[href="/"]', 'button[aria-label="New chat"]'],

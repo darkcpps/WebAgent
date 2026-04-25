@@ -20,7 +20,7 @@ import { WorkspaceFilesService } from './workspace/files';
 import { GitService } from './workspace/git';
 
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
-  const AUTO_FOLLOW_UP_DELAY_MS = 3000;
+  const AUTO_FOLLOW_UP_DELAY_MS = 1750;
   const configuration = vscode.workspace.getConfiguration('webagentCode');
   const sessions = new SessionStore(context);
   const approvals = new ApprovalManager();
@@ -211,7 +211,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         const promptBudgetProfile = providerId === 'perplexity' ? 'compact' : 'default';
         const wasPreviouslyAgentMode = sessions.get(session.id)?.lastPromptMode === 'agent';
         const resolvedAgentTools = useAgentTools || (isImplementPlanRequest && Boolean(activePendingPlan));
-        sessions.update(session.id, { lastPromptMode: usePlanningMode ? 'plan' : resolvedAgentTools ? 'agent' : 'chat', pendingPlan: activePendingPlan });
+        sessions.update(session.id, { lastPromptMode: usePlanningMode ? 'plan' : resolvedAgentTools ? 'agent' : 'chat', pendingPlan: implementationTask ? undefined : activePendingPlan });
         if (!chatPrompt) throw new Error('Empty message.');
         if (implementationTask?.planWasCompacted) sessions.appendLog(session.id, { level: 'info', source: 'agent', message: 'Approved plan was compacted before implementation to stay within provider prompt limits.' });
 
@@ -248,6 +248,47 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 
         const repoContext = await workspaceContext.build(contextTask);
         const toolResults: string[] = [];
+        const compact = (value: string, limit = 180): string => {
+          const normalized = value.replace(/\s+/g, ' ').trim();
+          return normalized.length <= limit ? normalized : `${normalized.slice(0, limit)}...`;
+        };
+        const describeAction = (action: { type: string; path?: string; query?: string; command?: string; fromPath?: string; toPath?: string }): string => {
+          switch (action.type) {
+            case 'read_file':
+              return `Reading ${action.path ?? 'file'}`;
+            case 'edit_file':
+              return `Editing ${action.path ?? 'file'}`;
+            case 'create_file':
+              return `Creating ${action.path ?? 'file'}`;
+            case 'delete_file':
+              return `Deleting ${action.path ?? 'file'}`;
+            case 'rename_file':
+              return `Renaming ${action.fromPath ?? 'source'} -> ${action.toPath ?? 'target'}`;
+            case 'search_files':
+              return `Searching "${compact(action.query ?? '', 80)}"`;
+            case 'list_files':
+              return 'Listing files';
+            case 'run_command':
+              return `Running ${compact(action.command ?? '', 80)}`;
+            case 'get_git_diff':
+              return 'Reading git diff';
+            case 'ask_user':
+              return 'Asking for input';
+            case 'finish':
+              return 'Finalizing';
+            default:
+              return action.type;
+          }
+        };
+        const actionUpdates: string[] = [];
+        const pushActionUpdate = (line: string): void => {
+          actionUpdates.push(line);
+          if (actionUpdates.length > 8) actionUpdates.shift();
+          if (assistantMessage) {
+            const content = ['Working...', '', ...actionUpdates.map((entry, index) => `${index + 1}. ${entry}`)].join('\n');
+            sessions.updateChatMessage(session.id, assistantMessage.id, { content, rawContent: content });
+          }
+        };
         for (let round = 0; round < 25; round += 1) {
           const prompt = buildProviderPrompt(chatPrompt, repoContext, toolResults);
           appendPromptPreviewLog(session.id, 'agent', prompt, round + 1);
@@ -264,16 +305,26 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
             return;
           }
           sessions.appendLog(session.id, { level: 'info', source: 'provider', message: parsed.summary || `Round ${round + 1} response received.` });
+          if (parsed.summary) pushActionUpdate(compact(parsed.summary, 220));
           for (const action of parsed.actions) {
+            const actionLabel = describeAction(action);
+            pushActionUpdate(`${actionLabel}...`);
             const result = await executor.execute(session.id, action);
             toolResults.push(`${action.type}: ${result.message}`);
+            pushActionUpdate(`${actionLabel} done.`);
             if (action.type === 'ask_user' || result.done) {
+              if (implementationTask && result.done) sessions.update(session.id, { pendingPlan: undefined });
               sessions.setStatus(session.id, 'done');
-              if (assistantMessage) sessions.updateChatMessage(session.id, assistantMessage.id, { content: result.message, rawContent: responseText });
+              if (assistantMessage) sessions.updateChatMessage(session.id, assistantMessage.id, { content: result.message, rawContent: result.message });
               return;
             }
           }
           await new Promise((resolve) => setTimeout(resolve, AUTO_FOLLOW_UP_DELAY_MS));
+        }
+        if (implementationTask) sessions.update(session.id, { pendingPlan: undefined });
+        if (assistantMessage) {
+          const content = ['Task complete.', ...(actionUpdates.length ? ['', 'Recent actions:', ...actionUpdates.map((entry, index) => `${index + 1}. ${entry}`)] : [])].join('\n');
+          sessions.updateChatMessage(session.id, assistantMessage.id, { content, rawContent: content });
         }
         sessions.setStatus(session.id, 'done');
       } catch (error) {

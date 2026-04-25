@@ -202,6 +202,16 @@ export class AgentResponseParser {
   }
 
   private normalizeResponseShape(value: unknown): unknown {
+    if (Array.isArray(value)) {
+      const actions = this.normalizeActionArray(value);
+      if (actions.length > 0) {
+        return {
+          summary: '',
+          actions,
+        };
+      }
+    }
+
     const normalized = this.unwrapContainer(value);
     if (!normalized || typeof normalized !== 'object') {
       return normalized;
@@ -217,6 +227,14 @@ export class AgentResponseParser {
       return {
         summary,
         actions: rawActions,
+      };
+    }
+
+    const singleAction = this.normalizeSingleAction(record);
+    if (singleAction) {
+      return {
+        summary,
+        actions: [singleAction],
       };
     }
 

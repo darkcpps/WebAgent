@@ -83,6 +83,14 @@ export function sanitizeResponse(text: string, options: SanitizeResponseOptions 
   
   // 5. Remove "Answer:" or "Response:" prefixes if they were left at the top
   cleaned = cleaned.replace(/^\s*(?:Answer|Final Answer|Response|Result)\s*[:\n]\s*/i, '');
+  cleaned = cleaned.replace(/^\s*(?:ChatGPT|Gemini|Perplexity|Z\.?ai)\s+said\s*:\s*/i, '');
+
+  if (!preferJson) {
+    const readable = tryExtractReadableFromAgentJson(cleaned);
+    if (readable) {
+      return readable;
+    }
+  }
 
   if (preferJson) {
     const jsonCandidate = extractJsonCandidate(cleaned);

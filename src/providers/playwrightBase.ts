@@ -324,11 +324,11 @@ export abstract class PlaywrightWebProvider implements ProviderAdapter {
       this.stopped = false;
       this.lastResponse = '';
 
-      let composer = await this.findFirstVisible(this.getSelectors('input'), 9000);
+      let composer = await this.findBottomMostVisible(this.getSelectors('input'), 9000);
       if (!composer) {
         await this.page!.reload({ waitUntil: 'domcontentloaded' }).catch(() => undefined);
         await this.refreshSelectorHintsFromHtml();
-        composer = await this.findFirstVisible(this.getSelectors('input'), 5000);
+        composer = await this.findBottomMostVisible(this.getSelectors('input'), 5000);
       }
       if (!composer) {
         throw new Error(`Unable to find input box for provider ${this.id}.`);
@@ -350,17 +350,38 @@ export abstract class PlaywrightWebProvider implements ProviderAdapter {
       // Small pause to let UI react
       await this.page!.waitForTimeout(220);
 
-      const submitButton = await this.findFirstVisible(this.getSelectors('submit'), 4000);
-      if (submitButton) {
-        // Double check if enabled
-        if (await submitButton.isEnabled()) {
-          await submitButton.click().catch(() => undefined);
+      if (await this.clickActiveComposerSubmit(composer)) {
+        if (await this.waitForPromptSubmission(composer, fullPrompt, 5000)) {
           return;
         }
       }
-      
-      // Fallback to Enter if button not found or disabled
+
+      const submitButton = await this.findBottomMostEnabled(this.getSelectors('submit'), 8000);
+      if (submitButton) {
+        await submitButton.click().catch(() => undefined);
+        if (await this.waitForPromptSubmission(composer, fullPrompt, 5000)) {
+          return;
+        }
+      }
+
+      // Fallbacks for composer variants where the visible button click does not
+      // dispatch the same submit event as the keyboard shortcut.
       await this.page!.keyboard.press('Enter');
+      if (await this.waitForPromptSubmission(composer, fullPrompt, 3000)) {
+        return;
+      }
+
+      await this.page!.keyboard.press(process.platform === 'darwin' ? 'Meta+Enter' : 'Control+Enter').catch(() => undefined);
+      if (await this.waitForPromptSubmission(composer, fullPrompt, 3000)) {
+        return;
+      }
+
+      await this.submitActiveComposerForm().catch(() => undefined);
+      if (await this.waitForPromptSubmission(composer, fullPrompt, 3000)) {
+        return;
+      }
+
+      throw new Error(`Unable to submit prompt for provider ${this.id}.`);
     });
   }
 
@@ -471,7 +492,7 @@ export abstract class PlaywrightWebProvider implements ProviderAdapter {
       }
 
       if (!this.context) {
-        const userDataDir = this.resolveProfileDir();
+        const userDataDir = await this.resolveProfileDir();
         await fs.promises.mkdir(userDataDir, { recursive: true });
         this.context = await this.launchContextWithFallback(userDataDir, desiredHeadless);
         this.launchedHeadless = desiredHeadless;
@@ -562,10 +583,12 @@ export abstract class PlaywrightWebProvider implements ProviderAdapter {
 
       if (/id=["']prompt-textarea["']/i.test(html)) add('input', '#prompt-textarea');
       if (/data-testid=["'][^"']*composer-input[^"']*["']/i.test(html)) add('input', '[data-testid*="composer-input"] textarea');
+      if (/data-testid=["'][^"']*composer-input[^"']*["'][^>]*contenteditable=["']true["']/i.test(html)) add('input', '[data-testid*="composer-input"][contenteditable="true"]');
       if (/contenteditable=["']true["']/i.test(html)) add('input', '[contenteditable="true"]');
       if (/<textarea/i.test(html)) add('input', 'textarea');
 
       if (/type=["']submit["']/i.test(html)) add('submit', 'button[type="submit"]');
+      if (/data-testid=["'][^"']*composer-submit[^"']*["']/i.test(html)) add('submit', '[data-testid*="composer-submit"]');
       if (/aria-label=["'][^"']*send[^"']*["']/i.test(html)) add('submit', 'button[aria-label*="Send"]');
       if (/data-testid=["'][^"']*send[^"']*["']/i.test(html)) add('submit', '[data-testid*="send"]');
 
@@ -600,15 +623,32 @@ export abstract class PlaywrightWebProvider implements ProviderAdapter {
     return [...new Set([...hinted, ...mapped, ...generic])];
   }
 
-  private resolveProfileDir(): string {
+  private async resolveProfileDir(): Promise<string> {
     const stableProfileDir = path.join(os.homedir(), '.webagent-code', 'playwright-state', this.id);
     const legacyProfileDir = path.join(this.extensionContext.globalStorageUri.fsPath, 'playwright-state', this.id);
 
-    if (fs.existsSync(stableProfileDir) || !fs.existsSync(legacyProfileDir)) {
-      return stableProfileDir;
+    if (!fs.existsSync(stableProfileDir) && fs.existsSync(legacyProfileDir)) {
+      await this.copyProfileIfPresent(legacyProfileDir, stableProfileDir);
     }
 
-    return legacyProfileDir;
+    return stableProfileDir;
+  }
+
+  private async copyProfileIfPresent(sourceDir: string, targetDir: string): Promise<void> {
+    try {
+      await fs.promises.mkdir(path.dirname(targetDir), { recursive: true });
+      await fs.promises.cp(sourceDir, targetDir, {
+        recursive: true,
+        force: false,
+        errorOnExist: false,
+        filter: (source) => !['SingletonLock', 'SingletonCookie', 'SingletonSocket'].includes(path.basename(source)),
+      });
+      console.log(`[${this.id}-managed] Migrated browser login profile to ${targetDir}.`);
+    } catch (error) {
+      console.warn(
+        `[${this.id}-managed] Could not migrate legacy browser profile. A fresh persistent profile will be used. ${String(error)}`,
+      );
+    }
   }
 
   private async launchContextWithFallback(userDataDir: string, headless: boolean): Promise<BrowserContext> {
@@ -783,6 +823,98 @@ export abstract class PlaywrightWebProvider implements ProviderAdapter {
     return undefined;
   }
 
+  private async findFirstEnabled(selectors: string[], timeoutMs: number): Promise<Locator | undefined> {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      const candidate = await this.findFirstVisible(selectors, 500);
+      if (candidate) {
+        try {
+          if (await candidate.isEnabled()) {
+            return candidate;
+          }
+        } catch (error) {
+          if (this.isClosedTargetError(error)) {
+            return undefined;
+          }
+        }
+      }
+      await this.page!.waitForTimeout(200).catch(() => undefined);
+    }
+    return undefined;
+  }
+
+  private async findBottomMostVisible(selectors: string[], timeoutMs: number): Promise<Locator | undefined> {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      let best: { locator: Locator; bottom: number } | undefined;
+      for (const selector of selectors) {
+        const locators = this.page!.locator(selector);
+        const count = await locators.count();
+        for (let index = 0; index < count; index += 1) {
+          const locator = locators.nth(index);
+          try {
+            if (!(await locator.isVisible())) {
+              continue;
+            }
+            const box = await locator.boundingBox();
+            if (!box) {
+              continue;
+            }
+            const bottom = box.y + box.height;
+            if (!best || bottom > best.bottom) {
+              best = { locator, bottom };
+            }
+          } catch (error) {
+            if (this.isClosedTargetError(error)) {
+              return undefined;
+            }
+          }
+        }
+      }
+      if (best) {
+        return best.locator;
+      }
+      await this.page!.waitForTimeout(250).catch(() => undefined);
+    }
+    return undefined;
+  }
+
+  private async findBottomMostEnabled(selectors: string[], timeoutMs: number): Promise<Locator | undefined> {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      let best: { locator: Locator; bottom: number } | undefined;
+      for (const selector of selectors) {
+        const locators = this.page!.locator(selector);
+        const count = await locators.count();
+        for (let index = 0; index < count; index += 1) {
+          const locator = locators.nth(index);
+          try {
+            if (!(await locator.isVisible()) || !(await locator.isEnabled())) {
+              continue;
+            }
+            const box = await locator.boundingBox();
+            if (!box) {
+              continue;
+            }
+            const bottom = box.y + box.height;
+            if (!best || bottom > best.bottom) {
+              best = { locator, bottom };
+            }
+          } catch (error) {
+            if (this.isClosedTargetError(error)) {
+              return undefined;
+            }
+          }
+        }
+      }
+      if (best) {
+        return best.locator;
+      }
+      await this.page!.waitForTimeout(200).catch(() => undefined);
+    }
+    return undefined;
+  }
+
   private async findVisibleOptionByText(selectors: string[], text: string, timeoutMs: number): Promise<Locator | undefined> {
     const deadline = Date.now() + timeoutMs;
     while (Date.now() < deadline) {
@@ -847,11 +979,11 @@ export abstract class PlaywrightWebProvider implements ProviderAdapter {
   private async tryFastComposerWrite(composer: Locator, fullPrompt: string): Promise<boolean> {
     const attempts: Array<() => Promise<void>> = [
       async () => {
-        await composer.fill(fullPrompt);
-      },
-      async () => {
         await composer.focus();
         await this.page!.keyboard.insertText(fullPrompt);
+      },
+      async () => {
+        await composer.fill(fullPrompt);
       },
       async () => {
         await this.page!.evaluate((value) => {
@@ -888,27 +1020,142 @@ export abstract class PlaywrightWebProvider implements ProviderAdapter {
     return false;
   }
 
-  private async composerContainsPrompt(composer: Locator, fullPrompt: string): Promise<boolean> {
+  private async readComposerText(composer: Locator): Promise<string | undefined> {
+    try {
+      return await composer.evaluate((node) => {
+        if (node instanceof HTMLTextAreaElement || node instanceof HTMLInputElement) {
+          return node.value || '';
+        }
+        return node.textContent || '';
+      });
+    } catch {
+      return undefined;
+    }
+  }
+
+  private async composerContainsPrompt(composer: Locator, fullPrompt: string): Promise<boolean | undefined> {
     const expected = fullPrompt.trim();
     if (!expected) {
       return true;
     }
 
-    try {
-      const actualRaw = await composer.evaluate((node) => {
-        if (node instanceof HTMLTextAreaElement || node instanceof HTMLInputElement) {
-          return node.value || '';
-        }
-        return (node.textContent || '').trim();
-      });
+    const actualRaw = await this.readComposerText(composer);
+    if (actualRaw === undefined) {
+      return undefined;
+    }
 
-      const actual = actualRaw.replace(/\s+/g, ' ').trim();
-      const probe = expected.slice(0, Math.min(96, expected.length)).replace(/\s+/g, ' ').trim();
+    const actual = actualRaw.replace(/\s+/g, ' ').trim();
+    const probe = expected.slice(0, Math.min(96, expected.length)).replace(/\s+/g, ' ').trim();
 
-      return actual.length >= Math.min(24, expected.length) && actual.includes(probe);
-    } catch {
+    return actual.length >= Math.min(24, expected.length) && actual.includes(probe);
+  }
+
+  private async waitForPromptSubmission(composer: Locator, fullPrompt: string, timeoutMs: number): Promise<boolean> {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      if (await this.isGenerating()) {
+        return true;
+      }
+
+      const containsPrompt = await this.composerContainsPrompt(composer, fullPrompt);
+      if (containsPrompt === false) {
+        return true;
+      }
+
+      await this.page!.waitForTimeout(180).catch(() => undefined);
+    }
+
+    return false;
+  }
+
+  private async clickActiveComposerSubmit(composer: Locator): Promise<boolean> {
+    const selectors = this.getSelectors('submit');
+    const composerHandle = await composer.elementHandle().catch(() => null);
+    if (!composerHandle) {
       return false;
     }
+
+    return this.page!.evaluate(({ composerNode, submitSelectors }) => {
+      const composerElement = composerNode as HTMLElement;
+      const active = document.activeElement as HTMLElement | null;
+      const roots = [
+        composerElement.closest('form'),
+        composerElement.closest('[data-testid*="composer"]'),
+        composerElement.closest('[class*="composer"]'),
+        composerElement.parentElement,
+        active?.closest('form'),
+        active?.closest('[data-testid*="composer"]'),
+        active?.closest('[class*="composer"]'),
+        document,
+      ].filter((root): root is Document | Element => Boolean(root));
+
+      const isVisible = (element: HTMLElement): boolean => {
+        const style = window.getComputedStyle(element);
+        const rect = element.getBoundingClientRect();
+        return style.visibility !== 'hidden' && style.display !== 'none' && rect.width > 0 && rect.height > 0;
+      };
+
+      const isSendButton = (button: HTMLButtonElement): boolean => {
+        const label = [
+          button.getAttribute('aria-label'),
+          button.getAttribute('data-testid'),
+          button.getAttribute('title'),
+          button.textContent,
+          button.type,
+        ]
+          .filter(Boolean)
+          .join(' ')
+          .toLowerCase();
+        return !/stop|voice|dictate|attach|upload|model/.test(label) && /send|submit/.test(label);
+      };
+
+      for (const root of roots) {
+        const candidates = [
+          ...submitSelectors.flatMap((selector) => {
+            try {
+              return Array.from(root.querySelectorAll<HTMLButtonElement>(selector));
+            } catch {
+              return [];
+            }
+          }),
+          ...Array.from(root.querySelectorAll<HTMLButtonElement>('button')),
+        ];
+
+        const button = candidates
+          .reverse()
+          .find((candidate) => !candidate.disabled && isVisible(candidate) && isSendButton(candidate));
+        if (button) {
+          button.click();
+          return true;
+        }
+      }
+
+      return false;
+    }, { composerNode: composerHandle, submitSelectors: selectors }).catch(() => false);
+  }
+
+  private async submitActiveComposerForm(): Promise<void> {
+    await this.page!.evaluate(() => {
+      const active = document.activeElement as HTMLElement | null;
+      const form = active?.closest('form');
+      if (!form) {
+        return;
+      }
+
+      const submitter = Array.from(form.querySelectorAll<HTMLButtonElement>('button'))
+        .reverse()
+        .find((button) => {
+          const label = `${button.getAttribute('aria-label') || ''} ${button.getAttribute('data-testid') || ''}`.toLowerCase();
+          return !button.disabled && (button.type === 'submit' || /send|submit/.test(label));
+        });
+
+      if (submitter) {
+        submitter.click();
+        return;
+      }
+
+      form.dispatchEvent(new SubmitEvent('submit', { bubbles: true, cancelable: true }));
+    });
   }
 
   private async extractVisibleOptionLabels(selectors: string[], timeoutMs: number): Promise<string[]> {
@@ -1002,7 +1249,115 @@ export abstract class PlaywrightWebProvider implements ProviderAdapter {
             }
           }
 
-          return (clone.innerText || '').trim();
+          const collapseBlankLines = (value: string): string =>
+            value
+              .replace(/[ \t]+\n/g, '\n')
+              .replace(/\n[ \t]+/g, '\n')
+              .replace(/\n{3,}/g, '\n\n')
+              .trim();
+
+          const inlineMarkdown = (nodeToRender: Node): string => {
+            if (nodeToRender.nodeType === Node.TEXT_NODE) {
+              return nodeToRender.textContent || '';
+            }
+
+            if (!(nodeToRender instanceof HTMLElement)) {
+              return '';
+            }
+
+            const tag = nodeToRender.tagName.toLowerCase();
+            const inner = Array.from(nodeToRender.childNodes).map(inlineMarkdown).join('');
+
+            if (tag === 'br') {
+              return '\n';
+            }
+            if (tag === 'strong' || tag === 'b') {
+              return inner.trim() ? `**${inner.trim()}**` : '';
+            }
+            if (tag === 'em' || tag === 'i') {
+              return inner.trim() ? `*${inner.trim()}*` : '';
+            }
+            if (tag === 'code' && !nodeToRender.closest('pre')) {
+              return inner.trim() ? `\`${inner.trim()}\`` : '';
+            }
+            return inner;
+          };
+
+          const blockMarkdown = (nodeToRender: Node, orderedDepth = 0): string => {
+            if (nodeToRender.nodeType === Node.TEXT_NODE) {
+              return nodeToRender.textContent || '';
+            }
+
+            if (!(nodeToRender instanceof HTMLElement)) {
+              return '';
+            }
+
+            const tag = nodeToRender.tagName.toLowerCase();
+
+            if (/^h[1-6]$/.test(tag)) {
+              const level = Number(tag.slice(1));
+              return `\n\n${'#'.repeat(level)} ${inlineMarkdown(nodeToRender).trim()}\n\n`;
+            }
+
+            if (tag === 'p') {
+              return `\n\n${inlineMarkdown(nodeToRender).trim()}\n\n`;
+            }
+
+            if (tag === 'blockquote') {
+              const text = collapseBlankLines(Array.from(nodeToRender.childNodes).map((child) => blockMarkdown(child, orderedDepth)).join(''));
+              return text ? `\n\n${text.split(/\r?\n/).map((line) => `> ${line}`).join('\n')}\n\n` : '';
+            }
+
+            if (tag === 'pre') {
+              const codeNode = nodeToRender.querySelector('code');
+              const lang =
+                codeNode
+                  ? Array.from(codeNode.classList)
+                      .find((className) => className.startsWith('language-'))
+                      ?.replace('language-', '') || ''
+                  : '';
+              const code = (codeNode?.textContent || nodeToRender.textContent || '')
+                .split(/\r?\n/)
+                .filter((line) => !/^\s*(copy|python|javascript|typescript|json)\s*$/i.test(line.trim()))
+                .join('\n')
+                .trim();
+              return code ? `\n\n\`\`\`${lang}\n${code}\n\`\`\`\n\n` : '';
+            }
+
+            if (tag === 'ul' || tag === 'ol') {
+              const items = Array.from(nodeToRender.children)
+                .filter((child): child is HTMLElement => child instanceof HTMLElement && child.tagName.toLowerCase() === 'li')
+                .map((li, index) => {
+                  const marker = tag === 'ol' ? `${index + 1}.` : '-';
+                  const text = collapseBlankLines(Array.from(li.childNodes).map((child) => blockMarkdown(child, orderedDepth + 1)).join(''))
+                    .split(/\r?\n/)
+                    .map((line, lineIndex) => (lineIndex === 0 ? `${marker} ${line}` : `  ${line}`))
+                    .join('\n');
+                  return text;
+                })
+                .filter(Boolean);
+              return items.length ? `\n\n${items.join('\n')}\n\n` : '';
+            }
+
+            if (tag === 'table') {
+              const rows = Array.from(nodeToRender.querySelectorAll('tr'))
+                .map((row) =>
+                  Array.from(row.querySelectorAll('th,td'))
+                    .map((cell) => inlineMarkdown(cell).replace(/\s+/g, ' ').trim())
+                    .join(' | '),
+                )
+                .filter(Boolean);
+              return rows.length ? `\n\n${rows.join('\n')}\n\n` : '';
+            }
+
+            if (tag === 'code') {
+              return inlineMarkdown(nodeToRender);
+            }
+
+            return Array.from(nodeToRender.childNodes).map((child) => blockMarkdown(child, orderedDepth)).join('');
+          };
+
+          return collapseBlankLines(blockMarkdown(clone) || clone.innerText || '');
         };
 
         const nodes = Array.from(document.querySelectorAll<HTMLElement>(selector));
@@ -1270,7 +1625,8 @@ export abstract class PlaywrightWebProvider implements ProviderAdapter {
   }
 
   private sanitizeAssistantText(raw: string): string {
-    const text = sanitizeResponse(raw);
+    const protocolJson = sanitizeResponse(raw, { preferJson: true });
+    const text = /"actions"\s*:/.test(protocolJson) ? protocolJson : sanitizeResponse(raw);
 
     if (this.isLikelyEcho(text)) {
       return '';

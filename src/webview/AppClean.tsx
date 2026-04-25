@@ -278,7 +278,7 @@ export function App(): JSX.Element {
                     </details>
                   )}
                   {contentToRender && (!thoughtView.live || contentToRender !== 'Thinking...') ? <div className="chat-content"><MarkdownContent content={contentToRender} /></div> : null}
-                  {entry.role === 'assistant' && !isRunning && activeSession?.pendingPlan && latestAssistantMessageId === entry.id ? <div className="response-actions"><button className="glass-btn primary" onClick={onImplementPlan} disabled={!isLoggedIn}>Implement Plan</button><button className="glass-btn" onClick={onRevisePlan}>Revise Plan</button></div> : null}
+                  {entry.role === 'assistant' && !isRunning && activeSession?.pendingPlan && latestAssistantMessageId === entry.id && entry.content === activeSession.pendingPlan.plan ? <div className="response-actions"><button className="glass-btn primary" onClick={onImplementPlan} disabled={!isLoggedIn}>Implement Plan</button><button className="glass-btn" onClick={onRevisePlan}>Revise Plan</button></div> : null}
                   {entry.role === 'assistant' && !isRunning && hasCompletedCodeChanges && latestAssistantMessageId === entry.id ? <div className="response-actions"><button className="glass-btn preview-changes-btn" onClick={onPreviewChanges}>Preview</button></div> : null}
                 </div>
               </article>
@@ -330,27 +330,188 @@ function getThoughtView(rawContent: string | undefined, fallbackAnswer: string):
   return { answer: answer || fallbackAnswer, thinking, hasThinking: Boolean(thinking), live: /thinking\.\.\./i.test(fallbackAnswer) && !answer };
 }
 
-function MarkdownContent({ content }: { content: string }): JSX.Element {
-  const hasFencedCode = /```[\s\S]*?```/.test(content);
-  const escaped = content
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;');
+function renderInlineMarkdown(text: string, keyPrefix: string): React.ReactNode[] {
+  const nodes: React.ReactNode[] = [];
+  const tokenRegex = /(`[^`]+`|\*\*\*[^*]+?\*\*\*|\*\*[^*]+?\*\*|\*[^*]+?\*|__[^_]+?__|_[^_]+?_)/g;
+  let lastIndex = 0;
+  let tokenIndex = 0;
+  let match: RegExpExecArray | null;
 
-  if (hasFencedCode) {
-    const html = escaped
-      .replace(/```([a-zA-Z0-9_-]+)?\r?\n?([\s\S]*?)```/g, (_match, lang: string, code: string) => {
-        const label = lang ? `<div class="md-code-lang">${lang}</div>` : '';
-        return `<pre class="md-code">${label}<code>${code.replace(/\n$/, '')}</code></pre>`;
-      })
-      .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
-      .replace(/\n/g, '<br />');
-    return <div dangerouslySetInnerHTML={{ __html: html }} />;
+  while ((match = tokenRegex.exec(text)) !== null) {
+    const plain = text.slice(lastIndex, match.index);
+    if (plain) {
+      nodes.push(<React.Fragment key={`${keyPrefix}-plain-${tokenIndex}`}>{plain}</React.Fragment>);
+    }
+
+    const token = match[0];
+    const delimiterLength = token.startsWith('`')
+      ? 1
+      : token.startsWith('***') || token.startsWith('___')
+        ? 3
+        : token.startsWith('**') || token.startsWith('__')
+          ? 2
+          : 1;
+    const inner = token.slice(delimiterLength, -delimiterLength);
+    if (token.startsWith('`')) {
+      nodes.push(
+        <code key={`${keyPrefix}-code-${tokenIndex}`} className="md-inline-code">
+          {inner}
+        </code>,
+      );
+    } else if (token.startsWith('***') || token.startsWith('___')) {
+      nodes.push(
+        <strong key={`${keyPrefix}-strong-${tokenIndex}`}>
+          <em>{inner}</em>
+        </strong>,
+      );
+    } else if (token.startsWith('**') || token.startsWith('__')) {
+      nodes.push(<strong key={`${keyPrefix}-strong-${tokenIndex}`}>{inner}</strong>);
+    } else {
+      nodes.push(<em key={`${keyPrefix}-em-${tokenIndex}`}>{inner}</em>);
+    }
+
+    lastIndex = tokenRegex.lastIndex;
+    tokenIndex += 1;
   }
 
-  const html = escaped
-    .replace(/`([^`\r\n]+)`/g, '<code>$1</code>')
-    .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
-    .replace(/\n/g, '<br />');
-  return <div dangerouslySetInnerHTML={{ __html: html }} />;
+  const suffix = text.slice(lastIndex);
+  if (suffix) {
+    nodes.push(<React.Fragment key={`${keyPrefix}-suffix`}>{suffix}</React.Fragment>);
+  }
+
+  return nodes;
+}
+
+function renderTextBlock(text: string, blockIndex: number): React.ReactNode[] {
+  const lines = text.split(/\r?\n/);
+  const nodes: React.ReactNode[] = [];
+  let i = 0;
+  let nodeIndex = 0;
+
+  while (i < lines.length) {
+    const line = lines[i];
+    const trimmed = line.trim();
+    if (!trimmed) {
+      i += 1;
+      continue;
+    }
+
+    const headingMatch = trimmed.match(/^(#{1,6})\s+(.+)$/);
+    if (headingMatch) {
+      const level = Math.min(headingMatch[1].length, 6);
+      const textValue = headingMatch[2].trim();
+      const className = `md-heading md-h${level}`;
+      const key = `md-${blockIndex}-heading-${nodeIndex}`;
+      const headingContent = renderInlineMarkdown(textValue, key);
+      if (level === 1) nodes.push(<h1 key={key} className={className}>{headingContent}</h1>);
+      else if (level === 2) nodes.push(<h2 key={key} className={className}>{headingContent}</h2>);
+      else if (level === 3) nodes.push(<h3 key={key} className={className}>{headingContent}</h3>);
+      else if (level === 4) nodes.push(<h4 key={key} className={className}>{headingContent}</h4>);
+      else if (level === 5) nodes.push(<h5 key={key} className={className}>{headingContent}</h5>);
+      else nodes.push(<h6 key={key} className={className}>{headingContent}</h6>);
+      i += 1;
+      nodeIndex += 1;
+      continue;
+    }
+
+    if (/^\s*[-*+]\s+/.test(line)) {
+      const items: string[] = [];
+      while (i < lines.length && /^\s*[-*+]\s+/.test(lines[i])) {
+        items.push(lines[i].replace(/^\s*[-*+]\s+/, '').trim());
+        i += 1;
+      }
+      const key = `md-${blockIndex}-ul-${nodeIndex}`;
+      nodes.push(
+        <ul key={key} className="md-list">
+          {items.map((item, itemIndex) => (
+            <li key={`${key}-li-${itemIndex}`}>{renderInlineMarkdown(item, `${key}-li-${itemIndex}`)}</li>
+          ))}
+        </ul>,
+      );
+      nodeIndex += 1;
+      continue;
+    }
+
+    if (/^\s*\d+\.\s+/.test(line)) {
+      const items: string[] = [];
+      while (i < lines.length && /^\s*\d+\.\s+/.test(lines[i])) {
+        items.push(lines[i].replace(/^\s*\d+\.\s+/, '').trim());
+        i += 1;
+      }
+      const key = `md-${blockIndex}-ol-${nodeIndex}`;
+      nodes.push(
+        <ol key={key} className="md-list md-list-ordered">
+          {items.map((item, itemIndex) => (
+            <li key={`${key}-li-${itemIndex}`}>{renderInlineMarkdown(item, `${key}-li-${itemIndex}`)}</li>
+          ))}
+        </ol>,
+      );
+      nodeIndex += 1;
+      continue;
+    }
+
+    const paragraph: string[] = [];
+    while (
+      i < lines.length &&
+      lines[i].trim() &&
+      !/^(#{1,6})\s+/.test(lines[i].trim()) &&
+      !/^\s*[-*+]\s+/.test(lines[i]) &&
+      !/^\s*\d+\.\s+/.test(lines[i])
+    ) {
+      paragraph.push(lines[i].trim());
+      i += 1;
+    }
+    const paragraphText = paragraph.join(' ');
+    const key = `md-${blockIndex}-p-${nodeIndex}`;
+    nodes.push(
+      <p key={key} className="md-paragraph">
+        {renderInlineMarkdown(paragraphText, key)}
+      </p>,
+    );
+    nodeIndex += 1;
+  }
+
+  return nodes;
+}
+
+function MarkdownContent({ content }: { content: string }): JSX.Element {
+  const blocks: Array<{ type: 'text' | 'code'; text: string; lang?: string }> = [];
+  const regex = /```([a-zA-Z0-9_-]+)?\n([\s\S]*?)```/g;
+  let lastIndex = 0;
+  let match: RegExpExecArray | null;
+
+  while ((match = regex.exec(content)) !== null) {
+    const prefix = content.slice(lastIndex, match.index);
+    if (prefix.trim().length > 0) {
+      blocks.push({ type: 'text', text: prefix.trim() });
+    }
+
+    blocks.push({
+      type: 'code',
+      lang: match[1] || '',
+      text: (match[2] || '').replace(/\n$/, ''),
+    });
+
+    lastIndex = regex.lastIndex;
+  }
+
+  const suffix = content.slice(lastIndex);
+  if (suffix.trim().length > 0 || blocks.length === 0) {
+    blocks.push({ type: 'text', text: suffix.trim() || content });
+  }
+
+  return (
+    <>
+      {blocks.map((block, index) =>
+        block.type === 'code' ? (
+          <pre key={`code-${index}`} className="md-code">
+            {block.lang ? <div className="md-code-lang">{block.lang}</div> : null}
+            <code>{block.text}</code>
+          </pre>
+        ) : (
+          <div key={`text-${index}`} className="md-text">{renderTextBlock(block.text, index)}</div>
+        ),
+      )}
+    </>
+  );
 }

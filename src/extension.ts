@@ -23,7 +23,7 @@ import { buildPlanningPrompt, buildProviderPrompt } from './agent/planner';
 import { sanitizeResponse } from './shared/utils';
 
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
-  const AUTO_FOLLOW_UP_DELAY_MS = 3000;
+  const AUTO_FOLLOW_UP_DELAY_MS = 1750;
   const configuration = vscode.workspace.getConfiguration('webagentCode');
   const sessions = new SessionStore(context);
   const approvals = new ApprovalManager();
@@ -202,16 +202,50 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     ].join('\n');
   };
 
-  const buildChatAskPrompt = (userPrompt: string, options: { wasPreviouslyAgentMode: boolean }): ProviderPrompt => {
+  const buildRecentChatContext = (sessionId: string, currentUserMessageId?: string): string => {
+    const session = sessions.get(sessionId);
+    if (!session) {
+      return '';
+    }
+
+    const currentIndex = currentUserMessageId
+      ? session.chatHistory.findIndex((entry) => entry.id === currentUserMessageId)
+      : -1;
+    const previousMessages = (currentIndex >= 0 ? session.chatHistory.slice(0, currentIndex) : session.chatHistory)
+      .filter((entry) => entry.role === 'user' || entry.role === 'assistant')
+      .filter((entry) => entry.content.trim() && entry.content.trim() !== 'Working...')
+      .slice(-12);
+
+    if (previousMessages.length === 0) {
+      return '';
+    }
+
+    const lines = previousMessages.map((entry) => {
+      const role = entry.role === 'user' ? 'User' : 'Assistant';
+      return `${role}: ${compactText(entry.content, 1200)}`;
+    });
+
+    return compactText(lines.join('\n\n'), 9000);
+  };
+
+  const buildChatAskPrompt = (
+    userPrompt: string,
+    options: { wasPreviouslyAgentMode: boolean; recentChatContext?: string },
+  ): ProviderPrompt => {
     const systemLines = [
       'You are in Chat/Ask mode inside an IDE conversation.',
       'Respond conversationally and helpfully to the user question.',
+      'Use the recent IDE conversation context to answer follow-up questions naturally. Do not repeat the context unless it is relevant.',
       'Do not output tool-action JSON and do not behave as an autonomous agent in this mode.',
       'Explain code changes clearly when asked, and ask clarifying questions if context is missing.',
       options.wasPreviouslyAgentMode
         ? 'Important: Previous agent-mode instructions in this thread are inactive. Ignore them unless the user explicitly asks to enable Agent Mode again.'
         : 'Stay in Chat/Ask mode unless the user explicitly asks to switch to Agent Mode.',
     ];
+
+    if (options.recentChatContext?.trim()) {
+      systemLines.push('', 'Recent IDE conversation context:', options.recentChatContext.trim());
+    }
 
     return {
       systemPrompt: systemLines.join('\n'),
@@ -474,7 +508,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
           existing && existing.providerId === providerId ? existing : sessions.create(providerId, 'Chat session', workspaceRoot);
 
         sessions.setActive(session.id);
-        sessions.appendChatMessage(session.id, {
+        const userMessage = sessions.appendChatMessage(session.id, {
           role: 'user',
           content: message,
           modelId,
@@ -671,7 +705,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
           const resolvedAgentTools = useAgentTools || (isImplementPlanRequest && Boolean(activePendingPlan));
           sessions.update(session.id, {
             lastPromptMode: usePlanningMode ? 'plan' : resolvedAgentTools ? 'agent' : 'chat',
-            pendingPlan: activePendingPlan,
+            pendingPlan: implementationTask ? undefined : activePendingPlan,
           });
           if (!chatPrompt) {
             throw new Error('Empty message.');
@@ -736,7 +770,10 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
           }
 
           if (!resolvedAgentTools) {
-            const prompt = buildChatAskPrompt(chatPrompt, { wasPreviouslyAgentMode });
+            const prompt = buildChatAskPrompt(chatPrompt, {
+              wasPreviouslyAgentMode,
+              recentChatContext: buildRecentChatContext(session.id, userMessage?.id),
+            });
             appendPromptPreviewLog(session.id, 'chat', prompt);
             await runWithAutoFallback(
               () => provider.sendPrompt({ ...prompt, enableThinking: requestThinking }),
@@ -1268,10 +1305,10 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
               rawContent: finalText,
             });
           }
-          sessions.setStatus(session.id, 'done');
           if (!endedByAskUser && implementationTask) {
             sessions.update(session.id, { pendingPlan: undefined });
           }
+          sessions.setStatus(session.id, 'done');
           sessions.appendLog(session.id, {
             level: endedByAskUser ? 'info' : 'success',
             source: 'agent',
