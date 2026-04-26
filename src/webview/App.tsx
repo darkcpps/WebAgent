@@ -1,6 +1,6 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import type { ExtensionToWebviewMessage, WebviewToExtensionMessage } from '../shared/messages';
-import type { WebviewState } from '../shared/types';
+import type { ImageAttachment, WebviewState } from '../shared/types';
 import { sanitizeResponse } from '../shared/utils';
 
 declare global {
@@ -11,6 +11,8 @@ declare global {
 
 const vscode = window.acquireVsCodeApi();
 const LONG_RESPONSE_THRESHOLD_MS = 5 * 60 * 1000;
+const MAX_IMAGE_ATTACHMENTS = 4;
+const MAX_IMAGE_ATTACHMENT_BYTES = 8 * 1024 * 1024;
 
 const initialState: WebviewState = {
   sessions: [],
@@ -65,6 +67,8 @@ export function App(): JSX.Element {
   const [now, setNow] = useState(Date.now());
   const hasPerformedStartupReadyCheck = useRef(false);
   const composerRef = useRef<HTMLTextAreaElement>(null);
+  const imageInputRef = useRef<HTMLInputElement>(null);
+  const [imageAttachments, setImageAttachments] = useState<ImageAttachment[]>([]);
 
   useEffect(() => {
     const handler = (event: MessageEvent<ExtensionToWebviewMessage>) => {
@@ -121,6 +125,12 @@ export function App(): JSX.Element {
   }, [toast]);
 
   useEffect(() => {
+    if (providerId !== 'chatgpt' && providerId !== 'perplexity') {
+      setImageAttachments([]);
+    }
+  }, [providerId]);
+
+  useEffect(() => {
     const timer = window.setInterval(() => setNow(Date.now()), 1000);
     return () => window.clearInterval(timer);
   }, []);
@@ -174,6 +184,7 @@ export function App(): JSX.Element {
   const hasExplicitThinkingPreference = Object.prototype.hasOwnProperty.call(thinkingByProvider, providerId);
   const enableThinking = Boolean(thinkingByProvider[providerId]);
   const canSend = message.trim().length > 0 && !isRunning && isLoggedIn;
+  const canAttachImages = providerId === 'chatgpt' || providerId === 'perplexity';
   const debugLogs = activeSession?.logs ?? [];
   const visibleActions = activeSession?.actionHistory.slice(-6) ?? [];
   const autoApproveEnabled = state.approvalMode === 'auto-apply-safe-edits';
@@ -246,6 +257,39 @@ export function App(): JSX.Element {
     vscode.postMessage({ type: 'previewSessionChanges', sessionId: activeSession.id });
   };
 
+  const fileToImageAttachment = (file: File): Promise<ImageAttachment> =>
+    new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onerror = () => reject(new Error(`Could not read ${file.name}`));
+      reader.onload = () => {
+        const result = String(reader.result || '');
+        const data = result.includes(',') ? result.split(',').pop() || '' : result;
+        resolve({ name: file.name, mimeType: file.type || 'image/png', data });
+      };
+      reader.readAsDataURL(file);
+    });
+
+  const onSelectImages = async (event: React.ChangeEvent<HTMLInputElement>) => {
+    const allFiles = Array.from(event.target.files ?? []).filter((file) => file.type.startsWith('image/'));
+    const files = allFiles.filter((file) => file.size <= MAX_IMAGE_ATTACHMENT_BYTES);
+    event.target.value = '';
+    if (files.length === 0) {
+      if (allFiles.length > 0) {
+        setToast({ level: 'warning', message: 'Images must be 8 MB or smaller.' });
+      }
+      return;
+    }
+    if (files.length < allFiles.length) {
+      setToast({ level: 'warning', message: 'Some images were skipped because they are larger than 8 MB.' });
+    }
+    const next = await Promise.all(files.slice(0, MAX_IMAGE_ATTACHMENTS).map(fileToImageAttachment));
+    setImageAttachments((current) => [...current, ...next].slice(0, MAX_IMAGE_ATTACHMENTS));
+  };
+
+  const removeImageAttachment = (name: string, index: number) => {
+    setImageAttachments((current) => current.filter((item, itemIndex) => item.name !== name || itemIndex !== index));
+  };
+
   const sendMessage = (content: string, modelOverride?: string, modeOverride?: 'chat' | 'agent' | 'plan') => {
     if (!content) {
       return;
@@ -263,7 +307,9 @@ export function App(): JSX.Element {
       agentMode: outgoingAgentMode,
       planningMode: outgoingPlanningMode,
       enableThinking: supportsThinkingControl && hasExplicitThinkingPreference ? enableThinking : undefined,
+      imageAttachments: canAttachImages ? imageAttachments : undefined,
     });
+    setImageAttachments([]);
   };
 
   const onSend = () => {
@@ -450,6 +496,11 @@ export function App(): JSX.Element {
                 activeSession.chatHistory.map((entry, index) => {
                   const thoughtView = getThoughtView(entry.rawContent, entry.content);
                   const thinkingExpanded = Boolean(expandedThinkingByMessage[entry.id]) || showThinking;
+                  const isPlanResponse = Boolean(
+                    entry.role === 'assistant' &&
+                      activeSession?.pendingPlan &&
+                      entry.content.trim() === activeSession.pendingPlan.plan.trim(),
+                  );
                   const rawContentToRender =
                     entry.role === 'assistant' && thoughtView.answer.trim().length > 0 ? thoughtView.answer : entry.content;
                   const contentToRender = entry.role === 'assistant'
@@ -481,8 +532,11 @@ export function App(): JSX.Element {
                           </details>
                         )}
                         {contentToRender && (!thoughtView.live || contentToRender !== 'Thinking...') ? (
-                          <div className="chat-content">
-                            <MarkdownContent content={contentToRender} />
+                          <div className={isPlanResponse ? 'chat-content plan-content' : 'chat-content'}>
+                            {isPlanResponse ? (
+                              <div className="plan-kicker">Planning Mode</div>
+                            ) : null}
+                            <MarkdownContent content={contentToRender} variant={isPlanResponse ? 'plan' : 'default'} />
                           </div>
                         ) : null}
                         
@@ -593,7 +647,38 @@ export function App(): JSX.Element {
             </section>
 
             <footer className="chat-composer">
+              {imageAttachments.length > 0 ? (
+                <div className="attachment-tray">
+                  {imageAttachments.map((attachment, index) => (
+                    <button
+                      key={`${attachment.name}-${index}`}
+                      className="attachment-chip"
+                      title="Remove image"
+                      onClick={() => removeImageAttachment(attachment.name, index)}
+                    >
+                      <span>{attachment.name}</span>
+                      <span aria-hidden="true">x</span>
+                    </button>
+                  ))}
+                </div>
+              ) : null}
                <div className="composer-input-area">
+                 <input
+                   ref={imageInputRef}
+                   type="file"
+                   accept="image/*"
+                   multiple
+                   className="hidden-file-input"
+                   onChange={onSelectImages}
+                 />
+                 <button
+                   className="attach-btn"
+                   disabled={!canAttachImages || isRunning || !isLoggedIn}
+                   title={canAttachImages ? 'Attach image' : 'Images are supported for ChatGPT and Perplexity'}
+                   onClick={() => imageInputRef.current?.click()}
+                 >
+                   <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M21.44 11.05 12 20.49a6 6 0 0 1-8.49-8.49l9.44-9.44a4 4 0 1 1 5.66 5.66l-9.45 9.44a2 2 0 0 1-2.83-2.83l8.49-8.48"></path></svg>
+                 </button>
                  <textarea
                    ref={composerRef}
                    rows={1}
@@ -916,6 +1001,32 @@ function renderInlineMarkdown(text: string, keyPrefix: string): React.ReactNode[
   return nodes;
 }
 
+function normalizePlanMarkdown(text: string): string {
+  const knownSections = new Map<string, string>([
+    ['goal and intended user experience', 'Goal'],
+    ['explicit requirements from the user', 'Requirements'],
+    ['inferred enhancements and creative additions', 'Inferred Enhancements'],
+    ['assumptions and defaults', 'Assumptions'],
+    ['codebase findings', 'Codebase Findings'],
+    ['ui/ux and interaction details', 'UI/UX Details'],
+    ['implementation steps', 'Implementation Steps'],
+    ['risks, tradeoffs, and open questions', 'Risks and Questions'],
+    ['verification', 'Verification'],
+  ]);
+
+  return text
+    .split(/\r?\n/)
+    .map((line) => {
+      const trimmed = line.trim().replace(/:$/, '');
+      const normalized = trimmed.toLowerCase();
+      if (!line.startsWith('#') && knownSections.has(normalized)) {
+        return `## ${knownSections.get(normalized)}`;
+      }
+      return line;
+    })
+    .join('\n');
+}
+
 function renderTextBlock(text: string, blockIndex: number): React.ReactNode[] {
   const lines = text.split(/\r?\n/);
   const nodes: React.ReactNode[] = [];
@@ -943,6 +1054,46 @@ function renderTextBlock(text: string, blockIndex: number): React.ReactNode[] {
       else if (level === 5) nodes.push(<h5 key={key} className={className}>{renderInlineMarkdown(textValue, key)}</h5>);
       else nodes.push(<h6 key={key} className={className}>{renderInlineMarkdown(textValue, key)}</h6>);
       i += 1;
+      nodeIndex += 1;
+      continue;
+    }
+
+    if (/^>\s+/.test(trimmed)) {
+      const linesInQuote: string[] = [];
+      while (i < lines.length && /^>\s+/.test(lines[i].trim())) {
+        linesInQuote.push(lines[i].trim().replace(/^>\s+/, ''));
+        i += 1;
+      }
+      const key = `md-${blockIndex}-quote-${nodeIndex}`;
+      nodes.push(
+        <blockquote key={key} className="md-blockquote">
+          {renderInlineMarkdown(linesInQuote.join(' '), key)}
+        </blockquote>,
+      );
+      nodeIndex += 1;
+      continue;
+    }
+
+    if (/^\s*[-*+]\s+\[[ xX]\]\s+/.test(line)) {
+      const items: Array<{ checked: boolean; text: string }> = [];
+      while (i < lines.length && /^\s*[-*+]\s+\[[ xX]\]\s+/.test(lines[i])) {
+        const match = lines[i].match(/^\s*[-*+]\s+\[([ xX])\]\s+(.+)$/);
+        if (match) {
+          items.push({ checked: match[1].toLowerCase() === 'x', text: match[2].trim() });
+        }
+        i += 1;
+      }
+      const key = `md-${blockIndex}-tasks-${nodeIndex}`;
+      nodes.push(
+        <ul key={key} className="md-list md-task-list">
+          {items.map((item, itemIndex) => (
+            <li key={`${key}-li-${itemIndex}`} className={item.checked ? 'checked' : undefined}>
+              <span className="md-task-box" aria-hidden="true">{item.checked ? 'x' : ''}</span>
+              <span>{renderInlineMarkdown(item.text, `${key}-li-${itemIndex}`)}</span>
+            </li>
+          ))}
+        </ul>,
+      );
       nodeIndex += 1;
       continue;
     }
@@ -1007,14 +1158,15 @@ function renderTextBlock(text: string, blockIndex: number): React.ReactNode[] {
   return nodes;
 }
 
-function MarkdownContent({ content }: { content: string }): JSX.Element {
+function MarkdownContent({ content, variant = 'default' }: { content: string; variant?: 'default' | 'plan' }): JSX.Element {
   const blocks: Array<{ type: 'text' | 'code'; text: string; lang?: string }> = [];
+  const source = variant === 'plan' ? normalizePlanMarkdown(content) : content;
   const regex = /```([a-zA-Z0-9_-]+)?\n([\s\S]*?)```/g;
   let lastIndex = 0;
   let match: RegExpExecArray | null;
 
-  while ((match = regex.exec(content)) !== null) {
-    const prefix = content.slice(lastIndex, match.index);
+  while ((match = regex.exec(source)) !== null) {
+    const prefix = source.slice(lastIndex, match.index);
     if (prefix.trim().length > 0) {
       blocks.push({ type: 'text', text: prefix.trim() });
     }
@@ -1028,9 +1180,9 @@ function MarkdownContent({ content }: { content: string }): JSX.Element {
     lastIndex = regex.lastIndex;
   }
 
-  const suffix = content.slice(lastIndex);
+  const suffix = source.slice(lastIndex);
   if (suffix.trim().length > 0 || blocks.length === 0) {
-    blocks.push({ type: 'text', text: suffix.trim() || content });
+    blocks.push({ type: 'text', text: suffix.trim() || source });
   }
 
   return (

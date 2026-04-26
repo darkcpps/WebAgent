@@ -1,4 +1,4 @@
-import type { ApprovalMode, ProviderId, WebviewState } from './types';
+import type { ApprovalMode, ImageAttachment, ProviderId, WebviewState } from './types';
 
 export type WebviewToExtensionMessage =
   | { type: 'ready' }
@@ -14,6 +14,7 @@ export type WebviewToExtensionMessage =
       agentMode?: boolean;
       planningMode?: boolean;
       enableThinking?: boolean;
+      imageAttachments?: ImageAttachment[];
     }
   | {
       type: 'regenerateChatInNewSession';

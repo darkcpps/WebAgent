@@ -1,6 +1,6 @@
 import * as vscode from 'vscode';
 import type { ExtensionToWebviewMessage, WebviewToExtensionMessage } from '../shared/messages';
-import type { ApprovalMode, ProviderId, ProviderModelRefreshStatus } from '../shared/types';
+import type { ApprovalMode, ImageAttachment, ProviderId, ProviderModelRefreshStatus } from '../shared/types';
 import type { ProviderReadiness } from '../providers/base';
 import type { ProviderRegistry } from '../providers/registry';
 import type { SessionStore } from '../storage/sessionStore';
@@ -18,6 +18,7 @@ interface PanelCallbacks {
     agentMode?: boolean,
     planningMode?: boolean,
     enableThinking?: boolean,
+    imageAttachments?: ImageAttachment[],
   ): Promise<void>;
   regenerateChatInNewSession(
     providerId: ProviderId,
@@ -122,6 +123,7 @@ export class WebAgentPanel {
             message.agentMode,
             message.planningMode,
             message.enableThinking,
+            message.imageAttachments,
           );
           return;
         case 'regenerateChatInNewSession':

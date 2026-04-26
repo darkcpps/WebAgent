@@ -16,7 +16,7 @@ import { WebAgentPanel } from './services/webviewPanel';
 import { WorkspaceContextService } from './workspace/context';
 import { WorkspaceFilesService } from './workspace/files';
 import { GitService } from './workspace/git';
-import type { ApprovalMode, BridgeUiState, ChatMessage, ProviderId, SessionState } from './shared/types';
+import type { ApprovalMode, BridgeUiState, ChatMessage, ImageAttachment, ProviderId, SessionState } from './shared/types';
 import type { ProviderAdapter, ProviderPrompt } from './providers/base';
 import { AgentResponseParser } from './agent/parser';
 import { buildPlanningPrompt, buildProviderPrompt } from './agent/planner';
@@ -128,6 +128,14 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       return normalized;
     }
     return `${normalized.slice(0, limit).trim()}\n...[truncated ${normalized.length - limit} chars]`;
+  };
+
+  const notifyModeComplete = (mode: 'agent' | 'plan', detail?: string): void => {
+    const message =
+      mode === 'plan'
+        ? 'WebAgent Code: planning mode is done. Plan is ready.'
+        : 'WebAgent Code: agent mode is done.';
+    void vscode.window.showInformationMessage(detail ? `${message} ${detail}` : message);
   };
 
   const buildRegenerationHandoffPrompt = (sourceSession: SessionState, retryMessage: string): string => {
@@ -500,17 +508,21 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         await ensureBridgeCompanion(providerId, session.id);
         void orchestrator.start(session.id, providerId, task);
       },
-      sendChat: async (providerId, message, modelId, sessionId, agentMode, planningMode, enableThinking) => {
+      sendChat: async (providerId, message, modelId, sessionId, agentMode, planningMode, enableThinking, imageAttachments?: ImageAttachment[]) => {
         const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
         const existing = sessionId ? sessions.get(sessionId) : undefined;
         const wasEmptySession = (existing?.chatHistory.length ?? 0) === 0;
         const session =
           existing && existing.providerId === providerId ? existing : sessions.create(providerId, 'Chat session', workspaceRoot);
+        const attachmentNames = (imageAttachments ?? []).map((attachment) => attachment.name).filter(Boolean);
+        const visibleUserMessage = attachmentNames.length > 0
+          ? `${message}\n\nAttached images: ${attachmentNames.join(', ')}`
+          : message;
 
         sessions.setActive(session.id);
         const userMessage = sessions.appendChatMessage(session.id, {
           role: 'user',
-          content: message,
+          content: visibleUserMessage,
           modelId,
         });
         const assistantMessage = sessions.appendChatMessage(session.id, {
@@ -685,23 +697,36 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
           const trimmedMessage = message.trim();
           const explicitAgent = /^\/agent\s+/i.test(trimmedMessage);
           const explicitPlan = /^\/plan\s+/i.test(trimmedMessage);
+          const explicitChat = /^\/chat\s+/i.test(trimmedMessage);
           const activePendingPlan = sessions.get(session.id)?.pendingPlan;
+          const previousPromptMode = sessions.get(session.id)?.lastPromptMode;
           const promptWithoutCommand = explicitAgent
             ? trimmedMessage.replace(/^\/agent\s+/i, '').trim()
             : explicitPlan
               ? trimmedMessage.replace(/^\/plan\s+/i, '').trim()
-              : trimmedMessage;
+              : explicitChat
+                ? trimmedMessage.replace(/^\/chat\s+/i, '').trim()
+                : trimmedMessage;
           const isImplementPlanRequest = /^implement\s+(this\s+|the\s+)?plan$/i.test(promptWithoutCommand);
           const implementationTask =
             isImplementPlanRequest && activePendingPlan
               ? buildAgentTaskFromPlan(activePendingPlan.originalRequest, activePendingPlan.plan)
               : undefined;
           const usePlanningMode = (Boolean(planningMode) || explicitPlan) && !(isImplementPlanRequest && activePendingPlan);
-          const useAgentTools = !usePlanningMode && (Boolean(agentMode) || explicitAgent);
+          const keepAgentSessionActive = previousPromptMode === 'agent' && !explicitChat && !planningMode;
+          const useAgentTools = !usePlanningMode && (Boolean(agentMode) || explicitAgent || keepAgentSessionActive);
           const chatPrompt = implementationTask ? implementationTask.task : promptWithoutCommand;
           const contextTask = implementationTask && activePendingPlan ? activePendingPlan.originalRequest : chatPrompt;
           const requestThinking = supportsThinkingControl ? enableThinking : undefined;
-          const wasPreviouslyAgentMode = sessions.get(session.id)?.lastPromptMode === 'agent';
+          const requestImageAttachments = providerId === 'chatgpt' || providerId === 'perplexity' ? imageAttachments ?? [] : [];
+          if ((imageAttachments?.length ?? 0) > 0 && requestImageAttachments.length === 0) {
+            sessions.appendLog(session.id, {
+              level: 'warning',
+              source: 'agent',
+              message: `Image attachments are currently supported for ChatGPT and Perplexity only; ignoring ${imageAttachments!.length} attachment(s).`,
+            });
+          }
+          const wasPreviouslyAgentMode = previousPromptMode === 'agent';
           const resolvedAgentTools = useAgentTools || (isImplementPlanRequest && Boolean(activePendingPlan));
           sessions.update(session.id, {
             lastPromptMode: usePlanningMode ? 'plan' : resolvedAgentTools ? 'agent' : 'chat',
@@ -729,7 +754,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
             const prompt = buildPlanningPrompt(chatPrompt, repoContext, existingPlan);
             appendPromptPreviewLog(session.id, 'plan', prompt);
             await runWithAutoFallback(
-              () => provider.sendPrompt({ ...prompt, enableThinking: requestThinking }),
+              () => provider.sendPrompt({ ...prompt, enableThinking: requestThinking, imageAttachments: requestImageAttachments }),
               'sendPrompt(plan)',
             );
 
@@ -753,6 +778,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
               });
             }
             sessions.setStatus(session.id, 'done');
+            notifyModeComplete('plan');
             await new Promise((r) => setTimeout(r, 1500));
             const conversationId = await runWithAutoFallback(
               () => getConversationIdSafely(provider),
@@ -776,7 +802,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
             });
             appendPromptPreviewLog(session.id, 'chat', prompt);
             await runWithAutoFallback(
-              () => provider.sendPrompt({ ...prompt, enableThinking: requestThinking }),
+              () => provider.sendPrompt({ ...prompt, enableThinking: requestThinking, imageAttachments: requestImageAttachments }),
               'sendPrompt(chat)',
             );
 
@@ -1038,7 +1064,11 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
             const prompt = buildProviderPrompt(chatPrompt, repoContext, toolResults);
             appendPromptPreviewLog(session.id, 'agent', prompt, round + 1);
             await runWithAutoFallback(
-              () => provider.sendPrompt({ ...prompt, enableThinking: requestThinking }),
+              () => provider.sendPrompt({
+                ...prompt,
+                enableThinking: requestThinking,
+                imageAttachments: round === 0 ? requestImageAttachments : undefined,
+              }),
               `sendPrompt(agent round ${round + 1})`,
             );
 
@@ -1309,6 +1339,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
             sessions.update(session.id, { pendingPlan: undefined });
           }
           sessions.setStatus(session.id, 'done');
+          if (!endedByAskUser) {
+            notifyModeComplete('agent');
+          }
           sessions.appendLog(session.id, {
             level: endedByAskUser ? 'info' : 'success',
             source: 'agent',

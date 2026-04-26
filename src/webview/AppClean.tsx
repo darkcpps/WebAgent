@@ -1,6 +1,6 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import type { ExtensionToWebviewMessage, WebviewToExtensionMessage } from '../shared/messages';
-import type { ProviderId, WebviewState } from '../shared/types';
+import type { ImageAttachment, ProviderId, WebviewState } from '../shared/types';
 import { sanitizeResponse } from '../shared/utils';
 
 declare global {
@@ -11,6 +11,9 @@ declare global {
 
 const vscode = window.acquireVsCodeApi();
 const LONG_RESPONSE_THRESHOLD_MS = 5 * 60 * 1000;
+const MAX_IMAGE_ATTACHMENTS = 4;
+const MAX_IMAGE_ATTACHMENT_BYTES = 8 * 1024 * 1024;
+
 
 const defaultModels = [{ id: 'auto', label: 'Auto' }];
 
@@ -53,6 +56,8 @@ export function App(): JSX.Element {
   const [now, setNow] = useState(Date.now());
   const hasPerformedStartupReadyCheck = useRef(false);
   const composerRef = useRef<HTMLTextAreaElement>(null);
+  const imageInputRef = useRef<HTMLInputElement>(null);
+  const [imageAttachments, setImageAttachments] = useState<ImageAttachment[]>([]);
 
   useEffect(() => {
     const handler = (event: MessageEvent<ExtensionToWebviewMessage>) => {
@@ -87,6 +92,12 @@ export function App(): JSX.Element {
     const timeoutId = window.setTimeout(() => setToast(undefined), 4000);
     return () => window.clearTimeout(timeoutId);
   }, [toast]);
+
+  useEffect(() => {
+    if (providerId !== 'chatgpt' && providerId !== 'perplexity') {
+      setImageAttachments([]);
+    }
+  }, [providerId]);
 
   useEffect(() => {
     const timer = window.setInterval(() => setNow(Date.now()), 1000);
@@ -126,6 +137,7 @@ export function App(): JSX.Element {
   const hasExplicitThinkingPreference = Object.prototype.hasOwnProperty.call(thinkingByProvider, providerId);
   const enableThinking = Boolean(thinkingByProvider[providerId]);
   const canSend = message.trim().length > 0 && !isRunning && isLoggedIn;
+  const canAttachImages = providerId === 'chatgpt' || providerId === 'perplexity';
   const debugLogs = activeSession?.logs ?? [];
   const autoApproveEnabled = state.approvalMode === 'auto-apply-safe-edits';
   const modifiedActionTypes = new Set(['edit_file', 'create_file', 'delete_file', 'rename_file']);
@@ -152,6 +164,45 @@ export function App(): JSX.Element {
   const onSetAutoApprove = (enabled: boolean) => vscode.postMessage({ type: 'setApprovalMode', mode: enabled ? 'auto-apply-safe-edits' : 'ask-before-action' });
   const onPreviewChanges = () => activeSession && vscode.postMessage({ type: 'previewSessionChanges', sessionId: activeSession.id });
 
+  const onSelectImages = async (event: React.ChangeEvent<HTMLInputElement>) => {
+    const files = Array.from(event.target.files ?? []);
+    if (files.length === 0) return;
+
+    const newAttachments: ImageAttachment[] = [...imageAttachments];
+    for (const file of files) {
+      if (newAttachments.length >= MAX_IMAGE_ATTACHMENTS) {
+        setToast({ level: 'warning', message: `Maximum ${MAX_IMAGE_ATTACHMENTS} images allowed.` });
+        break;
+      }
+      if (file.size > MAX_IMAGE_ATTACHMENT_BYTES) {
+        setToast({ level: 'warning', message: `Image ${file.name} exceeds 8MB limit.` });
+        continue;
+      }
+
+      const reader = new FileReader();
+      const promise = new Promise<void>((resolve) => {
+        reader.onload = () => {
+          const base64 = (reader.result as string).split(',')[1];
+          newAttachments.push({
+            name: file.name,
+            mimeType: file.type,
+            data: base64,
+          });
+          resolve();
+        };
+      });
+      reader.readAsDataURL(file);
+      await promise;
+    }
+
+    setImageAttachments(newAttachments);
+    if (imageInputRef.current) imageInputRef.current.value = '';
+  };
+
+  const removeImageAttachment = (name: string, index: number) => {
+    setImageAttachments((prev) => prev.filter((a, i) => !(a.name === name && i === index)));
+  };
+
   const sendMessage = (content: string, modelOverride?: string, modeOverride?: 'chat' | 'agent' | 'plan') => {
     if (!content) return;
     const targetSessionId = activeSession?.providerId === providerId ? activeSession.id : undefined;
@@ -164,6 +215,7 @@ export function App(): JSX.Element {
       agentMode: modeOverride === 'agent' ? true : modeOverride === 'plan' ? false : agentMode,
       planningMode: modeOverride === 'plan' ? true : modeOverride === 'agent' ? false : planningMode,
       enableThinking: supportsThinkingControl && hasExplicitThinkingPreference ? enableThinking : undefined,
+      imageAttachments: canAttachImages ? imageAttachments : undefined,
     });
   };
 
@@ -172,6 +224,7 @@ export function App(): JSX.Element {
     if (!content) return;
     sendMessage(content);
     setMessage('');
+    setImageAttachments([]);
   };
   const onImplementPlan = () => {
     if (!activeSession?.pendingPlan || isRunning || !isLoggedIn) return;
@@ -298,7 +351,38 @@ export function App(): JSX.Element {
         </section>
 
         <footer className="chat-composer">
+          {imageAttachments.length > 0 ? (
+            <div className="attachment-tray">
+              {imageAttachments.map((attachment, index) => (
+                <button
+                  key={`${attachment.name}-${index}`}
+                  className="attachment-chip"
+                  title="Remove image"
+                  onClick={() => removeImageAttachment(attachment.name, index)}
+                >
+                  <span>{attachment.name}</span>
+                  <span aria-hidden="true">x</span>
+                </button>
+              ))}
+            </div>
+          ) : null}
           <div className="composer-input-area">
+            <input
+              ref={imageInputRef}
+              type="file"
+              accept="image/*"
+              multiple
+              className="hidden-file-input"
+              onChange={onSelectImages}
+            />
+            <button
+              className="attach-btn"
+              disabled={!canAttachImages || isRunning || !isLoggedIn}
+              title={canAttachImages ? 'Attach image' : 'Images are supported for ChatGPT and Perplexity'}
+              onClick={() => imageInputRef.current?.click()}
+            >
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M21.44 11.05 12 20.49a6 6 0 0 1-8.49-8.49l9.44-9.44a4 4 0 1 1 5.66 5.66l-9.45 9.44a2 2 0 0 1-2.83-2.83l8.49-8.48"></path></svg>
+            </button>
             <textarea ref={composerRef} rows={1} placeholder={composerPlaceholder} value={message} onChange={(event) => { event.target.style.height = 'auto'; event.target.style.height = `${Math.min(event.target.scrollHeight, 200)}px`; setMessage(event.target.value); }} onKeyDown={(event) => { if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); onSend(); event.currentTarget.style.height = 'auto'; } }} />
             <button className="primary send-btn" disabled={!canSend} onClick={onSend}>➤</button>
           </div>

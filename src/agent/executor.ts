@@ -175,24 +175,16 @@ export class ActionExecutor {
             throw new Error('edit_file missing content and old/new replacement strings.');
           }
 
+          if (!action.oldString) {
+            throw new Error('edit_file oldString must not be empty.');
+          }
+
           if (action.oldString === action.newString) {
             throw new Error('edit_file oldString and newString must differ.');
           }
 
-          const occurrenceCount = (current.match(new RegExp(this.escapeRegex(action.oldString), 'g')) || []).length;
-          if (occurrenceCount === 0) {
-            throw new Error(`edit_file target text not found in ${action.path}.`);
-          }
-
-          if (!action.replaceAll && occurrenceCount > 1) {
-            throw new Error(
-              `edit_file matched ${occurrenceCount} occurrences in ${action.path}; set replaceAll=true or provide more specific text.`,
-            );
-          }
-
-          next = action.replaceAll
-            ? current.split(action.oldString).join(action.newString)
-            : current.replace(action.oldString, action.newString);
+          const replacement = this.resolveReplacement(current, action.oldString, action.newString, Boolean(action.replaceAll));
+          next = replacement.next;
         }
 
         await this.diffPreview.showFileReplacement(action.path, current, next);
@@ -299,7 +291,108 @@ export class ActionExecutor {
     void content;
   }
 
-  private escapeRegex(value: string): string {
-    return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  private resolveReplacement(
+    current: string,
+    oldString: string,
+    newString: string,
+    replaceAll: boolean,
+  ): { next: string; target: string; count: number } {
+    const variants = this.buildReplacementVariants(current, oldString, newString);
+    const ambiguousCounts: number[] = [];
+
+    for (const variant of variants) {
+      const count = this.countOccurrences(current, variant.oldString);
+      if (count === 0) {
+        continue;
+      }
+
+      if (!replaceAll && count > 1) {
+        ambiguousCounts.push(count);
+        continue;
+      }
+
+      const next = replaceAll
+        ? current.split(variant.oldString).join(variant.newString)
+        : current.replace(variant.oldString, variant.newString);
+      return { next, target: variant.oldString, count };
+    }
+
+    if (ambiguousCounts.length > 0) {
+      const count = Math.max(...ambiguousCounts);
+      throw new Error(`edit_file matched ${count} occurrences; set replaceAll=true or provide more specific text.`);
+    }
+
+    throw new Error(
+      'edit_file target text not found. Tried exact text plus common provider repairs for escaped newlines, escaped quotes, read_file line prefixes, and CRLF/LF differences.',
+    );
+  }
+
+  private buildReplacementVariants(
+    current: string,
+    oldString: string,
+    newString: string,
+  ): Array<{ oldString: string; newString: string }> {
+    const variants: Array<{ oldString: string; newString: string }> = [];
+    const add = (oldValue: string, newValue: string): void => {
+      if (!oldValue) {
+        return;
+      }
+      if (!variants.some((variant) => variant.oldString === oldValue && variant.newString === newValue)) {
+        variants.push({ oldString: oldValue, newString: newValue });
+      }
+    };
+
+    const basePairs = [
+      { oldValue: oldString, newValue: newString },
+      { oldValue: this.decodeProviderEscapes(oldString), newValue: this.decodeProviderEscapes(newString) },
+      { oldValue: this.stripReadLinePrefixes(oldString), newValue: this.stripReadLinePrefixes(newString) },
+      {
+        oldValue: this.stripReadLinePrefixes(this.decodeProviderEscapes(oldString)),
+        newValue: this.stripReadLinePrefixes(this.decodeProviderEscapes(newString)),
+      },
+    ];
+
+    for (const pair of basePairs) {
+      add(pair.oldValue, pair.newValue);
+      add(this.toLf(pair.oldValue), this.toLf(pair.newValue));
+      if (current.includes('\r\n')) {
+        add(this.toCrlf(pair.oldValue), this.toCrlf(pair.newValue));
+      }
+    }
+
+    return variants;
+  }
+
+  private decodeProviderEscapes(value: string): string {
+    return value
+      .replace(/\\r\\n/g, '\n')
+      .replace(/\\n/g, '\n')
+      .replace(/\\r/g, '\r')
+      .replace(/\\t/g, '\t')
+      .replace(/\\"/g, '"');
+  }
+
+  private stripReadLinePrefixes(value: string): string {
+    const lines = value.split(/\r?\n/);
+    const prefixedCount = lines.filter((line) => /^\s*\d+:\s?/.test(line)).length;
+    if (prefixedCount === 0) {
+      return value;
+    }
+    return lines.map((line) => line.replace(/^\s*\d+:\s?/, '')).join('\n');
+  }
+
+  private toLf(value: string): string {
+    return value.replace(/\r\n/g, '\n');
+  }
+
+  private toCrlf(value: string): string {
+    return this.toLf(value).replace(/\n/g, '\r\n');
+  }
+
+  private countOccurrences(value: string, needle: string): number {
+    if (!needle) {
+      return 0;
+    }
+    return value.split(needle).length - 1;
   }
 }

@@ -9,6 +9,12 @@ export interface ChatModel {
   label: string;
 }
 
+export interface ImageAttachment {
+  name: string;
+  mimeType: string;
+  data: string;
+}
+
 export interface ProviderModelRefreshStatus {
   status: 'idle' | 'loading' | 'success' | 'error';
   message?: string;

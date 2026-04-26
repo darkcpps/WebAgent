@@ -1,4 +1,4 @@
-import type { ChatModel, ProviderId } from '../shared/types';
+import type { ChatModel, ImageAttachment, ProviderId } from '../shared/types';
 
 export interface FileAttachment {
   name: string;
@@ -9,6 +9,7 @@ export interface ProviderPrompt {
   systemPrompt: string;
   userPrompt: string;
   enableThinking?: boolean;
+  imageAttachments?: ImageAttachment[];
 }
 
 export interface ProviderReadiness {

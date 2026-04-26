@@ -3,7 +3,7 @@ import * as os from 'os';
 import * as path from 'path';
 import { chromium, type BrowserContext, type Locator, type Page } from 'playwright';
 import * as vscode from 'vscode';
-import type { ChatModel, ProviderId } from '../shared/types';
+import type { ChatModel, ImageAttachment, ProviderId } from '../shared/types';
 import type { ProviderAdapter, ProviderEvent, ProviderPrompt, ProviderReadiness } from './base';
 import { selectorRegistry, type ProviderSelectorMap } from './selector-registry';
 import { sanitizeResponse } from '../shared/utils';
@@ -22,6 +22,12 @@ type SelectorGroup =
   | 'accountMenu'
   | 'signOut'
   | 'signIn';
+
+interface ComposerAttachmentState {
+  matchedNames: string[];
+  previewCount: number;
+  uploading: boolean;
+}
 
 export abstract class PlaywrightWebProvider implements ProviderAdapter {
   protected context?: BrowserContext;
@@ -347,6 +353,8 @@ export abstract class PlaywrightWebProvider implements ProviderAdapter {
         throw new Error(`Unable to insert prompt text for provider ${this.id}.`);
       }
 
+      await this.uploadImageAttachments(input.imageAttachments ?? []);
+
       // Small pause to let UI react
       await this.page!.waitForTimeout(220);
 
@@ -468,6 +476,212 @@ export abstract class PlaywrightWebProvider implements ProviderAdapter {
   async resetConversation(): Promise<void> {
     await this.startNewConversation();
     this.lastResponse = '';
+  }
+
+  private async uploadImageAttachments(attachments: ImageAttachment[]): Promise<void> {
+    if (attachments.length === 0) {
+      return;
+    }
+    if (this.id !== 'chatgpt' && this.id !== 'perplexity') {
+      throw new Error(`Image attachments are not supported for provider ${this.id}.`);
+    }
+
+    const payloads = attachments.map((attachment) => {
+      const buffer = Buffer.from(attachment.data, 'base64');
+      if (buffer.length === 0) {
+        throw new Error(`Image attachment ${attachment.name || '(unnamed)'} is empty.`);
+      }
+      return {
+        name: attachment.name || 'image.png',
+        mimeType: attachment.mimeType || 'image/png',
+        buffer,
+      };
+    });
+
+    const beforeUpload = await this.readComposerAttachmentState(attachments);
+    const uploaded =
+      (await this.uploadViaFileChooser(payloads, attachments, beforeUpload).catch(() => false)) ||
+      (await this.uploadViaFileInput(payloads, attachments, beforeUpload));
+    if (!uploaded) {
+      throw new Error(`Unable to attach image upload(s) for ${this.id}.`);
+    }
+  }
+
+  private async uploadViaFileChooser(
+    payloads: Array<{ name: string; mimeType: string; buffer: Buffer }>,
+    attachments: ImageAttachment[],
+    beforeUpload: ComposerAttachmentState,
+  ): Promise<boolean> {
+    const chooserPromise = this.page!.waitForEvent('filechooser', { timeout: 1800 }).catch(() => undefined);
+    await this.clickAttachmentControl();
+    const chooser = await chooserPromise;
+    if (!chooser) {
+      return false;
+    }
+    await chooser.setFiles(payloads);
+    return this.waitForImageAttachmentsReady(attachments, beforeUpload);
+  }
+
+  private async uploadViaFileInput(
+    payloads: Array<{ name: string; mimeType: string; buffer: Buffer }>,
+    attachments: ImageAttachment[],
+    beforeUpload: ComposerAttachmentState,
+  ): Promise<boolean> {
+    for (const input of await this.findUploadInputs()) {
+      await input.setInputFiles(payloads).catch(() => undefined);
+      if (await this.waitForImageAttachmentsReady(attachments, beforeUpload, 8000)) {
+        return true;
+      }
+    }
+
+    await this.clickAttachmentControl();
+    await this.page!.waitForTimeout(350);
+    for (const input of await this.findUploadInputs()) {
+      await input.setInputFiles(payloads).catch(() => undefined);
+      if (await this.waitForImageAttachmentsReady(attachments, beforeUpload, 12000)) {
+        return true;
+      }
+    }
+
+    return false;
+  }
+
+  private async findUploadInputs(): Promise<Locator[]> {
+    const selectors =
+      this.id === 'chatgpt'
+        ? [
+            'form input[type="file"][accept*="image"]',
+            'form input[type="file"][accept*="png"]',
+            'form input[type="file"][accept*="jpeg"]',
+            'form input[type="file"][accept*="jpg"]',
+            'main input[type="file"][accept*="image"]',
+            'main input[type="file"]',
+            'input[type="file"][accept*="image"]',
+            'input[type="file"]',
+          ]
+        : [
+            'input[type="file"][accept*="image"]',
+            'input[type="file"][accept*="png"]',
+            'input[type="file"][accept*="jpeg"]',
+            'input[type="file"][accept*="jpg"]',
+            'input[type="file"]',
+          ];
+
+    const inputs: Locator[] = [];
+    const seen = new Set<string>();
+    for (const selector of selectors) {
+      const locator = this.page!.locator(selector);
+      const count = await locator.count().catch(() => 0);
+      for (let index = count - 1; index >= 0; index -= 1) {
+        const input = locator.nth(index);
+        const signature = await input
+          .evaluate((node) => {
+            const htmlInput = node as HTMLInputElement;
+            const fileInputs = Array.from(document.querySelectorAll<HTMLInputElement>('input[type="file"]'));
+            const rect = htmlInput.getBoundingClientRect();
+            return [
+              fileInputs.indexOf(htmlInput),
+              htmlInput.accept,
+              htmlInput.name,
+              htmlInput.id,
+              Math.round(rect.top),
+              Math.round(rect.left),
+            ].join('|');
+          })
+          .catch(() => `${selector}|${index}`);
+        if (!seen.has(signature)) {
+          seen.add(signature);
+          inputs.push(input);
+        }
+      }
+    }
+
+    return inputs;
+  }
+
+  private async clickAttachmentControl(): Promise<void> {
+    const candidates = [
+      'button[aria-label*="Upload image"]',
+      'button[aria-label*="Add photos"]',
+      'button[aria-label*="Add photo"]',
+      'button[aria-label*="Attach files"]',
+      'button[aria-label*="Attach"]',
+      'button[aria-label*="Upload"]',
+      'button[aria-label*="Add"]',
+      'button[data-testid*="attach"]',
+      'button[data-testid*="upload"]',
+      'button[data-testid*="plus"]',
+      'button:has-text("Attach")',
+      'button:has-text("Upload")',
+      'button:has-text("Add photos")',
+      '[data-testid*="attach"]',
+      '[data-testid*="upload"]',
+    ];
+
+    const button = await this.findBottomMostEnabled(candidates, 1800).catch(() => undefined);
+    await button?.click().catch(() => undefined);
+  }
+
+  private async waitForImageAttachmentsReady(
+    attachments: ImageAttachment[],
+    beforeUpload: ComposerAttachmentState,
+    timeoutMs = 20000,
+  ): Promise<boolean> {
+    const deadline = Date.now() + timeoutMs;
+    let stableReadyTicks = 0;
+
+    while (Date.now() < deadline) {
+      const current = await this.readComposerAttachmentState(attachments);
+      const hasNewPreview = current.previewCount > beforeUpload.previewCount;
+      const hasExpectedName = current.matchedNames.length > 0;
+      const uploadStarted = current.uploading || hasNewPreview || hasExpectedName;
+
+      if (uploadStarted && !current.uploading) {
+        stableReadyTicks += 1;
+        if (stableReadyTicks >= 2) {
+          return true;
+        }
+      } else {
+        stableReadyTicks = 0;
+      }
+
+      await this.page!.waitForTimeout(400).catch(() => undefined);
+    }
+
+    return false;
+  }
+
+  private async readComposerAttachmentState(attachments: ImageAttachment[]): Promise<ComposerAttachmentState> {
+    return this.page!
+      .evaluate((attachmentNames) => {
+        const isVisible = (element: Element): boolean => {
+          const style = window.getComputedStyle(element);
+          const rect = element.getBoundingClientRect();
+          return style.visibility !== 'hidden' && style.display !== 'none' && rect.width > 0 && rect.height > 0;
+        };
+
+        const roots = Array.from(document.querySelectorAll<HTMLElement>('form, main, [role="main"]')).filter(isVisible);
+        const root =
+          roots
+            .map((candidate) => ({ candidate, rect: candidate.getBoundingClientRect() }))
+            .filter((item) => item.rect.bottom > 0)
+            .sort((a, b) => b.rect.bottom - a.rect.bottom)[0]?.candidate || document.body;
+
+        const text = (root.innerText || '').toLowerCase();
+        const normalizedNames = attachmentNames.map((name) => name.toLowerCase()).filter(Boolean);
+        const matchedNames = normalizedNames.filter((name) => text.includes(name));
+        const uploading =
+          /uploading|attaching|processing|reading|scanning|preparing/i.test(text) ||
+          Array.from(root.querySelectorAll('[role="progressbar"], progress')).some(isVisible);
+        const previewCount = Array.from(root.querySelectorAll<HTMLImageElement>('img')).filter((image) => {
+          const src = image.currentSrc || image.src || '';
+          const label = `${image.alt || ''} ${image.title || ''}`.toLowerCase();
+          return isVisible(image) && (src.startsWith('blob:') || src.startsWith('data:') || normalizedNames.some((name) => label.includes(name)));
+        }).length;
+
+        return { matchedNames, previewCount, uploading };
+      }, attachments.map((attachment) => attachment.name || ''))
+      .catch(() => ({ matchedNames: [], previewCount: 0, uploading: false }));
   }
 
   protected async ensurePage(headless?: boolean): Promise<void> {
@@ -1362,6 +1576,10 @@ export abstract class PlaywrightWebProvider implements ProviderAdapter {
 
         const nodes = Array.from(document.querySelectorAll<HTMLElement>(selector));
         const banned = /(new chat|more models|settings|sync|login|send|free ai chatbot|agent powered by|powered by glm|chat with z.ai)/i;
+        const hasAgentJsonMarkers = (value: string): boolean => {
+          const normalized = value.replace(/\\"/g, '"');
+          return /"actions"\s*:|"summary"\s*:|```json/i.test(normalized);
+        };
         const candidates = nodes
           .map((node) => {
             const rect = node.getBoundingClientRect();
@@ -1369,7 +1587,7 @@ export abstract class PlaywrightWebProvider implements ProviderAdapter {
             // Ignore if it matches banned text exactly or is a very short fragment of it
             if (banned.test(value.toLowerCase())) return { node, value: '', top: 0, bottom: 0, priority: -1 };
             
-            const priority = /"actions"\s*:|"summary"\s*:|```json/i.test(value) ? 10 : 0;
+            const priority = hasAgentJsonMarkers(value) ? 10 : 0;
             return { node, value, top: rect.top, bottom: rect.bottom, priority };
           })
           .filter((item) => item.value.length >= 2 && item.bottom > 0);

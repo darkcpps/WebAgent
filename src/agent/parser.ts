@@ -24,21 +24,24 @@ export class AgentResponseParser {
   private extractCandidates(input: string): string[] {
     const candidates: string[] = [];
     const trimmed = input.trim();
+    const normalizedInputs = this.buildCandidateTextVariants(trimmed);
 
     // 1. Try to find fenced code blocks
-    const fencedMatches = [...trimmed.matchAll(/```(?:json)?\s*([\s\S]*?)```/gi)];
+    const fencedMatches = normalizedInputs.flatMap((candidate) => [...candidate.matchAll(/```(?:json)?\s*([\s\S]*?)```/gi)]);
     for (const match of fencedMatches) {
       candidates.push(match[1].trim());
     }
 
     // 2. Try to find balanced JSON objects or arrays anywhere in the text.
-    candidates.push(...this.extractBalancedJson(trimmed));
+    for (const candidate of normalizedInputs) {
+      candidates.push(...this.extractBalancedJson(candidate));
+    }
 
     // 3. Fallback to just the trimmed input
-    candidates.push(trimmed);
+    candidates.push(...normalizedInputs);
 
     const repaired = candidates.map((candidate) => this.repairJson(candidate));
-    const uniqueCandidates = [...new Set(repaired)].filter(Boolean);
+    const uniqueCandidates = [...new Set(repaired.flatMap((candidate) => this.buildCandidateTextVariants(candidate)))].filter(Boolean);
     return uniqueCandidates.sort((left, right) => this.rankCandidate(right) - this.rankCandidate(left));
   }
 
@@ -131,7 +134,12 @@ export class AgentResponseParser {
 
     for (const variant of variants) {
       try {
-        return this.normalizeResponseShape(JSON.parse(variant));
+        const parsed = JSON.parse(variant);
+        if (typeof parsed === 'string' && this.looksLikeAgentJson(parsed)) {
+          const nested = this.parseCandidate(parsed);
+          return this.normalizeResponseShape(nested);
+        }
+        return this.normalizeResponseShape(parsed);
       } catch (error) {
         if (error instanceof SyntaxError) {
           lastSyntaxError = error;
@@ -157,14 +165,48 @@ export class AgentResponseParser {
   }
 
   private buildParseVariants(candidate: string): string[] {
-    const variants = [
-      candidate.trim(),
-      this.repairKnownWindowsPathFields(candidate.trim()),
-      this.repairCommonJsonIssues(candidate.trim()),
-      this.repairKnownWindowsPathFields(this.repairCommonJsonIssues(candidate.trim())),
-    ];
+    const variants = this.buildCandidateTextVariants(candidate).flatMap((variant) => [
+      variant.trim(),
+      this.repairKnownWindowsPathFields(variant.trim()),
+      this.repairToolStringFields(variant.trim()),
+      this.repairCommonJsonIssues(variant.trim()),
+      this.repairCommonJsonIssues(this.repairToolStringFields(variant.trim())),
+      this.repairKnownWindowsPathFields(this.repairCommonJsonIssues(variant.trim())),
+      this.repairKnownWindowsPathFields(this.repairCommonJsonIssues(this.repairToolStringFields(variant.trim()))),
+    ]);
 
     return [...new Set(variants)].filter(Boolean);
+  }
+
+  private buildCandidateTextVariants(candidate: string): string[] {
+    const trimmed = candidate.trim();
+    const variants = [
+      candidate.trim(),
+    ];
+
+    const unescaped = this.unescapeLikelyJsonText(trimmed);
+    if (unescaped !== trimmed) {
+      variants.push(unescaped);
+    }
+
+    return [...new Set(variants)].filter(Boolean);
+  }
+
+  private unescapeLikelyJsonText(candidate: string): string {
+    let value = candidate.trim();
+    const unquoted = value.replace(/\\"/g, '"');
+    if (!/\\+"/.test(value) || !/(?:"summary"|"actions")\s*:/.test(unquoted)) {
+      return value;
+    }
+
+    value = value.replace(/^(['"])([\s\S]*)\1$/, '$2');
+    value = value.replace(/\\"/g, '"');
+    return value.replace(/([}\]])['"]$/, '$1');
+  }
+
+  private looksLikeAgentJson(value: string): boolean {
+    const trimmed = value.trim();
+    return /"?actions"?\s*:/.test(trimmed) || /"?summary"?\s*:/.test(trimmed);
   }
 
   private repairCommonJsonIssues(candidate: string): string {
@@ -199,6 +241,38 @@ export class AgentResponseParser {
     });
 
     return repaired.trim();
+  }
+
+  private repairToolStringFields(candidate: string): string {
+    let repaired = candidate;
+
+    repaired = this.repairToolStringField(repaired, 'oldString', ['newString']);
+    repaired = this.repairToolStringField(repaired, 'newString', ['replaceAll', 'summary', 'type']);
+    repaired = this.repairToolStringField(repaired, 'content', ['summary', 'type']);
+    repaired = this.repairToolStringField(repaired, 'result', ['summary', 'type']);
+    repaired = this.repairToolStringField(repaired, 'command', ['summary', 'type']);
+
+    return repaired;
+  }
+
+  private repairToolStringField(candidate: string, field: string, followingKeys: string[]): string {
+    const nextKeyPattern = followingKeys.map((key) => this.escapeRegex(key)).join('|');
+    const pattern = new RegExp(
+      `("${this.escapeRegex(field)}"\\s*:\\s*")([\\s\\S]*?)("\\s*(?:,\\s*"(${nextKeyPattern})"\\s*:|\\}))`,
+      'g',
+    );
+
+    return candidate.replace(pattern, (_whole, prefix: string, rawValue: string, suffix: string) => {
+      return `${prefix}${this.escapeJsonStringContent(rawValue)}${suffix}`;
+    });
+  }
+
+  private escapeJsonStringContent(value: string): string {
+    return JSON.stringify(value).slice(1, -1);
+  }
+
+  private escapeRegex(value: string): string {
+    return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   }
 
   private normalizeResponseShape(value: unknown): unknown {

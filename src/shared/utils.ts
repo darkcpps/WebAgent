@@ -116,6 +116,10 @@ export function sanitizeResponse(text: string, options: SanitizeResponseOptions 
     if (readable) {
       return readable;
     }
+    const malformedReadable = tryExtractReadableFromMalformedAgentJson(final);
+    if (malformedReadable) {
+      return malformedReadable;
+    }
   }
 
   return final;
@@ -127,7 +131,7 @@ export function sanitizeResponse(text: string, options: SanitizeResponseOptions 
  */
 function tryExtractReadableFromAgentJson(text: string): string | undefined {
   // Quick heuristic: only try if it looks like it contains "summary" and "actions"
-  if (!/"summary"\s*:/.test(text) || !/"actions"\s*:/.test(text)) {
+  if (!hasAgentJsonMarkers(text)) {
     return undefined;
   }
 
@@ -139,9 +143,11 @@ function tryExtractReadableFromAgentJson(text: string): string | undefined {
   }
 
   jsonStr = jsonStr.replace(/^`{2,3}(?:json)?\s*/i, '').replace(/`{2,3}\s*$/i, '').trim();
+  jsonStr = unescapeLikelyJsonText(jsonStr);
 
   try {
-    const parsed = JSON.parse(jsonStr);
+    const parsedRaw = JSON.parse(jsonStr);
+    const parsed = typeof parsedRaw === 'string' && hasAgentJsonMarkers(parsedRaw) ? JSON.parse(unescapeLikelyJsonText(parsedRaw)) : parsedRaw;
     if (typeof parsed !== 'object' || !parsed) {
       return undefined;
     }
@@ -177,6 +183,20 @@ function tryExtractReadableFromAgentJson(text: string): string | undefined {
   return undefined;
 }
 
+function tryExtractReadableFromMalformedAgentJson(text: string): string | undefined {
+  const normalized = unescapeLikelyJsonText(text.trim());
+  if (!hasAgentJsonMarkers(normalized)) {
+    return undefined;
+  }
+
+  const summary = normalized.match(/"summary"\s*:\s*"([\s\S]*?)"\s*,\s*"actions"\s*:/)?.[1];
+  if (summary?.trim()) {
+    return summary.replace(/\\"/g, '"').replace(/\\n/g, '\n').trim();
+  }
+
+  return 'ChatGPT returned agent tool JSON instead of a chat answer. Send the request with Agent Mode enabled or prefix it with /agent.';
+}
+
 function stripAgentProtocolJson(input: string): string {
   let output = input;
   const extractedFromWhole = tryExtractReadableFromAgentJson(output);
@@ -208,8 +228,8 @@ function stripAgentProtocolJson(input: string): string {
 }
 
 function isAgentProtocolJson(text: string): boolean {
-  const candidate = text.trim();
-  if (!candidate || !/"actions"\s*:/.test(candidate)) {
+  const candidate = unescapeLikelyJsonText(text.trim());
+  if (!candidate || !hasAgentJsonMarkers(candidate)) {
     return false;
   }
 
@@ -222,17 +242,19 @@ function isAgentProtocolJson(text: string): boolean {
 }
 
 function extractJsonCandidate(input: string): string | undefined {
-  const fencedMatches = [...input.matchAll(/`{2,3}(?:json)?\s*([\s\S]*?)`{2,3}/gi)]
+  const inputs = buildJsonTextVariants(input);
+  const fencedMatches = inputs.flatMap((value) => [...value.matchAll(/`{2,3}(?:json)?\s*([\s\S]*?)`{2,3}/gi)])
     .map((match) => match[1]?.trim() || '')
     .filter(Boolean);
 
   for (const candidate of fencedMatches) {
-    if (/"actions"\s*:/.test(candidate) || /"summary"\s*:/.test(candidate)) {
-      return candidate;
+    const normalized = unescapeLikelyJsonText(candidate);
+    if (hasAgentJsonMarkers(normalized)) {
+      return normalized;
     }
   }
 
-  const balanced = extractBalancedJsonSegments(input);
+  const balanced = inputs.flatMap((value) => extractBalancedJsonSegments(value));
   if (balanced.length === 0) {
     return undefined;
   }
@@ -243,6 +265,29 @@ function extractJsonCandidate(input: string): string | undefined {
     return undefined;
   }
   return best.trim();
+}
+
+function buildJsonTextVariants(input: string): string[] {
+  const trimmed = input.trim();
+  const unescaped = unescapeLikelyJsonText(trimmed);
+  return [...new Set([trimmed, unescaped])].filter(Boolean);
+}
+
+function unescapeLikelyJsonText(input: string): string {
+  let value = input.trim();
+  const unquoted = value.replace(/\\"/g, '"');
+  if (!/\\+"/.test(value) || !/(?:"summary"|"actions")\s*:/.test(unquoted)) {
+    return value;
+  }
+
+  value = value.replace(/^(['"])([\s\S]*)\1$/, '$2');
+  value = value.replace(/\\"/g, '"');
+  return value.replace(/([}\]])['"]$/, '$1');
+}
+
+function hasAgentJsonMarkers(input: string): boolean {
+  const normalized = unescapeLikelyJsonText(input);
+  return /"summary"\s*:/.test(normalized) && /"actions"\s*:/.test(normalized);
 }
 
 function extractBalancedJsonSegments(input: string): string[] {
