@@ -7,6 +7,7 @@ import { ProviderRegistry } from './providers/registry';
 import { ApprovalManager } from './safety/approvalManager';
 import { SafetyPolicy } from './safety/policy';
 import { DiffPreviewService } from './services/diffPreviewService';
+import { McpManager } from './services/mcpManager';
 import { WebAgentPanel } from './services/webviewPanel';
 import { sanitizeResponse } from './shared/utils';
 import type { ApprovalMode, ChatMessage, ProviderId, SessionState } from './shared/types';
@@ -14,6 +15,7 @@ import type { ProviderAdapter, ProviderPrompt } from './providers/base';
 import { SessionStore } from './storage/sessionStore';
 import { TerminalRunner } from './terminal/runner';
 import { ActivityTreeProvider } from './ui/tree/activityTreeProvider';
+import { McpTreeProvider } from './ui/tree/mcpTreeProvider';
 import { SessionTreeProvider } from './ui/tree/sessionTreeProvider';
 import { WorkspaceContextService } from './workspace/context';
 import { WorkspaceFilesService } from './workspace/files';
@@ -30,11 +32,15 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   const safety = new SafetyPolicy(configuration);
   const diffPreview = new DiffPreviewService();
   const terminal = new TerminalRunner();
+  const mcp = new McpManager(context);
+  const mcpOutput = vscode.window.createOutputChannel('WebAgent MCP');
   const workspaceContext = new WorkspaceContextService(files);
-  const executor = new ActionExecutor(files, git, safety, approvals, sessions, diffPreview, terminal);
+  const executor = new ActionExecutor(files, git, safety, approvals, sessions, diffPreview, terminal, mcp);
   const orchestrator = new AgentOrchestrator(providers, workspaceContext, executor, sessions);
   const parser = new AgentResponseParser();
   const providerReady: Record<ProviderId, boolean> = { chatgpt: false, gemini: false, perplexity: false };
+
+  context.subscriptions.push(mcp, mcpOutput);
 
   const collectProviderText = async (sessionId: string, providerId: ProviderId, onDelta?: (text: string) => void): Promise<string> => {
     const provider = providers.get(providerId, { sessionId });
@@ -248,11 +254,15 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 
         const repoContext = await workspaceContext.build(contextTask);
         const toolResults: string[] = [];
+        const initialMcpContext = await executor.getMcpToolPromptContext();
+        if (initialMcpContext) {
+          toolResults.push(initialMcpContext);
+        }
         const compact = (value: string, limit = 180): string => {
           const normalized = value.replace(/\s+/g, ' ').trim();
           return normalized.length <= limit ? normalized : `${normalized.slice(0, limit)}...`;
         };
-        const describeAction = (action: { type: string; path?: string; query?: string; command?: string; fromPath?: string; toPath?: string }): string => {
+        const describeAction = (action: { type: string; path?: string; query?: string; command?: string; fromPath?: string; toPath?: string; server?: string; tool?: string }): string => {
           switch (action.type) {
             case 'read_file':
               return `Reading ${action.path ?? 'file'}`;
@@ -272,6 +282,12 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
               return `Running ${compact(action.command ?? '', 80)}`;
             case 'get_git_diff':
               return 'Reading git diff';
+            case 'list_mcp_tools':
+              return 'Listing MCP tools';
+            case 'resolve_mcp_intent':
+              return `Resolving MCP intent${action.server ? ` on ${action.server}` : ''}`;
+            case 'call_mcp_tool':
+              return `Calling MCP ${action.server ?? 'server'}.${action.tool ?? 'tool'}`;
             case 'ask_user':
               return 'Asking for input';
             case 'finish':
@@ -364,6 +380,11 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       const active = sessions.getActive();
       if (active) sessions.setProviderSessionId(active.id, conversationId);
     },
+    openMcpServersView: async () => {
+      mcpTree.refresh();
+      await vscode.commands.executeCommand('workbench.view.extension.webagentCode');
+      await vscode.commands.executeCommand('webagentCode.mcp.focus');
+    },
     approve: async (_sessionId: string, actionId: string) => approvals.approve(actionId),
     reject: async (_sessionId: string, actionId: string) => approvals.reject(actionId),
     setActiveSession: (sessionId: string) => sessions.setActive(sessionId),
@@ -379,11 +400,13 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 
   const sessionTree = new SessionTreeProvider(sessions);
   const activityTree = new ActivityTreeProvider(sessions);
+  const mcpTree = new McpTreeProvider(mcp);
   const panel = new WebAgentPanel(context.extensionUri, sessions, providers, () => configuration.get<ApprovalMode>('approvalMode', 'ask-before-action'), panelCallbacks);
 
   context.subscriptions.push(
     vscode.window.registerTreeDataProvider('webagentCode.sessions', sessionTree),
     vscode.window.registerTreeDataProvider('webagentCode.activity', activityTree),
+    vscode.window.registerTreeDataProvider('webagentCode.mcp', mcpTree),
     vscode.commands.registerCommand('webagentCode.open', () => panel.show()),
     vscode.commands.registerCommand('webagentCode.startTask', async () => {
       const providerId = await vscode.window.showQuickPick(providers.list(), { title: 'Choose provider' }) as ProviderId | undefined;
@@ -402,6 +425,35 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     vscode.commands.registerCommand('webagentCode.resetConversation', async () => {
       const active = sessions.getActive();
       if (active) await panelCallbacks.resetConversation(active.providerId);
+    }),
+    vscode.commands.registerCommand('webagentCode.listMcpTools', async () => {
+      try {
+        const tools = await mcp.listTools();
+        mcpOutput.clear();
+        mcpOutput.appendLine(`Discovered ${tools.length} MCP tool${tools.length === 1 ? '' : 's'}.`);
+        for (const tool of tools) {
+          mcpOutput.appendLine('');
+          mcpOutput.appendLine(`${tool.server}.${tool.name}`);
+          if (tool.description) {
+            mcpOutput.appendLine(tool.description);
+          }
+          if (tool.inputSchema) {
+            mcpOutput.appendLine(JSON.stringify(tool.inputSchema, null, 2));
+          }
+        }
+        mcpOutput.show(true);
+        await vscode.window.showInformationMessage(`WebAgent Code discovered ${tools.length} MCP tool${tools.length === 1 ? '' : 's'}.`);
+      } catch (error) {
+        const message = (error as Error).message;
+        mcpOutput.clear();
+        mcpOutput.appendLine(message);
+        mcpOutput.show(true);
+        await vscode.window.showErrorMessage(`WebAgent Code MCP discovery failed: ${message}`);
+      }
+    }),
+    vscode.commands.registerCommand('webagentCode.refreshMcpServers', async () => {
+      mcpTree.refresh();
+      await vscode.window.showInformationMessage('WebAgent Code MCP status refreshed.');
     }),
     vscode.commands.registerCommand('webagentCode.approvePendingAction', async () => {
       const active = sessions.getActive();

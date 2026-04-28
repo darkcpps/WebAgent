@@ -78,6 +78,13 @@ export class SafetyPolicy {
       };
     }
 
+    if (action.type === 'call_mcp_tool') {
+      return {
+        allowed: true,
+        requiresApproval: this.approvalMode !== 'auto-apply-safe-edits',
+      };
+    }
+
     if (action.type === 'edit_file' || action.type === 'create_file') {
       return {
         allowed: true,
@@ -101,7 +108,7 @@ export class SafetyPolicy {
   }
 
   private isReadOnlyAction(action: AgentAction): boolean {
-    return ['list_files', 'read_file', 'search_files', 'get_git_diff', 'ask_user', 'finish'].includes(action.type);
+    return ['list_files', 'read_file', 'search_files', 'get_git_diff', 'list_mcp_tools', 'resolve_mcp_intent', 'ask_user', 'finish'].includes(action.type);
   }
 
   private getRiskyPath(action: AgentAction): string | undefined {

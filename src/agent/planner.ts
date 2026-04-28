@@ -1,7 +1,8 @@
 import type { RepoContext } from '../workspace/context';
 
-const TOOL_RESULT_MAX_CHARS = 12000;
+const TOOL_RESULT_MAX_CHARS = 24000;
 const TOOL_RESULT_ITEM_MAX_CHARS = 3000;
+const MCP_TOOL_RESULT_ITEM_MAX_CHARS = 9000;
 
 export function buildProviderPrompt(task: string, context: RepoContext, toolResults: string[] = []): { systemPrompt: string; userPrompt: string } {
   const systemPrompt = [
@@ -56,6 +57,9 @@ export function buildProviderPrompt(task: string, context: RepoContext, toolResu
     '2. You can perform multiple actions in one turn if they are independent.',
     '3. For sequential actions (e.g., read then edit), wait for the tool result of the first action before emitting the second.',
     '4. You do not directly access the user filesystem from the model runtime. You access the repository only by emitting JSON tool actions such as `list_files`, `search_files`, and `read_file`; the IDE will run them and return results.',
+    '4a. You can use configured MCP servers only by emitting `list_mcp_tools` and `call_mcp_tool`; the IDE will discover and execute those MCP calls locally.',
+    '4b. For MCP work, prefer `resolve_mcp_intent` over direct `call_mcp_tool`. Describe the intended MCP operation and include known arguments; the IDE will rank tools, fetch schemas, validate arguments, and return an exact next action when ready.',
+    '4c. MCP calls are preflight-validated against their inputSchema before execution. If validation fails, do not repeat the same call. Fix the exact fields named in the validation errors.',
     '5. Never claim that repository files are unavailable, missing from your runtime, or inaccessible until you have first emitted `list_files` or `search_files` and received tool results proving that.',
     '6. If you need files, ask the IDE for them with JSON tool calls. Do not describe a lack of access in prose or finish early.',
     '7. Never hallucinate file paths. Use `list_files` or `search_files` if you are unsure.',
@@ -83,6 +87,9 @@ export function buildProviderPrompt(task: string, context: RepoContext, toolResu
     '- rename_file: {"type":"rename_file", "fromPath": "old.ts", "toPath": "new.ts"} - Rename/move a file.',
     '- run_command: {"type":"run_command", "command": "npm test"} - Execute shell commands.',
     '- get_git_diff: {"type":"get_git_diff"} - Inspect the current workspace diff after edits.',
+    '- list_mcp_tools: {"type":"list_mcp_tools", "server": "optionalServerName", "tool": "optionalToolName"} - List MCP tools. With no server, returns the complete compact catalog. With server only, returns that server catalog. With server and tool, returns that exact tool input schema.',
+    '- resolve_mcp_intent: {"type":"resolve_mcp_intent", "server": "optionalServerName", "intent": "high-level MCP operation", "knownArguments": {"key": "value"}} - Deterministically resolve a MCP intent to the best tool, validate known arguments, and return an exact call_mcp_tool nextAction when ready. Prefer this for MCP work.',
+    '- call_mcp_tool: {"type":"call_mcp_tool", "server": "serverName", "tool": "toolName", "arguments": {"key": "value"}} - Call a configured MCP tool. Use arguments matching the schema returned by list_mcp_tools. MCP tool calls may require user approval.',
     '- ask_user: {"type":"ask_user", "question": "..."} - Ask the user for clarification.',
     '- finish: {"type":"finish", "result": "summary of work done"} - Finalize the task.',
     '',
@@ -118,6 +125,9 @@ export function buildProviderPrompt(task: string, context: RepoContext, toolResu
     '- For bug fixes, localize the root cause before editing. Use errors, code reads, searches, tests, and command output as evidence.',
     '- Verify with the most relevant command or manual check before finishing, when the repository supports it.',
     '- If you changed code, inspect the resulting diff before `finish` when possible.',
+    '- If the task needs MCP, use `resolve_mcp_intent` first with the high-level intent and any known arguments. If it returns `status: "ready"`, emit its `nextAction` exactly. If it returns `needs_more_info`, fix/provide only the listed fields.',
+    '- If a MCP call returns "was not sent because arguments do not match", repair only the listed fields and retry with the same exact server/tool unless the error says the tool does not exist.',
+    '- For Roblox MCP tasks, prefer `resolve_mcp_intent` with `server:"Roblox_Studio"` when that server appears in MCP_TOOL_CATALOG.',
     '',
     `Workspace summary:\n${context.summary}`,
     '',
@@ -131,25 +141,35 @@ export function buildProviderPrompt(task: string, context: RepoContext, toolResu
 }
 
 function compactToolResults(toolResults: string[]): string[] {
-  const compacted: string[] = [];
+  const compactedResults: string[] = [];
   let remainingBudget = TOOL_RESULT_MAX_CHARS;
+  const latestMcpCatalog = [...toolResults].reverse().find((result) => result.startsWith('MCP_TOOL_CATALOG:'));
 
   for (const result of [...toolResults].reverse()) {
+    if (result.startsWith('MCP_TOOL_CATALOG:')) {
+      continue;
+    }
+
     if (remainingBudget <= 0) {
       break;
     }
 
-    const maxForItem = Math.min(TOOL_RESULT_ITEM_MAX_CHARS, remainingBudget);
+    const itemBudget = result.startsWith('list_mcp_tools:') || result.startsWith('call_mcp_tool:')
+      ? MCP_TOOL_RESULT_ITEM_MAX_CHARS
+      : TOOL_RESULT_ITEM_MAX_CHARS;
+    const maxForItem = Math.min(itemBudget, remainingBudget);
     const text = result.length > maxForItem
       ? `${result.slice(0, maxForItem)}\n...[tool result truncated for prompt budget]`
       : result;
 
-    compacted.unshift(text);
+    compactedResults.unshift(text);
     remainingBudget -= text.length;
   }
 
-  if (compacted.length < toolResults.length) {
-    compacted.unshift(`[${toolResults.length - compacted.length} older tool result(s) omitted for prompt budget]`);
+  const compacted = latestMcpCatalog ? [latestMcpCatalog, ...compactedResults] : compactedResults;
+  const nonCatalogResultCount = toolResults.filter((result) => !result.startsWith('MCP_TOOL_CATALOG:')).length;
+  if (compactedResults.length < nonCatalogResultCount) {
+    compacted.splice(latestMcpCatalog ? 1 : 0, 0, `[${nonCatalogResultCount - compactedResults.length} older tool result(s) omitted for prompt budget]`);
   }
 
   return compacted;

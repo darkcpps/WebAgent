@@ -31,6 +31,10 @@ export class AgentOrchestrator {
 
       const context = await this.contextService.build(task);
       const toolResults: string[] = [];
+      const initialMcpContext = await this.executor.getMcpToolPromptContext();
+      if (initialMcpContext) {
+        toolResults.push(initialMcpContext);
+      }
 
       for (let round = 0; round < 25; round += 1) {
         if (this.stops.has(sessionId)) {

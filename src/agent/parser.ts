@@ -396,6 +396,80 @@ export class AgentResponseParser {
       }
     }
 
+    if (normalizedType === 'call_mcp_tool') {
+      if (typeof result.server !== 'string' && typeof action.mcpServer === 'string') {
+        result.server = action.mcpServer;
+      }
+      if (typeof result.tool !== 'string') {
+        const toolName = action.toolName ?? action.name;
+        if (typeof toolName === 'string') {
+          result.tool = toolName;
+        }
+      }
+      
+      let args = action.arguments ?? action.args ?? action.input ?? action.parameters;
+      if (typeof args === 'string') {
+        try {
+          args = JSON.parse(args);
+        } catch (e) {
+          // Leave it as string, let Zod catch it if it's invalid
+        }
+      }
+      
+      if (args && typeof args === 'object' && !Array.isArray(args)) {
+        result.arguments = args;
+      } else if (!('arguments' in result)) {
+        const knownKeys = new Set(['type', 'tool', 'name', 'toolName', 'server', 'mcpServer', 'timeoutMs', 'summary', 'arguments', 'args', 'input', 'parameters']);
+        const extras: Record<string, unknown> = {};
+        let hasExtras = false;
+        for (const [key, value] of Object.entries(action)) {
+          if (!knownKeys.has(key)) {
+            extras[key] = value;
+            hasExtras = true;
+          }
+        }
+        if (hasExtras) {
+          result.arguments = extras;
+        }
+      }
+    }
+
+    if (normalizedType === 'list_mcp_tools') {
+      if (typeof result.server !== 'string' && typeof action.mcpServer === 'string') {
+        result.server = action.mcpServer;
+      }
+      if (typeof result.tool !== 'string') {
+        const toolName = action.toolName ?? action.name;
+        if (typeof toolName === 'string') {
+          result.tool = toolName;
+        }
+      }
+    }
+
+    if (normalizedType === 'resolve_mcp_intent') {
+      if (typeof result.server !== 'string' && typeof action.mcpServer === 'string') {
+        result.server = action.mcpServer;
+      }
+      if (typeof result.intent !== 'string') {
+        const intent = action.query ?? action.request ?? action.goal ?? action.description;
+        if (typeof intent === 'string') {
+          result.intent = intent;
+        }
+      }
+
+      let knownArguments = action.knownArguments ?? action.arguments ?? action.args ?? action.input ?? action.parameters;
+      if (typeof knownArguments === 'string') {
+        try {
+          knownArguments = JSON.parse(knownArguments);
+        } catch {
+          // Leave it as string, let Zod catch it if invalid.
+        }
+      }
+      if (knownArguments && typeof knownArguments === 'object' && !Array.isArray(knownArguments)) {
+        result.knownArguments = knownArguments;
+      }
+    }
+
     return result;
   }
 
@@ -431,6 +505,19 @@ export class AgentResponseParser {
       terminal: 'run_command',
       git_diff: 'get_git_diff',
       get_git_diff: 'get_git_diff',
+      mcp_tools: 'list_mcp_tools',
+      list_mcp_tools: 'list_mcp_tools',
+      listmcptools: 'list_mcp_tools',
+      call_mcp: 'call_mcp_tool',
+      call_mcp_tool: 'call_mcp_tool',
+      callmcptool: 'call_mcp_tool',
+      mcp_call: 'call_mcp_tool',
+      mcp_tool: 'call_mcp_tool',
+      resolve_mcp: 'resolve_mcp_intent',
+      resolve_mcp_intent: 'resolve_mcp_intent',
+      mcp_intent: 'resolve_mcp_intent',
+      choose_mcp_tool: 'resolve_mcp_intent',
+      route_mcp_tool: 'resolve_mcp_intent',
       ask: 'ask_user',
       ask_user: 'ask_user',
       question: 'ask_user',

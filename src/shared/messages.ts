@@ -32,6 +32,7 @@ export type WebviewToExtensionMessage =
   | { type: 'checkProviderReady'; providerId: ProviderId; silent?: boolean }
   | { type: 'refreshProviderModels'; providerId: ProviderId }
   | { type: 'resetConversation'; providerId: ProviderId }
+  | { type: 'openMcpServersView' }
   | { type: 'approve'; sessionId: string; actionId: string }
   | { type: 'reject'; sessionId: string; actionId: string }
   | { type: 'setActiveSession'; sessionId: string }

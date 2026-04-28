@@ -35,6 +35,7 @@ interface PanelCallbacks {
   checkProviderReady(providerId: ProviderId): Promise<ProviderReadiness>;
   refreshProviderModels(providerId: ProviderId): Promise<number>;
   resetConversation(providerId: ProviderId): Promise<void>;
+  openMcpServersView(): Promise<void>;
   approve(sessionId: string, actionId: string): Promise<void>;
   reject(sessionId: string, actionId: string): Promise<void>;
   setActiveSession(sessionId: string): void;
@@ -185,6 +186,10 @@ export class WebAgentPanel {
         case 'resetConversation':
           await this.callbacks.resetConversation(message.providerId);
           await this.postToast('info', `Reset conversation for ${message.providerId}.`);
+          return;
+        case 'openMcpServersView':
+          await this.callbacks.openMcpServersView();
+          await this.postToast('info', 'Opened MCP Servers view.');
           return;
         case 'approve':
           await this.callbacks.approve(message.sessionId, message.actionId);

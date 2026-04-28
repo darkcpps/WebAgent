@@ -160,6 +160,13 @@ textarea::placeholder { color: #525964; }
 
 .auth-btn { width: 100%; padding: 8px; }
 
+.mcp-view-btn {
+  margin-top: 8px;
+  background: var(--glass-bg);
+  border: 1px solid var(--glass-border);
+  color: var(--text-primary);
+}
+
 .model-browser-note {
   font-size: 12px;
   line-height: 1.4;

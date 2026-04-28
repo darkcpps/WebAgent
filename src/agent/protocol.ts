@@ -57,6 +57,27 @@ export const gitDiffActionSchema = baseAction.extend({
   type: z.literal('get_git_diff'),
 });
 
+export const listMcpToolsActionSchema = baseAction.extend({
+  type: z.literal('list_mcp_tools'),
+  server: z.string().optional(),
+  tool: z.string().optional(),
+});
+
+export const callMcpToolActionSchema = baseAction.extend({
+  type: z.literal('call_mcp_tool'),
+  server: z.string().min(1).optional(),
+  tool: z.string().min(1),
+  arguments: z.record(z.unknown()).optional(),
+  timeoutMs: z.number().int().positive().max(300000).optional(),
+});
+
+export const resolveMcpIntentActionSchema = baseAction.extend({
+  type: z.literal('resolve_mcp_intent'),
+  server: z.string().min(1).optional(),
+  intent: z.string().min(1),
+  knownArguments: z.record(z.unknown()).optional(),
+});
+
 export const askUserActionSchema = baseAction.extend({
   type: z.literal('ask_user'),
   question: z.string().min(1),
@@ -77,6 +98,9 @@ export const agentActionSchema = z.discriminatedUnion('type', [
   renameFileActionSchema,
   runCommandActionSchema,
   gitDiffActionSchema,
+  listMcpToolsActionSchema,
+  callMcpToolActionSchema,
+  resolveMcpIntentActionSchema,
   askUserActionSchema,
   finishActionSchema,
 ]);

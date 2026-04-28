@@ -16,7 +16,8 @@
     "onStartupFinished",
     "onCommand:webagentCode.open",
     "onView:webagentCode.sessions",
-    "onView:webagentCode.activity"
+    "onView:webagentCode.activity",
+    "onView:webagentCode.mcp"
   ],
   "main": "./dist/extension.js",
   "contributes": {
@@ -40,6 +41,14 @@
       {
         "command": "webagentCode.resetConversation",
         "title": "WebAgent Code: Reset Provider Conversation"
+      },
+      {
+        "command": "webagentCode.listMcpTools",
+        "title": "WebAgent Code: List MCP Tools"
+      },
+      {
+        "command": "webagentCode.refreshMcpServers",
+        "title": "WebAgent Code: Refresh MCP Servers"
       },
       {
         "command": "webagentCode.approvePendingAction",
@@ -68,10 +77,21 @@
         {
           "id": "webagentCode.activity",
           "name": "Activity"
+        },
+        {
+          "id": "webagentCode.mcp",
+          "name": "MCP Servers"
         }
       ]
     },
     "menus": {
+      "view/title": [
+        {
+          "command": "webagentCode.refreshMcpServers",
+          "when": "view == webagentCode.mcp",
+          "group": "navigation"
+        }
+      ],
       "view/item/context": [
         {
           "command": "webagentCode.approvePendingAction",
@@ -119,6 +139,16 @@
           ],
           "default": "auto",
           "description": "Browser channel used for managed Playwright sessions. Auto prefers Chrome/Edge for providers with strict sign-in checks, then falls back to bundled Chromium."
+        },
+        "webagentCode.mcp.enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Enable MCP tool discovery and execution for Agent Mode."
+        },
+        "webagentCode.mcp.servers": {
+          "type": "object",
+          "default": {},
+          "description": "Additional MCP stdio servers. Shape: { \"name\": { \"command\": \"node\", \"args\": [\"server.js\"], \"env\": {}, \"cwd\": \"optional\" } }. Codex ~/.codex/config.toml MCP servers are also loaded when enabled."
         }
       }
     }

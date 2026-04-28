@@ -267,6 +267,7 @@ export function App(): JSX.Element {
           <div className="button-row">
             {isLoggedIn ? <button className="auth-btn sign-out" onClick={() => vscode.postMessage({ type: 'logoutProvider', providerId })}>Sign Out</button> : <button className="auth-btn sign-in primary" onClick={() => vscode.postMessage({ type: 'loginProvider', providerId })}>Connect Provider</button>}
           </div>
+          <button className="auth-btn mcp-view-btn" onClick={() => vscode.postMessage({ type: 'openMcpServersView' })}>MCP Servers</button>
         </div>
 
         <div className="session-list">
