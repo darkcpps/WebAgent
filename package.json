@@ -51,6 +51,16 @@
         "title": "WebAgent Code: Refresh MCP Servers"
       },
       {
+        "command": "webagentCode.disableMcpServer",
+        "title": "WebAgent Code: Disable MCP Server",
+        "icon": "$(circle-slash)"
+      },
+      {
+        "command": "webagentCode.enableMcpServer",
+        "title": "WebAgent Code: Enable MCP Server",
+        "icon": "$(check)"
+      },
+      {
         "command": "webagentCode.approvePendingAction",
         "title": "WebAgent Code: Approve Pending Action"
       },
@@ -93,6 +103,16 @@
         }
       ],
       "view/item/context": [
+        {
+          "command": "webagentCode.disableMcpServer",
+          "when": "view == webagentCode.mcp && viewItem == mcpServerEnabled",
+          "group": "inline"
+        },
+        {
+          "command": "webagentCode.enableMcpServer",
+          "when": "view == webagentCode.mcp && viewItem == mcpServerDisabled",
+          "group": "inline"
+        },
         {
           "command": "webagentCode.approvePendingAction",
           "when": "view == webagentCode.activity && viewItem == pendingAction",
@@ -149,6 +169,15 @@
           "type": "object",
           "default": {},
           "description": "Additional MCP stdio servers. Shape: { \"name\": { \"command\": \"node\", \"args\": [\"server.js\"], \"env\": {}, \"cwd\": \"optional\" } }. Codex ~/.codex/config.toml MCP servers are also loaded when enabled."
+        },
+        "webagentCode.mcp.disabledServers": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "uniqueItems": true,
+          "description": "MCP server names to hide from Agent Mode prompts and prevent from being called."
         }
       }
     }

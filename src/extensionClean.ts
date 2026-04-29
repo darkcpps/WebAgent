@@ -402,11 +402,27 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   const activityTree = new ActivityTreeProvider(sessions);
   const mcpTree = new McpTreeProvider(mcp);
   const panel = new WebAgentPanel(context.extensionUri, sessions, providers, () => configuration.get<ApprovalMode>('approvalMode', 'ask-before-action'), panelCallbacks);
+  const getMcpServerNameFromCommand = async (node: unknown): Promise<string | undefined> => {
+    const name = typeof (node as { status?: { name?: unknown } } | undefined)?.status?.name === 'string'
+      ? (node as { status: { name: string } }).status.name
+      : undefined;
+    if (name) {
+      return name;
+    }
+
+    const configs = await mcp.getAllServerConfigs();
+    return await vscode.window.showQuickPick(Object.keys(configs).sort(), { title: 'Choose MCP server' });
+  };
 
   context.subscriptions.push(
     vscode.window.registerTreeDataProvider('webagentCode.sessions', sessionTree),
     vscode.window.registerTreeDataProvider('webagentCode.activity', activityTree),
     vscode.window.registerTreeDataProvider('webagentCode.mcp', mcpTree),
+    vscode.workspace.onDidChangeConfiguration((event) => {
+      if (event.affectsConfiguration('webagentCode.mcp')) {
+        mcpTree.refresh();
+      }
+    }),
     vscode.commands.registerCommand('webagentCode.open', () => panel.show()),
     vscode.commands.registerCommand('webagentCode.startTask', async () => {
       const providerId = await vscode.window.showQuickPick(providers.list(), { title: 'Choose provider' }) as ProviderId | undefined;
@@ -454,6 +470,26 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     vscode.commands.registerCommand('webagentCode.refreshMcpServers', async () => {
       mcpTree.refresh();
       await vscode.window.showInformationMessage('WebAgent Code MCP status refreshed.');
+    }),
+    vscode.commands.registerCommand('webagentCode.disableMcpServer', async (node?: unknown) => {
+      const server = await getMcpServerNameFromCommand(node);
+      if (!server) {
+        return;
+      }
+
+      await mcp.setServerDisabled(server, true);
+      mcpTree.refresh();
+      await vscode.window.showInformationMessage(`Disabled MCP server "${server}". It will be hidden from Agent Mode prompts.`);
+    }),
+    vscode.commands.registerCommand('webagentCode.enableMcpServer', async (node?: unknown) => {
+      const server = await getMcpServerNameFromCommand(node);
+      if (!server) {
+        return;
+      }
+
+      await mcp.setServerDisabled(server, false);
+      mcpTree.refresh();
+      await vscode.window.showInformationMessage(`Enabled MCP server "${server}".`);
     }),
     vscode.commands.registerCommand('webagentCode.approvePendingAction', async () => {
       const active = sessions.getActive();

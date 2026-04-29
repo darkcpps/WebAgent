@@ -38,16 +38,24 @@ export class McpTreeProvider implements vscode.TreeDataProvider<McpTreeNode | vs
     const { status } = element;
     const item = new vscode.TreeItem(
       status.name,
-      status.ok && status.tools.length > 0 ? vscode.TreeItemCollapsibleState.Collapsed : vscode.TreeItemCollapsibleState.None,
+      !status.disabled && status.ok && status.tools.length > 0 ? vscode.TreeItemCollapsibleState.Collapsed : vscode.TreeItemCollapsibleState.None,
     );
-    item.description = status.ok ? `${status.tools.length} tool${status.tools.length === 1 ? '' : 's'}` : 'error';
+    item.description = status.disabled
+      ? 'disabled'
+      : status.ok
+        ? `${status.tools.length} tool${status.tools.length === 1 ? '' : 's'}`
+        : 'error';
     item.tooltip = [
-      status.ok ? 'MCP server is reachable.' : `MCP server failed: ${status.error ?? 'Unknown error.'}`,
+      status.disabled
+        ? 'MCP server is disabled. It will not appear in Agent Mode prompts and cannot be called.'
+        : status.ok
+          ? 'MCP server is reachable.'
+          : `MCP server failed: ${status.error ?? 'Unknown error.'}`,
       `Command: ${[status.command, ...status.args].join(' ')}`,
       status.cwd ? `CWD: ${status.cwd}` : undefined,
     ].filter(Boolean).join('\n');
-    item.iconPath = new vscode.ThemeIcon(status.ok ? 'pass-filled' : 'error');
-    item.contextValue = status.ok ? 'mcpServerReady' : 'mcpServerError';
+    item.iconPath = new vscode.ThemeIcon(status.disabled ? 'circle-slash' : status.ok ? 'pass-filled' : 'error');
+    item.contextValue = status.disabled ? 'mcpServerDisabled' : 'mcpServerEnabled';
     return item;
   }
 
