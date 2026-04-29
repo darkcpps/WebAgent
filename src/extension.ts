@@ -19,11 +19,15 @@ import { GitService } from './workspace/git';
 import type { ApprovalMode, BridgeUiState, ChatMessage, ImageAttachment, ProviderId, SessionState } from './shared/types';
 import type { ProviderAdapter, ProviderPrompt } from './providers/base';
 import { AgentResponseParser } from './agent/parser';
-import { buildPlanningPrompt, buildProviderPrompt } from './agent/planner';
+import { buildCompactAgentPrompt, buildPlanningPrompt } from './agent/planner';
+import { AgentLedger } from './agent/ledger';
+import type { AgentAction } from './agent/protocol';
 import { sanitizeResponse } from './shared/utils';
 
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
   const AUTO_FOLLOW_UP_DELAY_MS = 1750;
+  const KIMI_FOLLOW_UP_DELAY_MS = 500;
+  const AGENT_PROVIDER_CHAT_ROTATION_ROUNDS = 6;
   const configuration = vscode.workspace.getConfiguration('webagentCode');
   const sessions = new SessionStore(context);
   const approvals = new ApprovalManager();
@@ -244,6 +248,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       'You are in Chat/Ask mode inside an IDE conversation.',
       'Respond conversationally and helpfully to the user question.',
       'Use the recent IDE conversation context to answer follow-up questions naturally. Do not repeat the context unless it is relevant.',
+      'Do not proactively debug, diagnose, trace root causes, or suggest step-by-step troubleshooting unless the user explicitly asks to debug, fix, troubleshoot, investigate, diagnose, or shares an error/broken behavior.',
+      'For ordinary questions, answer directly and keep any code reasoning high-level unless deeper analysis is requested.',
       'Do not output tool-action JSON and do not behave as an autonomous agent in this mode.',
       'Explain code changes clearly when asked, and ask clarifying questions if context is missing.',
       options.wasPreviouslyAgentMode
@@ -838,8 +844,22 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
           }
 
 
-          const repoContext = await workspaceContext.build(contextTask);
+          const repoContext = await workspaceContext.build(contextTask, {
+            includeFileContents: false,
+            includeWorkspaceRoot: false,
+          });
           const toolResults: string[] = [];
+          const ledger = new AgentLedger(chatPrompt);
+          const initialMcpContext = await executor.getMcpToolPromptContext();
+          if (initialMcpContext) {
+            ledger.recordInitialContext(initialMcpContext);
+            toolResults.push(initialMcpContext);
+          }
+          sessions.appendLog(session.id, {
+            level: 'info',
+            source: 'agent',
+            message: `Compact agent context enabled. Agent mode keeps the current provider chat for the first round, then starts a fresh provider chat every ${AGENT_PROVIDER_CHAT_ROTATION_ROUNDS} rounds within the same run and uses the local task ledger as memory.`,
+          });
           let finalText = '';
           let lastRawResponse = '';
           const actionUpdates: string[] = [];
@@ -868,6 +888,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 
           const isFailedActionMessage = (message: string): boolean =>
             /^(Action failed:|Blocked action |User rejected action )/i.test(message.trim());
+
+          const userRequestedVerification = /\b(test|tests|tested|verify|verification|check|typecheck|build|lint|compile|validate|make sure it works|confirm it works)\b/i.test(chatPrompt);
 
           const isPrematureAccessBlocker = (message: string): boolean =>
             /(files?|workspace|repository|repo).{0,80}(unavailable|not available|inaccessible|not accessible|not present|missing)|sandbox only exposes|could not safely implement|provide the actual project files/i.test(
@@ -1052,16 +1074,51 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
             return `${value.slice(0, limit)}\n...[truncated ${value.length - limit} chars]`;
           };
 
+          const pushToolResult = (entry: string): void => {
+            toolResults.push(entry);
+            if (toolResults.length > 10) {
+              toolResults.shift();
+            }
+          };
+
+          const pushSystemFeedback = (message: string): void => {
+            ledger.recordSystemFeedback(message);
+            pushToolResult(message);
+          };
+
+          const pushActionResult = (action: AgentAction, resultMessage: string): void => {
+            ledger.recordAction(action, resultMessage);
+            pushToolResult(`${action.type}: ${trimForToolPrompt(action.type, resultMessage)}`);
+          };
+
           for (let round = 0; round < 25; round += 1) {
             if (round > 0) {
+              const followUpDelayMs = providerId === 'kimi' ? KIMI_FOLLOW_UP_DELAY_MS : AUTO_FOLLOW_UP_DELAY_MS;
               sessions.appendLog(session.id, {
                 level: 'info',
                 source: 'provider',
-                message: `Waiting ${AUTO_FOLLOW_UP_DELAY_MS / 1000}s before automatic follow-up prompt...`,
+                message: `Waiting ${followUpDelayMs / 1000}s before automatic follow-up prompt...`,
               });
-              await new Promise((resolve) => setTimeout(resolve, AUTO_FOLLOW_UP_DELAY_MS));
+              await new Promise((resolve) => setTimeout(resolve, followUpDelayMs));
             }
-            const prompt = buildProviderPrompt(chatPrompt, repoContext, toolResults);
+            if (round > 0 && round % AGENT_PROVIDER_CHAT_ROTATION_ROUNDS === 0) {
+              const roundConversationId = await runWithAutoFallback(
+                () => provider.startNewConversation(),
+                `startNewConversation(agent round ${round + 1})`,
+              ).catch((error) => {
+                sessions.appendLog(session.id, {
+                  level: 'warning',
+                  source: 'provider',
+                  message: `Could not start a fresh provider chat for agent round ${round + 1}: ${(error as Error).message}`,
+                });
+                return undefined;
+              });
+              if (roundConversationId) {
+                sessions.setProviderSessionId(session.id, roundConversationId);
+              }
+            }
+
+            const prompt = buildCompactAgentPrompt(chatPrompt, repoContext, ledger);
             appendPromptPreviewLog(session.id, 'agent', prompt, round + 1);
             await runWithAutoFallback(
               () => provider.sendPrompt({
@@ -1099,21 +1156,16 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
                 if (invalidToolResponseCount <= 4) {
                   autoCorrectionCount += 1;
                   const responsePreview = cleanFinalResponse(responseText).slice(0, 1200);
-                  toolResults.push(
-                    [
-                      'SYSTEM_FEEDBACK: Your previous response did not use a valid executable tool JSON object.',
-                      `Parse error: ${parseErrorMessage}`,
-                      'Your next response must be raw JSON only. The first character must be `{` and the last character must be `}`.',
-                      'Do not include prose, Markdown fences, headings, bullets, XML tags, or explanations outside the JSON object.',
-                      'Respond with exactly this shape:',
-                      '{"summary":"...","actions":[{"type":"list_files|read_file|search_files|edit_file|create_file|delete_file|rename_file|run_command|ask_user|finish", ...}]}',
-                      'Use only allowed tool names. If uncertain, use read_file/search_files first.',
-                      `Previous invalid response (truncated): ${responsePreview || '[empty]'}`,
-                    ].join('\n'),
-                  );
-                  if (toolResults.length > 10) {
-                    toolResults.shift();
-                  }
+                  pushSystemFeedback([
+                    'SYSTEM_FEEDBACK: Your previous response did not use a valid executable tool JSON object.',
+                    `Parse error: ${parseErrorMessage}`,
+                    'Your next response must be raw JSON only. The first character must be `{` and the last character must be `}`.',
+                    'Do not include prose, Markdown fences, headings, bullets, XML tags, or explanations outside the JSON object.',
+                    'Respond with exactly this shape:',
+                    '{"summary":"...","actions":[{"type":"list_files|read_file|search_files|edit_file|create_file|delete_file|rename_file|run_command|ask_user|finish", ...}]}',
+                    'Use only allowed tool names. If uncertain, use read_file/search_files first.',
+                    `Previous invalid response (truncated): ${responsePreview || '[empty]'}`,
+                  ].join('\n'));
                   pushActionUpdate('Auto-recovery: requested valid tool JSON after invalid tool/output response.');
                   continue;
                 }
@@ -1135,9 +1187,19 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
               pushActionUpdate(`Planning: ${compact(parsed.summary, 160)}`);
             }
 
+            const actionsToExecute: AgentAction[] = parsed.actions.length > 1 ? [parsed.actions[0]] : parsed.actions;
+            if (parsed.actions.length > 1) {
+              sessions.appendLog(session.id, {
+                level: 'info',
+                source: 'agent',
+                message: `Provider returned ${parsed.actions.length} actions; executing only the first so Agent Mode advances one step at a time.`,
+              });
+              pushActionUpdate(`Step mode: executing first of ${parsed.actions.length} proposed actions.`);
+            }
+
             const hasNonTerminalActions = parsed.actions.some((action) => action.type !== 'ask_user' && action.type !== 'finish');
 
-            for (const action of parsed.actions) {
+            for (const action of actionsToExecute) {
               if (action.type === 'finish' && hasNonTerminalActions) {
                 sessions.appendLog(session.id, {
                   level: 'warning',
@@ -1154,18 +1216,13 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
                   source: 'agent',
                   message: 'Rejected premature no-access finish; asking model to use IDE file tools first.',
                 });
-                toolResults.push(
-                  [
-                    'SYSTEM_FEEDBACK: Do not finish by saying repository files are unavailable based on your model/runtime environment.',
-                    'Your next response must be raw JSON only. No prose or Markdown outside the JSON object.',
-                    'You are inside an IDE agent loop. To access the workspace, emit JSON tool calls and the IDE will return results.',
-                    'Start with {"type":"list_files","limit":100} or {"type":"search_files","query":"<relevant term>"} before deciding files are missing.',
-                    `Rejected finish result: ${compact(action.result, 500)}`,
-                  ].join('\n'),
-                );
-                if (toolResults.length > 10) {
-                  toolResults.shift();
-                }
+                pushSystemFeedback([
+                  'SYSTEM_FEEDBACK: Do not finish by saying repository files are unavailable based on your model/runtime environment.',
+                  'Your next response must be raw JSON only. No prose or Markdown outside the JSON object.',
+                  'You are inside an IDE agent loop. To access the workspace, emit JSON tool calls and the IDE will return results.',
+                  'Start with {"type":"list_files","limit":100} or {"type":"search_files","query":"<relevant term>"} before deciding files are missing.',
+                  `Rejected finish result: ${compact(action.result, 500)}`,
+                ].join('\n'));
                 pushActionUpdate('Auto-recovery: rejected premature no-access finish and requested file discovery.');
                 continue;
               }
@@ -1176,18 +1233,13 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
                   source: 'agent',
                   message: 'Rejected intent-only finish; asking model to emit executable tool actions.',
                 });
-                toolResults.push(
-                  [
-                    'SYSTEM_FEEDBACK: Do not finish with a statement about what you are about to build or edit.',
-                    'Your next response must be raw JSON only. No prose or Markdown outside the JSON object.',
-                    'The IDE can only execute JSON tool actions. Emit list_files/search_files/read_file/create_file/edit_file/run_command actions as needed.',
-                    'Use finish only after the requested work has actually been completed by prior tool actions.',
-                    `Rejected finish result: ${compact(action.result, 500)}`,
-                  ].join('\n'),
-                );
-                if (toolResults.length > 10) {
-                  toolResults.shift();
-                }
+                pushSystemFeedback([
+                  'SYSTEM_FEEDBACK: Do not finish with a statement about what you are about to build or edit.',
+                  'Your next response must be raw JSON only. No prose or Markdown outside the JSON object.',
+                  'The IDE can only execute JSON tool actions. Emit list_files/search_files/read_file/create_file/edit_file/run_command actions as needed.',
+                  'Use finish only after the requested work has actually been completed by prior tool actions.',
+                  `Rejected finish result: ${compact(action.result, 500)}`,
+                ].join('\n'));
                 pushActionUpdate('Auto-recovery: rejected intent-only finish and requested executable actions.');
                 continue;
               }
@@ -1213,10 +1265,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
                   verificationFailureDetail = compact(result.message, 180);
                 }
               }
-              toolResults.push(`${action.type}: ${trimForToolPrompt(action.type, result.message)}`);
-              if (toolResults.length > 10) {
-                toolResults.shift();
-              }
+              pushActionResult(action, result.message);
               const actionLabel = describeAction(action);
               const outcomeLabel = describeActionOutcome(action, result.message);
               pushActionUpdate(`${actionLabel}... ${outcomeLabel}`);
@@ -1225,18 +1274,13 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
               if (isFailedActionMessage(result.message)) {
                 if (autoCorrectionCount < 4) {
                   autoCorrectionCount += 1;
-                  toolResults.push(
-                    [
-                      'SYSTEM_FEEDBACK: The previous action failed or was blocked in IDE execution.',
-                      `Failure detail: ${result.message}`,
-                      'Your next response must be raw JSON only. No prose or Markdown outside the JSON object.',
-                      'Adjust your next action to use valid workspace-relative paths and supported tools.',
-                      'If editing, ensure you read_file the exact target first.',
-                    ].join('\n'),
-                  );
-                  if (toolResults.length > 10) {
-                    toolResults.shift();
-                  }
+                  pushSystemFeedback([
+                    'SYSTEM_FEEDBACK: The previous action failed or was blocked in IDE execution.',
+                    `Failure detail: ${result.message}`,
+                    'Your next response must be raw JSON only. No prose or Markdown outside the JSON object.',
+                    'Adjust your next action to use valid workspace-relative paths and supported tools.',
+                    'If editing, ensure you read_file the exact target first.',
+                  ].join('\n'));
                 }
               }
 
@@ -1251,7 +1295,13 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
             }
           }
 
-          if (!endedByAskUser && codeChangesApplied && needsVerification && !verificationPassed) {
+          const shouldAutoVerify =
+            userRequestedVerification ||
+            failedActionCount > 0 ||
+            autoCorrectionCount > 0 ||
+            Boolean(verificationFailureDetail);
+
+          if (!endedByAskUser && codeChangesApplied && needsVerification && !verificationPassed && shouldAutoVerify) {
             const verificationCommands = await detectVerificationCommands();
             if (verificationCommands.length === 0) {
               verificationAttempted = true;
@@ -1269,10 +1319,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
                 if (isFailedActionMessage(verifyResult.message)) {
                   failedActionCount += 1;
                 }
-                toolResults.push(`run_command: ${trimForToolPrompt('run_command', verifyResult.message)}`);
-                if (toolResults.length > 10) {
-                  toolResults.shift();
-                }
+                pushActionResult(verificationAction, verifyResult.message);
 
                 const verificationOutcome = describeActionOutcome(verificationAction, verifyResult.message);
                 pushActionUpdate(`Verification... ${verificationOutcome}`);
@@ -1289,6 +1336,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
                 verificationFailureDetail = compact(verifyResult.message, 180);
               }
             }
+          } else if (!endedByAskUser && codeChangesApplied && needsVerification && !verificationPassed) {
+            verificationFailureDetail = 'Not run automatically; user did not request verification and no failed/uncertain action required it.';
+            pushActionUpdate('Verification skipped: not requested and no failed/uncertain action required it.');
           }
 
           if (endedByAskUser) {
@@ -1311,7 +1361,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
             const verificationLine = codeChangesApplied
               ? verificationPassed
                 ? `Verification: ${verificationSummary || 'completed successfully.'}`
-                : 'Verification: could not be completed automatically. Please test locally.'
+                : verificationAttempted
+                  ? 'Verification: could not be completed automatically. Please test locally.'
+                  : 'Verification: not run automatically because it was not requested and no failed/uncertain action required it.'
               : '';
             const outcome = finalText ? compact(finalText, 300) : '';
             const recentUpdates = actionUpdates.slice(-6);

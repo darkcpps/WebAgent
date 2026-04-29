@@ -2,7 +2,8 @@ import * as vscode from 'vscode';
 import type { ProviderId } from '../shared/types';
 import type { ProviderAdapter } from './base';
 import { ChatGPTWebAdapter } from './chatgpt-web';
-import { GeminiWebAdapter } from './gemini-web';
+import { DeepSeekWebAdapter } from './deepseek-web';
+import { KimiWebAdapter } from './kimi-web';
 import { PerplexityWebAdapter } from './perplexity-web';
 
 export class ProviderRegistry {
@@ -10,12 +11,13 @@ export class ProviderRegistry {
 
   constructor(context: vscode.ExtensionContext) {
     this.providers.set('chatgpt', new ChatGPTWebAdapter(context));
-    this.providers.set('gemini', new GeminiWebAdapter(context));
+    this.providers.set('kimi', new KimiWebAdapter(context));
     this.providers.set('perplexity', new PerplexityWebAdapter(context));
+    this.providers.set('deepseek', new DeepSeekWebAdapter(context));
   }
 
   list(): ProviderId[] {
-    return ['chatgpt', 'gemini', 'perplexity'];
+    return ['chatgpt', 'kimi', 'perplexity', 'deepseek'];
   }
 
   get(providerId: ProviderId): ProviderAdapter;

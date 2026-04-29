@@ -19,21 +19,24 @@ const defaultModels = [{ id: 'auto', label: 'Auto' }];
 
 const initialState: WebviewState = {
   sessions: [],
-  providers: ['chatgpt', 'gemini', 'perplexity'],
+  providers: ['chatgpt', 'kimi', 'perplexity', 'deepseek'],
   providerModels: {
     chatgpt: defaultModels,
-    gemini: defaultModels,
+    kimi: [{ id: 'auto', label: 'Kimi K2.6' }],
     perplexity: defaultModels,
+    deepseek: defaultModels,
   },
   modelRefreshStatus: {
     chatgpt: { status: 'idle' },
-    gemini: { status: 'idle' },
+    kimi: { status: 'idle' },
     perplexity: { status: 'idle' },
+    deepseek: { status: 'idle' },
   },
   providerReady: {
     chatgpt: false,
-    gemini: false,
+    kimi: false,
     perplexity: false,
+    deepseek: false,
   },
   approvalMode: 'ask-before-action',
 };

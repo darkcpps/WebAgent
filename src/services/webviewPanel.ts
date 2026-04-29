@@ -1,6 +1,6 @@
 import * as vscode from 'vscode';
 import type { ExtensionToWebviewMessage, WebviewToExtensionMessage } from '../shared/messages';
-import type { ApprovalMode, ImageAttachment, ProviderId, ProviderModelRefreshStatus } from '../shared/types';
+import type { ApprovalMode, ChatModel, ImageAttachment, ProviderId, ProviderModelRefreshStatus } from '../shared/types';
 import type { ProviderReadiness } from '../providers/base';
 import type { ProviderRegistry } from '../providers/registry';
 import type { SessionStore } from '../storage/sessionStore';
@@ -66,9 +66,9 @@ export class WebAgentPanel {
     private readonly callbacks: PanelCallbacks,
   ) {
     const defaultStatus: ProviderModelRefreshStatus = { status: 'idle' };
-    this.modelRefreshStatus.set('chatgpt', defaultStatus);
-    this.modelRefreshStatus.set('gemini', defaultStatus);
-    this.modelRefreshStatus.set('perplexity', defaultStatus);
+    for (const providerId of this.providers.list()) {
+      this.modelRefreshStatus.set(providerId, defaultStatus);
+    }
     this.sessions.onDidChange(() => void this.postState(false));
   }
 
@@ -227,11 +227,7 @@ export class WebAgentPanel {
         sessions: this.sessions.getAll(),
         activeSessionId: this.sessions.getActive()?.id,
         providers: this.providers.list(),
-        providerModels: {
-          chatgpt: this.providers.get('chatgpt').listModels(),
-          gemini: this.providers.get('gemini').listModels(),
-          perplexity: this.providers.get('perplexity').listModels(),
-        },
+        providerModels: this.getProviderModelsSnapshot(),
         modelRefreshStatus: this.getModelRefreshStatusSnapshot(),
         providerReady: this.callbacks.getProviderReadyState(),
         approvalMode: this.approvalMode(),
@@ -247,6 +243,12 @@ export class WebAgentPanel {
 
   private getCurrentModelCount(providerId: ProviderId): number {
     return this.providers.get(providerId, { sessionId: this.sessions.getActive()?.id }).listModels().length;
+  }
+
+  private getProviderModelsSnapshot(): Record<ProviderId, ChatModel[]> {
+    return Object.fromEntries(
+      this.providers.list().map((providerId) => [providerId, this.providers.get(providerId).listModels()]),
+    ) as Record<ProviderId, ChatModel[]>;
   }
 
   private refreshProviderModelsInBackground(providerId: ProviderId, options?: { force?: boolean; reason?: string }): Promise<void> {
@@ -325,10 +327,8 @@ export class WebAgentPanel {
   }
 
   private getModelRefreshStatusSnapshot(): Record<ProviderId, ProviderModelRefreshStatus> {
-    return {
-      chatgpt: this.modelRefreshStatus.get('chatgpt') ?? { status: 'idle' },
-      gemini: this.modelRefreshStatus.get('gemini') ?? { status: 'idle' },
-      perplexity: this.modelRefreshStatus.get('perplexity') ?? { status: 'idle' },
-    };
+    return Object.fromEntries(
+      this.providers.list().map((providerId) => [providerId, this.modelRefreshStatus.get(providerId) ?? { status: 'idle' }]),
+    ) as Record<ProviderId, ProviderModelRefreshStatus>;
   }
 }

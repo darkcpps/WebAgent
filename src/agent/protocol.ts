@@ -22,6 +22,27 @@ export const searchFilesActionSchema = baseAction.extend({
   limit: z.number().int().positive().max(100).optional(),
 });
 
+export const inspectRepoActionSchema = baseAction.extend({
+  type: z.literal('inspect_repo'),
+  query: z.string().optional(),
+  limit: z.number().int().positive().max(200).optional(),
+});
+
+export const readManyFilesActionSchema = baseAction.extend({
+  type: z.literal('read_many_files'),
+  files: z.array(z.object({
+    path: z.string().min(1),
+    startLine: z.number().int().positive().optional(),
+    limit: z.number().int().positive().max(500).optional(),
+  })).min(1).max(12),
+});
+
+export const searchCodeActionSchema = baseAction.extend({
+  type: z.literal('search_code'),
+  query: z.string().min(1),
+  limit: z.number().int().positive().max(100).optional(),
+});
+
 export const editFileActionSchema = baseAction.extend({
   type: z.literal('edit_file'),
   path: z.string().min(1),
@@ -29,6 +50,16 @@ export const editFileActionSchema = baseAction.extend({
   oldString: z.string().optional(),
   newString: z.string().optional(),
   replaceAll: z.boolean().optional(),
+});
+
+export const applyPatchActionSchema = baseAction.extend({
+  type: z.literal('apply_patch'),
+  patches: z.array(z.object({
+    path: z.string().min(1),
+    oldString: z.string().min(1),
+    newString: z.string(),
+    replaceAll: z.boolean().optional(),
+  })).min(1).max(20),
 });
 
 export const createFileActionSchema = baseAction.extend({
@@ -92,7 +123,11 @@ export const agentActionSchema = z.discriminatedUnion('type', [
   listFilesActionSchema,
   readFileActionSchema,
   searchFilesActionSchema,
+  inspectRepoActionSchema,
+  readManyFilesActionSchema,
+  searchCodeActionSchema,
   editFileActionSchema,
+  applyPatchActionSchema,
   createFileActionSchema,
   deleteFileActionSchema,
   renameFileActionSchema,

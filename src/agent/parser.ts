@@ -396,6 +396,46 @@ export class AgentResponseParser {
       }
     }
 
+    if (normalizedType === 'read_many_files') {
+      if (!Array.isArray(result.files)) {
+        const paths = action.paths ?? action.path;
+        if (Array.isArray(paths)) {
+          result.files = paths.map((path) => typeof path === 'string' ? { path } : path);
+        } else if (typeof paths === 'string') {
+          result.files = [{ path: paths }];
+        }
+      }
+    }
+
+    if (normalizedType === 'search_code' && typeof result.query !== 'string') {
+      const query = action.pattern ?? action.text ?? action.term;
+      if (typeof query === 'string') {
+        result.query = query;
+      }
+    }
+
+    if (normalizedType === 'inspect_repo' && typeof result.query !== 'string') {
+      const query = action.goal ?? action.request ?? action.description;
+      if (typeof query === 'string') {
+        result.query = query;
+      }
+    }
+
+    if (normalizedType === 'apply_patch') {
+      if (!Array.isArray(result.patches)) {
+        const rawPatches = action.replacements ?? action.changes ?? action.edits ?? action.hunks;
+        if (Array.isArray(rawPatches)) {
+          result.patches = rawPatches;
+        } else if (typeof action.path === 'string') {
+          const oldString = action.oldString ?? action.find ?? action.old;
+          const newString = action.newString ?? action.replacement ?? action.new;
+          if (typeof oldString === 'string' && typeof newString === 'string') {
+            result.patches = [{ path: action.path, oldString, newString, replaceAll: action.replaceAll }];
+          }
+        }
+      }
+    }
+
     if (normalizedType === 'call_mcp_tool') {
       if (typeof result.server !== 'string' && typeof action.mcpServer === 'string') {
         result.server = action.mcpServer;
@@ -484,9 +524,24 @@ export class AgentResponseParser {
       search: 'search_files',
       searchfiles: 'search_files',
       search_files: 'search_files',
+      inspect: 'inspect_repo',
+      inspectrepo: 'inspect_repo',
+      inspect_repo: 'inspect_repo',
+      repo_context: 'inspect_repo',
+      read_many: 'read_many_files',
+      readmany: 'read_many_files',
+      readmanyfiles: 'read_many_files',
+      read_many_files: 'read_many_files',
+      batch_read: 'read_many_files',
+      search_code: 'search_code',
+      searchcode: 'search_code',
+      code_search: 'search_code',
       edit: 'edit_file',
       editfile: 'edit_file',
       edit_file: 'edit_file',
+      patch: 'apply_patch',
+      apply_patch: 'apply_patch',
+      applypatch: 'apply_patch',
       create: 'create_file',
       createfile: 'create_file',
       create_file: 'create_file',

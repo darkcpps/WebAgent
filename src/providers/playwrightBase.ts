@@ -358,8 +358,14 @@ export abstract class PlaywrightWebProvider implements ProviderAdapter {
       // Small pause to let UI react
       await this.page!.waitForTimeout(220);
 
+      const primarySubmitTimeoutMs = this.id === 'kimi' ? 500 : 5000;
+      const fallbackSubmitTimeoutMs = this.id === 'kimi' ? 500 : 3000;
+
       if (await this.clickActiveComposerSubmit(composer)) {
-        if (await this.waitForPromptSubmission(composer, fullPrompt, 5000)) {
+        if (await this.waitForPromptSubmission(composer, fullPrompt, primarySubmitTimeoutMs)) {
+          return;
+        }
+        if (this.id === 'kimi') {
           return;
         }
       }
@@ -367,7 +373,10 @@ export abstract class PlaywrightWebProvider implements ProviderAdapter {
       const submitButton = await this.findBottomMostEnabled(this.getSelectors('submit'), 8000);
       if (submitButton) {
         await submitButton.click().catch(() => undefined);
-        if (await this.waitForPromptSubmission(composer, fullPrompt, 5000)) {
+        if (await this.waitForPromptSubmission(composer, fullPrompt, primarySubmitTimeoutMs)) {
+          return;
+        }
+        if (this.id === 'kimi') {
           return;
         }
       }
@@ -375,17 +384,17 @@ export abstract class PlaywrightWebProvider implements ProviderAdapter {
       // Fallbacks for composer variants where the visible button click does not
       // dispatch the same submit event as the keyboard shortcut.
       await this.page!.keyboard.press('Enter');
-      if (await this.waitForPromptSubmission(composer, fullPrompt, 3000)) {
+      if (await this.waitForPromptSubmission(composer, fullPrompt, fallbackSubmitTimeoutMs)) {
         return;
       }
 
       await this.page!.keyboard.press(process.platform === 'darwin' ? 'Meta+Enter' : 'Control+Enter').catch(() => undefined);
-      if (await this.waitForPromptSubmission(composer, fullPrompt, 3000)) {
+      if (await this.waitForPromptSubmission(composer, fullPrompt, fallbackSubmitTimeoutMs)) {
         return;
       }
 
       await this.submitActiveComposerForm().catch(() => undefined);
-      if (await this.waitForPromptSubmission(composer, fullPrompt, 3000)) {
+      if (await this.waitForPromptSubmission(composer, fullPrompt, fallbackSubmitTimeoutMs)) {
         return;
       }
 
@@ -948,7 +957,7 @@ export abstract class PlaywrightWebProvider implements ProviderAdapter {
     }
 
     // Providers that often trigger strict auth checks do better with branded channels.
-    if (this.id === 'perplexity' || this.id === 'gemini') {
+    if (this.id === 'perplexity' || this.id === 'kimi' || this.id === 'deepseek') {
       return ['chrome', 'msedge', undefined];
     }
     return [undefined];
@@ -1060,7 +1069,7 @@ export abstract class PlaywrightWebProvider implements ProviderAdapter {
   private async findBottomMostVisible(selectors: string[], timeoutMs: number): Promise<Locator | undefined> {
     const deadline = Date.now() + timeoutMs;
     while (Date.now() < deadline) {
-      let best: { locator: Locator; bottom: number } | undefined;
+      let best: { locator: Locator; bottom: number; x: number } | undefined;
       for (const selector of selectors) {
         const locators = this.page!.locator(selector);
         const count = await locators.count();
@@ -1074,9 +1083,10 @@ export abstract class PlaywrightWebProvider implements ProviderAdapter {
             if (!box) {
               continue;
             }
-            const bottom = box.y + box.height;
-            if (!best || bottom > best.bottom) {
-              best = { locator, bottom };
+            const bottom = Math.round(box.y + box.height);
+            const x = Math.round(box.x);
+            if (!best || bottom > best.bottom + 4 || (Math.abs(bottom - best.bottom) <= 4 && x > best.x)) {
+              best = { locator, bottom, x };
             }
           } catch (error) {
             if (this.isClosedTargetError(error)) {
@@ -1096,7 +1106,7 @@ export abstract class PlaywrightWebProvider implements ProviderAdapter {
   private async findBottomMostEnabled(selectors: string[], timeoutMs: number): Promise<Locator | undefined> {
     const deadline = Date.now() + timeoutMs;
     while (Date.now() < deadline) {
-      let best: { locator: Locator; bottom: number } | undefined;
+      let best: { locator: Locator; bottom: number; x: number } | undefined;
       for (const selector of selectors) {
         const locators = this.page!.locator(selector);
         const count = await locators.count();
@@ -1110,9 +1120,10 @@ export abstract class PlaywrightWebProvider implements ProviderAdapter {
             if (!box) {
               continue;
             }
-            const bottom = box.y + box.height;
-            if (!best || bottom > best.bottom) {
-              best = { locator, bottom };
+            const bottom = Math.round(box.y + box.height);
+            const x = Math.round(box.x);
+            if (!best || bottom > best.bottom + 4 || (Math.abs(bottom - best.bottom) <= 4 && x > best.x)) {
+              best = { locator, bottom, x };
             }
           } catch (error) {
             if (this.isClosedTargetError(error)) {
@@ -1830,15 +1841,29 @@ export abstract class PlaywrightWebProvider implements ProviderAdapter {
   }
 
   private parseConversationIdFromUrl(url: string): string | undefined {
+    if (this.id === 'kimi') {
+      const match = url.match(/\/chat\/([A-Za-z0-9-]{8,})/);
+      return match?.[1];
+    }
+    if (this.id === 'deepseek') {
+      const match = url.match(/\/(?:a\/)?chat\/(?:s\/)?([A-Za-z0-9-]{8,})/);
+      return match?.[1];
+    }
     const match = url.match(/\/c\/([A-Za-z0-9-]{8,})/);
     return match?.[1];
   }
 
   private buildConversationUrl(conversationId: string): string | undefined {
-    const base = this.selectorMap.homeUrl.replace(/\/+$/, '');
     if (!conversationId) {
       return undefined;
     }
+    if (this.id === 'kimi') {
+      return `https://www.kimi.com/chat/${conversationId}`;
+    }
+    if (this.id === 'deepseek') {
+      return `https://chat.deepseek.com/a/chat/s/${conversationId}`;
+    }
+    const base = this.selectorMap.homeUrl.replace(/\/+$/, '');
     return `${base}/c/${conversationId}`;
   }
 

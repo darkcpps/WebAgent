@@ -2,7 +2,9 @@ import * as vscode from 'vscode';
 import { AgentOrchestrator } from './agent/orchestrator';
 import { ActionExecutor } from './agent/executor';
 import { AgentResponseParser } from './agent/parser';
-import { buildPlanningPrompt, buildProviderPrompt } from './agent/planner';
+import { AgentLedger } from './agent/ledger';
+import { buildCompactAgentPrompt, buildPlanningPrompt } from './agent/planner';
+import type { AgentAction } from './agent/protocol';
 import { ProviderRegistry } from './providers/registry';
 import { ApprovalManager } from './safety/approvalManager';
 import { SafetyPolicy } from './safety/policy';
@@ -23,6 +25,8 @@ import { GitService } from './workspace/git';
 
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
   const AUTO_FOLLOW_UP_DELAY_MS = 1750;
+  const KIMI_FOLLOW_UP_DELAY_MS = 500;
+  const AGENT_PROVIDER_CHAT_ROTATION_ROUNDS = 6;
   const configuration = vscode.workspace.getConfiguration('webagentCode');
   const sessions = new SessionStore(context);
   const approvals = new ApprovalManager();
@@ -38,7 +42,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   const executor = new ActionExecutor(files, git, safety, approvals, sessions, diffPreview, terminal, mcp);
   const orchestrator = new AgentOrchestrator(providers, workspaceContext, executor, sessions);
   const parser = new AgentResponseParser();
-  const providerReady: Record<ProviderId, boolean> = { chatgpt: false, gemini: false, perplexity: false };
+  const providerReady: Record<ProviderId, boolean> = { chatgpt: false, kimi: false, perplexity: false, deepseek: false };
 
   context.subscriptions.push(mcp, mcpOutput);
 
@@ -113,6 +117,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     systemPrompt: [
       'You are in Chat/Ask mode inside an IDE conversation.',
       'Respond conversationally and helpfully to the user question.',
+      'Do not proactively debug, diagnose, trace root causes, or suggest step-by-step troubleshooting unless the user explicitly asks to debug, fix, troubleshoot, investigate, diagnose, or shares an error/broken behavior.',
+      'For ordinary questions, answer directly and keep any code reasoning high-level unless deeper analysis is requested.',
       'Do not output tool-action JSON and do not behave as an autonomous agent in this mode.',
       'Explain code changes clearly when asked, and ask clarifying questions if context is missing.',
       options.wasPreviouslyAgentMode ? 'Important: Previous agent-mode instructions in this thread are inactive. Ignore them unless the user explicitly asks to enable Agent Mode again.' : 'Stay in Chat/Ask mode unless the user explicitly asks to switch to Agent Mode.',
@@ -252,22 +258,37 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
           return;
         }
 
-        const repoContext = await workspaceContext.build(contextTask);
+        const repoContext = await workspaceContext.build(contextTask, { includeFileContents: false, includeWorkspaceRoot: false });
         const toolResults: string[] = [];
+        const ledger = new AgentLedger(chatPrompt);
         const initialMcpContext = await executor.getMcpToolPromptContext();
         if (initialMcpContext) {
+          ledger.recordInitialContext(initialMcpContext);
           toolResults.push(initialMcpContext);
         }
+        sessions.appendLog(session.id, {
+          level: 'info',
+          source: 'agent',
+          message: `Compact agent context enabled. Agent mode keeps the current provider chat for the first round, then starts a fresh provider chat every ${AGENT_PROVIDER_CHAT_ROTATION_ROUNDS} rounds within the same run and uses the local task ledger as memory.`,
+        });
         const compact = (value: string, limit = 180): string => {
           const normalized = value.replace(/\s+/g, ' ').trim();
           return normalized.length <= limit ? normalized : `${normalized.slice(0, limit)}...`;
         };
-        const describeAction = (action: { type: string; path?: string; query?: string; command?: string; fromPath?: string; toPath?: string; server?: string; tool?: string }): string => {
+        const describeAction = (action: { type?: string; path?: string; query?: string; command?: string; fromPath?: string; toPath?: string; server?: string; tool?: string }): string => {
           switch (action.type) {
+            case 'inspect_repo':
+              return 'Inspecting repo';
             case 'read_file':
               return `Reading ${action.path ?? 'file'}`;
+            case 'read_many_files':
+              return 'Reading files';
+            case 'search_code':
+              return `Searching code "${compact(action.query ?? '', 80)}"`;
             case 'edit_file':
               return `Editing ${action.path ?? 'file'}`;
+            case 'apply_patch':
+              return 'Applying patch';
             case 'create_file':
               return `Creating ${action.path ?? 'file'}`;
             case 'delete_file':
@@ -305,8 +326,29 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
             sessions.updateChatMessage(session.id, assistantMessage.id, { content, rawContent: content });
           }
         };
-        for (let round = 0; round < 25; round += 1) {
-          const prompt = buildProviderPrompt(chatPrompt, repoContext, toolResults);
+        const pushToolResult = (entry: string): void => {
+          toolResults.push(entry);
+          if (toolResults.length > 10) toolResults.shift();
+        };
+        const pushActionResult = (action: AgentAction, resultMessage: string): void => {
+          ledger.recordAction(action, resultMessage);
+          pushToolResult(`${action.type}: ${resultMessage}`);
+        };
+        let verificationPrompted = false;
+        const maxRounds = Math.max(1, configuration.get<number>('agent.maxRounds', 25));
+        for (let round = 0; round < maxRounds; round += 1) {
+          if (round > 0 && round % AGENT_PROVIDER_CHAT_ROTATION_ROUNDS === 0) {
+            const conversationId = await provider.startNewConversation().catch((error) => {
+              sessions.appendLog(session.id, {
+                level: 'warning',
+                source: 'provider',
+                message: `Could not start a fresh provider chat for agent round ${round + 1}: ${(error as Error).message}`,
+              });
+              return undefined;
+            });
+            if (conversationId) sessions.setProviderSessionId(session.id, conversationId);
+          }
+          const prompt = buildCompactAgentPrompt(chatPrompt, repoContext, ledger);
           appendPromptPreviewLog(session.id, 'agent', prompt, round + 1);
           await provider.sendPrompt({ ...prompt, enableThinking: requestThinking });
           const responseText = await collectProviderText(session.id, providerId);
@@ -322,11 +364,30 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
           }
           sessions.appendLog(session.id, { level: 'info', source: 'provider', message: parsed.summary || `Round ${round + 1} response received.` });
           if (parsed.summary) pushActionUpdate(compact(parsed.summary, 220));
-          for (const action of parsed.actions) {
+          const actionsToExecute: AgentAction[] = parsed.actions.length > 1 ? [parsed.actions[0]] : parsed.actions;
+          if (parsed.actions.length > 1) {
+            sessions.appendLog(session.id, {
+              level: 'info',
+              source: 'agent',
+              message: `Provider returned ${parsed.actions.length} actions; executing only the first so Agent Mode advances one step at a time.`,
+            });
+            pushActionUpdate(`Step mode: executing first of ${parsed.actions.length} proposed actions.`);
+          }
+
+          for (const action of actionsToExecute) {
+            const autoVerify = configuration.get<'off' | 'after-edits' | 'before-finish'>('agent.autoVerify', 'after-edits');
+            if (action.type === 'finish' && !verificationPrompted && autoVerify !== 'off' && ledger.hasUnverifiedChanges()) {
+              verificationPrompted = true;
+              const message = 'Verification is still pending after file changes. Run an appropriate existing check/build/test command, inspect the diff, or finish only if you explicitly state verification was skipped and why.';
+              ledger.recordSystemFeedback(message);
+              pushToolResult(`verification_required: ${message}`);
+              pushActionUpdate('Verification needed before final response.');
+              continue;
+            }
             const actionLabel = describeAction(action);
             pushActionUpdate(`${actionLabel}...`);
             const result = await executor.execute(session.id, action);
-            toolResults.push(`${action.type}: ${result.message}`);
+            pushActionResult(action, result.message);
             pushActionUpdate(`${actionLabel} done.`);
             if (action.type === 'ask_user' || result.done) {
               if (implementationTask && result.done) sessions.update(session.id, { pendingPlan: undefined });
@@ -335,7 +396,10 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
               return;
             }
           }
-          await new Promise((resolve) => setTimeout(resolve, AUTO_FOLLOW_UP_DELAY_MS));
+          const followUpDelay = providerId === 'kimi' ? KIMI_FOLLOW_UP_DELAY_MS : Math.min(AUTO_FOLLOW_UP_DELAY_MS, 250);
+          if (followUpDelay > 0) {
+            await new Promise((resolve) => setTimeout(resolve, followUpDelay));
+          }
         }
         if (implementationTask) sessions.update(session.id, { pendingPlan: undefined });
         if (assistantMessage) {

@@ -144,10 +144,40 @@
           "minimum": 10,
           "description": "Maximum number of workspace files to consider while building repo context."
         },
+        "webagentCode.searchScanLimit": {
+          "type": "number",
+          "default": 80,
+          "minimum": 10,
+          "description": "Maximum number of ranked workspace files to open during each Agent Mode text search."
+        },
         "webagentCode.includeHiddenFiles": {
           "type": "boolean",
           "default": false,
           "description": "Whether hidden files should be considered during repo scans."
+        },
+        "webagentCode.agent.maxRounds": {
+          "type": "number",
+          "default": 25,
+          "minimum": 1,
+          "maximum": 100,
+          "description": "Maximum number of Agent Mode provider/tool rounds before stopping."
+        },
+        "webagentCode.agent.maxReadBatch": {
+          "type": "number",
+          "default": 6,
+          "minimum": 1,
+          "maximum": 12,
+          "description": "Maximum number of files Agent Mode should read in one batched read action."
+        },
+        "webagentCode.agent.autoVerify": {
+          "type": "string",
+          "enum": [
+            "off",
+            "after-edits",
+            "before-finish"
+          ],
+          "default": "after-edits",
+          "description": "Controls when Agent Mode should prefer verification commands after file changes."
         },
         "webagentCode.playwright.browserChannel": {
           "type": "string",

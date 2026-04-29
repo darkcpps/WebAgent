@@ -1,4 +1,4 @@
-export type ProviderId = 'chatgpt' | 'gemini' | 'perplexity';
+export type ProviderId = 'chatgpt' | 'kimi' | 'perplexity' | 'deepseek';
 
 export type ApprovalMode = 'view-only' | 'ask-before-action' | 'auto-apply-safe-edits';
 

@@ -1,8 +1,8 @@
 import * as vscode from 'vscode';
 import { PlaywrightWebProvider } from './playwrightBase';
 
-export class GeminiWebAdapter extends PlaywrightWebProvider {
+export class DeepSeekWebAdapter extends PlaywrightWebProvider {
   constructor(context: vscode.ExtensionContext) {
-    super('gemini', context);
+    super('deepseek', context);
   }
 }

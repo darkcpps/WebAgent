@@ -5,7 +5,7 @@ import type { SessionStore } from '../storage/sessionStore';
 import { TerminalRunner } from '../terminal/runner';
 import { createId, truncate } from '../shared/utils';
 import { DiffPreviewService } from '../services/diffPreviewService';
-import { WorkspaceFilesService } from '../workspace/files';
+import { WorkspaceFilesService, type FileReadWindow } from '../workspace/files';
 import { GitService } from '../workspace/git';
 import { McpManager } from '../services/mcpManager';
 import type { AgentAction } from './protocol';
@@ -54,7 +54,7 @@ interface McpToolCandidate {
 
 export class ActionExecutor {
   private static readonly READ_FILE_DEFAULT_LIMIT_LINES = 250;
-  private static readonly READ_FILE_MAX_CHARS = 30000;
+  private readonly sessionReads = new Map<string, Set<string>>();
 
   constructor(
     private readonly files: WorkspaceFilesService,
@@ -130,6 +130,21 @@ export class ActionExecutor {
       }
     }
 
+    const preflight = await this.preflight(sessionId, action);
+    if (preflight) {
+      this.sessions.updateAction(sessionId, actionId, { status: 'error', result: preflight });
+      this.updateLatestAssistantToolStatus(sessionId, `Blocked ${summary}.`);
+      this.sessions.appendLog(sessionId, {
+        level: 'warning',
+        source: 'agent',
+        message: `Blocked ${summary}: ${truncate(preflight, 220)}`,
+      });
+      return {
+        done: false,
+        message: `Action failed: ${preflight}`,
+      };
+    }
+
     if (decision.requiresApproval) {
       this.updateLatestAssistantToolStatus(sessionId, `Awaiting approval for ${summary}...`);
       this.sessions.appendLog(sessionId, {
@@ -171,6 +186,7 @@ export class ActionExecutor {
 
     try {
       const result = await this.run(action);
+      this.recordSuccessfulAction(sessionId, action);
       this.sessions.updateAction(sessionId, actionId, { status: 'done', result: truncate(result, 1000) });
       this.updateLatestAssistantToolStatus(sessionId, `Done ${summary}.`);
       this.sessions.appendLog(sessionId, {
@@ -205,45 +221,44 @@ export class ActionExecutor {
         return `Files:\n${files.join('\n')}`;
       }
       case 'read_file': {
-        const content = await this.files.readFile(action.path);
-        const lines = content.split(/\r?\n/);
-        const totalLines = lines.length;
-        const requestedStartLine = action.startLine ?? 1;
-        const startLine = Math.min(Math.max(requestedStartLine, 1), Math.max(totalLines, 1));
-        const limit = action.limit ?? ActionExecutor.READ_FILE_DEFAULT_LIMIT_LINES;
-        const endLine = Math.min(startLine + limit - 1, totalLines);
-        const selectedLines = lines.slice(startLine - 1, endLine);
-        let body = selectedLines.map((line, index) => `${startLine + index}: ${line}`).join('\n');
-        let charTruncated = false;
-
-        if (body.length > ActionExecutor.READ_FILE_MAX_CHARS) {
-          body = body.slice(0, ActionExecutor.READ_FILE_MAX_CHARS);
-          charTruncated = true;
-        }
-
-        const nextStartLine = endLine < totalLines ? endLine + 1 : undefined;
-        const parts = [
-          `Read ${action.path} lines ${startLine}-${endLine} of ${totalLines} (${content.length} chars total).`,
-        ];
-
-        if (nextStartLine) {
-          parts.push(`More content is available. Continue with {"type":"read_file","path":"${action.path}","startLine":${nextStartLine},"limit":${limit}}.`);
-        }
-
-        if (charTruncated) {
-          parts.push('This window was character-truncated. Retry with a smaller limit.');
-        }
-
-        parts.push('', body);
-        return parts.join('\n');
+        return this.formatReadWindow(await this.files.readFileWindow({
+          path: action.path,
+          startLine: action.startLine,
+          limit: action.limit,
+        }));
       }
       case 'search_files': {
         const results = await this.files.searchFiles(action.query, action.limit ?? 20);
         return JSON.stringify(results, null, 2);
       }
+      case 'inspect_repo': {
+        const inspection = await this.files.inspectRepo(action.query, action.limit);
+        const status = await this.git.getStatus().catch(() => 'Git status unavailable');
+        const branch = await this.git.getBranch().catch(() => 'unknown');
+        return [
+          'REPO_INSPECTION:',
+          JSON.stringify({ ...inspection, git: { branch, status } }, null, 2),
+          '',
+          'Use matching/key files as hints only. Read files before relying on their contents or editing.',
+        ].join('\n');
+      }
+      case 'read_many_files': {
+        const windows = await Promise.all(action.files.map((file) => this.files.readFileWindow({
+          path: file.path,
+          startLine: file.startLine,
+          limit: file.limit,
+        })));
+        return windows.map((window) => this.formatReadWindow(window)).join('\n\n---\n\n');
+      }
+      case 'search_code': {
+        const results = await this.files.searchCode(action.query, action.limit ?? 20);
+        return JSON.stringify(results, null, 2);
+      }
       case 'edit_file': {
         const current = await this.files.readFile(action.path);
-        let next = action.content;
+        let next = typeof action.content === 'string'
+          ? this.normalizeProviderEscapedMultiline(action.content)
+          : action.content;
 
         if (typeof next !== 'string') {
           if (typeof action.oldString !== 'string' || typeof action.newString !== 'string') {
@@ -266,8 +281,24 @@ export class ActionExecutor {
         await this.files.writeFile(action.path, next);
         return `Updated ${action.path}`;
       }
+      case 'apply_patch': {
+        const nextByPath = new Map<string, string>();
+        for (const patch of action.patches) {
+          const current = nextByPath.get(patch.path) ?? await this.files.readFile(patch.path);
+          const replacement = this.resolveReplacement(current, patch.oldString, patch.newString, Boolean(patch.replaceAll));
+          nextByPath.set(patch.path, replacement.next);
+        }
+
+        for (const [path, next] of nextByPath) {
+          const current = await this.files.readFile(path);
+          await this.diffPreview.showFileReplacement(path, current, next);
+          await this.files.writeFile(path, next);
+        }
+
+        return `Applied ${action.patches.length} patch${action.patches.length === 1 ? '' : 'es'} across ${nextByPath.size} file${nextByPath.size === 1 ? '' : 's'}: ${[...nextByPath.keys()].join(', ')}`;
+      }
       case 'create_file': {
-        await this.files.writeFile(action.path, action.content);
+        await this.files.writeFile(action.path, this.normalizeProviderEscapedMultiline(action.content));
         return `Created ${action.path}`;
       }
       case 'delete_file': {
@@ -320,6 +351,16 @@ export class ActionExecutor {
 
   private buildPreview(action: AgentAction): string {
     switch (action.type) {
+      case 'inspect_repo':
+        return action.query ? `Inspect repo for "${truncate(action.query, 120)}"` : 'Inspect repo structure, key files, scripts, and git status';
+      case 'read_many_files':
+        return action.files
+          .map((file) => file.startLine || file.limit
+            ? `${file.path}:${file.startLine ?? 1}${file.limit ? `+${file.limit}` : ''}`
+            : file.path)
+          .join('\n');
+      case 'search_code':
+        return action.query;
       case 'edit_file':
       case 'create_file':
         if (action.type === 'create_file') {
@@ -329,6 +370,10 @@ export class ActionExecutor {
           return `${action.path}\n\n${truncate(action.content, 1500)}`;
         }
         return `${action.path}\n\nreplace: ${truncate(action.oldString ?? '', 400)}\nwith: ${truncate(action.newString ?? '', 400)}`;
+      case 'apply_patch':
+        return action.patches
+          .map((patch) => `${patch.path}\nreplace: ${truncate(patch.oldString, 300)}\nwith: ${truncate(patch.newString, 300)}`)
+          .join('\n\n---\n\n');
       case 'run_command':
         return action.command;
       case 'rename_file':
@@ -366,16 +411,24 @@ export class ActionExecutor {
     switch (action.type) {
       case 'list_files':
         return withRequestedSummary('Listing files');
+      case 'inspect_repo':
+        return withRequestedSummary('Inspecting repo');
       case 'read_file':
         return withRequestedSummary(
           action.startLine || action.limit
             ? `Reading ${action.path}:${action.startLine ?? 1}${action.limit ? `+${action.limit}` : ''}`
             : `Reading ${action.path}`,
         );
+      case 'read_many_files':
+        return withRequestedSummary(`Reading ${action.files.length} files`);
       case 'search_files':
         return withRequestedSummary(`Searching "${truncate(action.query, 80)}"`);
+      case 'search_code':
+        return withRequestedSummary(`Searching code "${truncate(action.query, 80)}"`);
       case 'edit_file':
         return withRequestedSummary(`Writing ${action.path}`);
+      case 'apply_patch':
+        return withRequestedSummary(`Applying ${action.patches.length} patch${action.patches.length === 1 ? '' : 'es'}`);
       case 'create_file':
         return withRequestedSummary(`Writing ${action.path}`);
       case 'delete_file':
@@ -410,6 +463,140 @@ export class ActionExecutor {
   private updateLatestAssistantToolStatus(sessionId: string, content: string): void {
     void sessionId;
     void content;
+  }
+
+  private formatReadWindow(window: FileReadWindow): string {
+    const nextStartLine = window.endLine < window.totalLines ? window.endLine + 1 : undefined;
+    const parts = [
+      `Read ${window.path} lines ${window.startLine}-${window.endLine} of ${window.totalLines} (${window.totalChars} chars total).`,
+    ];
+
+    if (nextStartLine) {
+      parts.push(`More content is available. Continue with {"type":"read_file","path":"${window.path}","startLine":${nextStartLine},"limit":${ActionExecutor.READ_FILE_DEFAULT_LIMIT_LINES}}.`);
+    }
+
+    if (window.truncated) {
+      parts.push('This window was character-truncated. Retry with a smaller limit.');
+    }
+
+    parts.push('', window.content);
+    return parts.join('\n');
+  }
+
+  private recordSuccessfulAction(sessionId: string, action: AgentAction): void {
+    const reads = this.sessionReads.get(sessionId) ?? new Set<string>();
+    if (action.type === 'read_file') {
+      reads.add(action.path);
+    }
+    if (action.type === 'read_many_files') {
+      for (const file of action.files) {
+        reads.add(file.path);
+      }
+    }
+    this.sessionReads.set(sessionId, reads);
+  }
+
+  private async preflight(sessionId: string, action: AgentAction): Promise<string | undefined> {
+    if (action.type === 'read_many_files') {
+      const maxReadBatch = Math.max(1, vscode.workspace.getConfiguration('webagentCode').get<number>('agent.maxReadBatch', 6));
+      if (action.files.length > maxReadBatch) {
+        return [
+          `read_many_files requested ${action.files.length} files, but the configured maximum is ${maxReadBatch}.`,
+          `Next valid action: ${JSON.stringify({ type: 'read_many_files', files: action.files.slice(0, maxReadBatch) })}`,
+        ].join('\n');
+      }
+    }
+
+    const unread = this.requiredReadPaths(action).filter((path) => !this.hasRead(sessionId, path));
+    if (unread.length > 0) {
+      const nextAction = unread.length === 1
+        ? { type: 'read_file', path: unread[0], startLine: 1, limit: ActionExecutor.READ_FILE_DEFAULT_LIMIT_LINES }
+        : { type: 'read_many_files', files: unread.slice(0, 6).map((path) => ({ path, startLine: 1, limit: ActionExecutor.READ_FILE_DEFAULT_LIMIT_LINES })) };
+      return [
+        `The agent tried to ${action.type} without reading required file evidence first: ${unread.join(', ')}.`,
+        'Read the exact target file(s), then retry the mutation using only observed text.',
+        `Next valid action: ${JSON.stringify(nextAction)}`,
+      ].join('\n');
+    }
+
+    if (action.type === 'run_command') {
+      const commandIssue = await this.preflightCommand(action.command);
+      if (commandIssue) {
+        return commandIssue;
+      }
+    }
+
+    if (action.type === 'edit_file' && typeof action.content !== 'string') {
+      if (typeof action.oldString !== 'string' || typeof action.newString !== 'string') {
+        return 'edit_file is missing content and oldString/newString replacement fields. Read the target file and retry with exact observed oldString text.';
+      }
+
+      const current = await this.files.readFile(action.path);
+      try {
+        this.resolveReplacement(current, action.oldString, action.newString, Boolean(action.replaceAll));
+      } catch (error) {
+        return [
+          `edit_file validation failed for ${action.path}: ${(error as Error).message}`,
+          'Read the current target window again and retry with exact observed text in oldString.',
+          `Next valid action: ${JSON.stringify({ type: 'read_file', path: action.path, startLine: 1, limit: ActionExecutor.READ_FILE_DEFAULT_LIMIT_LINES })}`,
+        ].join('\n');
+      }
+    }
+
+    if (action.type === 'apply_patch') {
+      for (const patch of action.patches) {
+        const current = await this.files.readFile(patch.path);
+        try {
+          this.resolveReplacement(current, patch.oldString, patch.newString, Boolean(patch.replaceAll));
+        } catch (error) {
+          return [
+            `Patch validation failed for ${patch.path}: ${(error as Error).message}`,
+            'Read the current target window again and retry with exact observed text in oldString.',
+            `Next valid action: ${JSON.stringify({ type: 'read_file', path: patch.path, startLine: 1, limit: ActionExecutor.READ_FILE_DEFAULT_LIMIT_LINES })}`,
+          ].join('\n');
+        }
+      }
+    }
+
+    return undefined;
+  }
+
+  private requiredReadPaths(action: AgentAction): string[] {
+    switch (action.type) {
+      case 'edit_file':
+      case 'delete_file':
+        return [action.path];
+      case 'rename_file':
+        return [action.fromPath];
+      case 'apply_patch':
+        return [...new Set(action.patches.map((patch) => patch.path))];
+      default:
+        return [];
+    }
+  }
+
+  private hasRead(sessionId: string, path: string): boolean {
+    return this.sessionReads.get(sessionId)?.has(path) ?? false;
+  }
+
+  private async preflightCommand(command: string): Promise<string | undefined> {
+    const npmRun = command.match(/(?:^|\s)npm(?:\.cmd)?\s+run\s+([^\s]+)/i);
+    if (!npmRun) {
+      return undefined;
+    }
+
+    const script = npmRun[1];
+    const scripts = await this.files.readPackageScripts().catch(() => []);
+    if (scripts.length === 0 || scripts.includes(script)) {
+      return undefined;
+    }
+
+    return [
+      `Command references missing package.json script "${script}".`,
+      `Available scripts: ${scripts.join(', ') || 'none'}.`,
+      'Inspect package.json or choose an existing script before running commands.',
+      `Next valid action: ${JSON.stringify({ type: 'read_file', path: 'package.json', startLine: 1, limit: 200 })}`,
+    ].join('\n');
   }
 
   private async buildMcpSchemaHint(server: string, toolName: string): Promise<string | undefined> {
@@ -1008,7 +1195,7 @@ export class ActionExecutor {
     };
 
     const basePairs = [
-      { oldValue: oldString, newValue: newString },
+      { oldValue: oldString, newValue: this.normalizeProviderEscapedMultiline(newString, oldString) },
       { oldValue: this.decodeProviderEscapes(oldString), newValue: this.decodeProviderEscapes(newString) },
       { oldValue: this.stripReadLinePrefixes(oldString), newValue: this.stripReadLinePrefixes(newString) },
       {
@@ -1026,6 +1213,28 @@ export class ActionExecutor {
     }
 
     return variants;
+  }
+
+  private normalizeProviderEscapedMultiline(value: string, comparisonText = ''): string {
+    const escapedNewlineCount = (value.match(/\\r\\n|\\n|\\r/g) || []).length;
+    if (escapedNewlineCount === 0) {
+      return value;
+    }
+
+    const realNewlineCount = (value.match(/\r\n|\n|\r/g) || []).length;
+    if (realNewlineCount >= escapedNewlineCount) {
+      return value;
+    }
+
+    const decoded = this.decodeProviderEscapes(value);
+    if (!/[\r\n]/.test(decoded)) {
+      return value;
+    }
+
+    const comparisonHasNewlines = /[\r\n]/.test(comparisonText);
+    const likelyWholeFile = realNewlineCount === 0 && (escapedNewlineCount >= 2 || decoded.length > 120);
+    const likelyMultilineReplacement = comparisonHasNewlines || escapedNewlineCount >= 2;
+    return likelyWholeFile || likelyMultilineReplacement ? decoded : value;
   }
 
   private decodeProviderEscapes(value: string): string {
