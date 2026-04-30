@@ -329,6 +329,7 @@ export abstract class PlaywrightWebProvider implements ProviderAdapter {
       await this.ensureConversationContext();
       this.stopped = false;
       this.lastResponse = '';
+      await this.waitForGenerationToSettleBeforeSend();
 
       let composer = await this.findBottomMostVisible(this.getSelectors('input'), 9000);
       if (!composer) {
@@ -407,6 +408,9 @@ export abstract class PlaywrightWebProvider implements ProviderAdapter {
     const start = Date.now();
     let stableTicks = 0;
     let lastDelivered = '';
+    const slowStreamingProvider = this.id === 'deepseek' || this.id === 'kimi';
+    const requiredStableTicks = slowStreamingProvider ? 10 : 3;
+    const emptyResponseStableTicks = slowStreamingProvider ? 24 : 12;
 
     onEvent({ type: 'status', message: `Waiting for ${this.id} response...` });
     let lastCid = '';
@@ -448,13 +452,13 @@ export abstract class PlaywrightWebProvider implements ProviderAdapter {
       }
 
       const stillGenerating = await this.isGenerating();
-      if (!stillGenerating && stableTicks >= 3 && lastDelivered.trim()) {
+      if (!stillGenerating && stableTicks >= requiredStableTicks && lastDelivered.trim()) {
         this.lastResponse = lastDelivered;
         onEvent({ type: 'done', fullText: lastDelivered });
         return;
       }
 
-      if (!stillGenerating && stableTicks >= 12 && !lastDelivered.trim()) {
+      if (!stillGenerating && stableTicks >= emptyResponseStableTicks && !lastDelivered.trim()) {
         const fallbackText = (await this.readAssistantTextFromDomSnapshot()) || (await this.readAssistantTextFromHeuristicSnapshot());
         if (fallbackText.trim()) {
           this.lastResponse = fallbackText;
@@ -1282,6 +1286,10 @@ export abstract class PlaywrightWebProvider implements ProviderAdapter {
         return true;
       }
 
+      if (this.id === 'deepseek' && (await this.hasDeepSeekRequestStarted(composer))) {
+        return true;
+      }
+
       const containsPrompt = await this.composerContainsPrompt(composer, fullPrompt);
       if (containsPrompt === false) {
         return true;
@@ -1293,6 +1301,57 @@ export abstract class PlaywrightWebProvider implements ProviderAdapter {
     return false;
   }
 
+  private async hasDeepSeekRequestStarted(composer: Locator): Promise<boolean> {
+    const composerBusy = await composer
+      .evaluate((node) => {
+        const element = node as HTMLElement;
+        const input = element as HTMLInputElement | HTMLTextAreaElement;
+        return Boolean(
+          input.disabled ||
+            element.getAttribute('aria-disabled') === 'true' ||
+            element.getAttribute('data-disabled') === 'true' ||
+            element.closest('[aria-busy="true"], [data-loading="true"], [class*="loading"], [class*="generating"]'),
+        );
+      })
+      .catch(() => false);
+    if (composerBusy) {
+      return true;
+    }
+
+    const visibleStop = await this.page!
+      .evaluate(() => {
+        const isVisible = (element: HTMLElement): boolean => {
+          const style = window.getComputedStyle(element);
+          const rect = element.getBoundingClientRect();
+          return style.visibility !== 'hidden' && style.display !== 'none' && rect.width > 0 && rect.height > 0;
+        };
+
+        return Array.from(document.querySelectorAll<HTMLElement>('button, [role="button"]')).some((button) => {
+          if (!isVisible(button)) {
+            return false;
+          }
+          const label = [
+            button.getAttribute('aria-label'),
+            button.getAttribute('title'),
+            button.getAttribute('data-testid'),
+            button.className,
+            button.textContent,
+          ]
+            .filter(Boolean)
+            .join(' ')
+            .toLowerCase();
+          return /stop|停止|generating/.test(label);
+        });
+      })
+      .catch(() => false);
+    if (visibleStop) {
+      return true;
+    }
+
+    const currentAssistant = (await this.readAssistantTextFromDomSnapshot()).trim();
+    return Boolean(currentAssistant && currentAssistant !== this.lastAssistantBeforeSend.trim());
+  }
+
   private async clickActiveComposerSubmit(composer: Locator): Promise<boolean> {
     const selectors = this.getSelectors('submit');
     const composerHandle = await composer.elementHandle().catch(() => null);
@@ -1300,7 +1359,7 @@ export abstract class PlaywrightWebProvider implements ProviderAdapter {
       return false;
     }
 
-    return this.page!.evaluate(({ composerNode, submitSelectors }) => {
+    return this.page!.evaluate(({ composerNode, providerId, submitSelectors }) => {
       const composerElement = composerNode as HTMLElement;
       const active = document.activeElement as HTMLElement | null;
       const roots = [
@@ -1331,7 +1390,21 @@ export abstract class PlaywrightWebProvider implements ProviderAdapter {
           .filter(Boolean)
           .join(' ')
           .toLowerCase();
-        return !/stop|voice|dictate|attach|upload|model/.test(label) && /send|submit/.test(label);
+        return !/stop|voice|dictate|attach|upload|model/.test(label) && /send|submit|发送/.test(label);
+      };
+
+      const isDeepSeekModeButton = (button: HTMLButtonElement): boolean => {
+        const label = [
+          button.getAttribute('aria-label'),
+          button.getAttribute('data-testid'),
+          button.getAttribute('title'),
+          button.textContent,
+          button.className,
+        ]
+          .filter(Boolean)
+          .join(' ')
+          .toLowerCase();
+        return /deepthink|think|search|联网|深度|推理|voice|dictate|attach|upload|model|menu|close|clear|stop|停止/.test(label);
       };
 
       for (const root of roots) {
@@ -1353,10 +1426,23 @@ export abstract class PlaywrightWebProvider implements ProviderAdapter {
           button.click();
           return true;
         }
+
+        if (providerId === 'deepseek' && root !== document) {
+          const iconButtons = candidates
+            .filter((candidate) => !candidate.disabled && isVisible(candidate) && !isDeepSeekModeButton(candidate))
+            .map((candidate) => ({ candidate, rect: candidate.getBoundingClientRect() }))
+            .filter(({ rect }) => rect.width > 0 && rect.height > 0)
+            .sort((left, right) => right.rect.bottom - left.rect.bottom || right.rect.right - left.rect.right);
+          const iconButton = iconButtons[0]?.candidate;
+          if (iconButton) {
+            iconButton.click();
+            return true;
+          }
+        }
       }
 
       return false;
-    }, { composerNode: composerHandle, submitSelectors: selectors }).catch(() => false);
+    }, { composerNode: composerHandle, providerId: this.id, submitSelectors: selectors }).catch(() => false);
   }
 
   private async submitActiveComposerForm(): Promise<void> {
@@ -1896,6 +1982,72 @@ export abstract class PlaywrightWebProvider implements ProviderAdapter {
 
   private async isGenerating(): Promise<boolean> {
     const stopButton = await this.findFirstVisible(this.getSelectors('stopButton'), 250);
-    return Boolean(stopButton);
+    if (stopButton) {
+      return true;
+    }
+    if (this.id === 'deepseek' || this.id === 'kimi') {
+      return this.hasWebGeneratingSignal();
+    }
+    return false;
+  }
+
+  private async waitForGenerationToSettleBeforeSend(): Promise<void> {
+    if (this.id !== 'deepseek' && this.id !== 'kimi') {
+      return;
+    }
+
+    const deadline = Date.now() + 90000;
+    let quietTicks = 0;
+    while (Date.now() < deadline && !this.stopped) {
+      if (await this.isGenerating()) {
+        quietTicks = 0;
+        await this.page!.waitForTimeout(750).catch(() => undefined);
+        continue;
+      }
+
+      quietTicks += 1;
+      if (quietTicks >= 3) {
+        return;
+      }
+      await this.page!.waitForTimeout(500).catch(() => undefined);
+    }
+  }
+
+  private async hasWebGeneratingSignal(): Promise<boolean> {
+    return this.page!
+      .evaluate(() => {
+        const isVisible = (element: HTMLElement): boolean => {
+          const style = window.getComputedStyle(element);
+          const rect = element.getBoundingClientRect();
+          return style.visibility !== 'hidden' && style.display !== 'none' && rect.width > 0 && rect.height > 0;
+        };
+
+        const visibleButtons = Array.from(document.querySelectorAll<HTMLElement>('button, [role="button"]'))
+          .filter(isVisible)
+          .map((button) =>
+            [
+              button.getAttribute('aria-label'),
+              button.getAttribute('title'),
+              button.getAttribute('data-testid'),
+              button.className,
+              button.textContent,
+            ]
+              .filter(Boolean)
+              .join(' ')
+              .toLowerCase(),
+          );
+
+        if (visibleButtons.some((label) => /stop|generating|responding|cancel|停止/.test(label))) {
+          return true;
+        }
+
+        const busyElements = Array.from(
+          document.querySelectorAll<HTMLElement>(
+            '[aria-busy="true"], [data-loading="true"], [data-state*="loading"], [class*="loading"], [class*="generating"], [class*="typing"]',
+          ),
+        );
+        return busyElements.some(isVisible);
+      })
+      .catch(() => false);
   }
 }

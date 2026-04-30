@@ -1,4 +1,5 @@
 import type { AgentAction } from './protocol';
+import type { CodebaseProfile } from '../workspace/codebaseTier';
 
 interface FileReadState {
   ranges: string[];
@@ -12,8 +13,11 @@ export class AgentLedger {
   private readonly verification: string[] = [];
   private readonly facts: string[] = [];
   private latestObservation = '';
+  private readonly budgetChars: number;
 
-  constructor(private readonly userGoal: string) {}
+  constructor(private readonly userGoal: string, profile?: CodebaseProfile) {
+    this.budgetChars = profile?.ledgerBudgetChars ?? 9000;
+  }
 
   recordInitialContext(context: string | undefined): void {
     if (!context?.trim()) {
@@ -60,16 +64,17 @@ export class AgentLedger {
         this.pushLimited(this.facts, `Listed workspace files. ${this.compact(result, 240)}`, 8);
         break;
       case 'edit_file':
+      case 'replace_range':
       case 'create_file':
       case 'delete_file':
         this.filesChanged.add(action.path);
         this.pushLimited(this.facts, `${action.type} succeeded for ${action.path}.`, 8);
         break;
       case 'apply_patch':
-        for (const patch of action.patches) {
+        for (const patch of action.patches ?? []) {
           this.filesChanged.add(patch.path);
         }
-        this.pushLimited(this.facts, `apply_patch succeeded for ${[...new Set(action.patches.map((patch) => patch.path))].join(', ')}.`, 8);
+        this.pushLimited(this.facts, `apply_patch succeeded${action.patches?.length ? ` for ${[...new Set(action.patches.map((patch) => patch.path))].join(', ')}` : ''}.`, 8);
         break;
       case 'rename_file':
         this.filesChanged.add(action.fromPath);
@@ -86,6 +91,18 @@ export class AgentLedger {
       case 'list_mcp_tools':
       case 'call_mcp_tool':
         this.pushLimited(this.facts, `${action.type}: ${this.compact(result, 520)}`, 8);
+        break;
+      case 'list_directory':
+        this.pushLimited(this.facts, `Browsed directory: ${this.compact(result, 360)}`, 8);
+        break;
+      case 'grep_search':
+        this.pushLimited(this.facts, `Grep searched: ${this.compact(result, 360)}`, 8);
+        break;
+      case 'find_symbols':
+        this.pushLimited(this.facts, `Found symbols: ${this.compact(result, 360)}`, 8);
+        break;
+      case 'file_outline':
+        this.pushLimited(this.facts, `File outline: ${this.compact(result, 420)}`, 8);
         break;
       case 'ask_user':
       case 'finish':
@@ -110,7 +127,7 @@ export class AgentLedger {
       this.latestObservation ? `Latest observation:\n${this.latestObservation}` : '',
     ].filter(Boolean);
 
-    return this.compact(sections.join('\n\n'), 9000);
+    return this.compact(sections.join('\n\n'), this.budgetChars);
   }
 
   hasUnverifiedChanges(): boolean {

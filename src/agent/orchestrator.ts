@@ -1,21 +1,24 @@
 import type { ProviderId } from '../shared/types';
-import { buildProviderPrompt } from './planner';
+import { buildProviderPrompt, buildCompactAgentPrompt } from './planner';
 import { AgentResponseParser } from './parser';
 import { ActionExecutor } from './executor';
+import { AgentLedger } from './ledger';
 import type { ProviderRegistry } from '../providers/registry';
 import type { SessionStore } from '../storage/sessionStore';
 import { WorkspaceContextService } from '../workspace/context';
+import { CodebaseTierDetector, type CodebaseProfile } from '../workspace/codebaseTier';
 
 export class AgentOrchestrator {
   private readonly parser = new AgentResponseParser();
   private readonly stops = new Set<string>();
+  private readonly tierDetector = new CodebaseTierDetector();
 
   constructor(
     private readonly providers: ProviderRegistry,
     private readonly contextService: WorkspaceContextService,
     private readonly executor: ActionExecutor,
     private readonly sessions: SessionStore,
-  ) {}
+  ) { }
 
   async start(sessionId: string, providerId: ProviderId, task: string): Promise<void> {
     this.stops.delete(sessionId);
@@ -29,21 +32,48 @@ export class AgentOrchestrator {
         throw new Error(`${providerId} is not ready. Run provider login first.`);
       }
 
-      const context = await this.contextService.build(task);
+      // Detect codebase tier
+      const profile = await this.tierDetector.detect();
+      this.sessions.appendLog(sessionId, {
+        level: 'info',
+        source: 'system',
+        message: `Codebase detected: ${profile.tier} (${profile.fileCount} files${profile.isGitRepo ? ', git' : ''})`,
+      });
+
+      // Build initial context with tier awareness
+      let context = await this.contextService.build(task, {}, profile);
       const toolResults: string[] = [];
+      const ledger = new AgentLedger(task, profile);
       const initialMcpContext = await this.executor.getMcpToolPromptContext();
       if (initialMcpContext) {
         toolResults.push(initialMcpContext);
+        ledger.recordInitialContext(initialMcpContext);
       }
 
-      for (let round = 0; round < 25; round += 1) {
+      const maxRounds = 25;
+
+      for (let round = 0; round < maxRounds; round += 1) {
         if (this.stops.has(sessionId)) {
           this.sessions.setStatus(sessionId, 'stopped');
           this.sessions.appendLog(sessionId, { level: 'warning', source: 'agent', message: 'Task stopped.' });
           return;
         }
 
-        const prompt = buildProviderPrompt(task, context, toolResults);
+        // Context refresh for large repos
+        if (this.shouldRefreshContext(round, profile)) {
+          context = await this.contextService.build(task, {}, profile);
+          this.sessions.appendLog(sessionId, {
+            level: 'info',
+            source: 'system',
+            message: `Context refreshed at round ${round + 1}.`,
+          });
+        }
+
+        // Use compact prompts for large repos after round 0
+        const prompt = this.shouldUseCompactPrompt(round, profile)
+          ? buildCompactAgentPrompt(task, context, ledger, profile)
+          : buildProviderPrompt(task, context, toolResults, profile);
+
         await provider.sendPrompt(prompt);
         const responseText = await this.collectProviderText(sessionId, providerId);
         this.sessions.appendRawResponse(sessionId, responseText);
@@ -54,6 +84,8 @@ export class AgentOrchestrator {
         for (const action of parsed.actions) {
           const result = await this.executor.execute(sessionId, action);
           toolResults.push(`${action.type}: ${result.message}`);
+          ledger.recordAction(action, result.message);
+
           this.sessions.appendLog(sessionId, {
             level: result.message.toLowerCase().includes('failed') || result.message.toLowerCase().includes('blocked') ? 'warning' : 'info',
             source: action.type === 'run_command' ? 'terminal' : 'workspace',
@@ -83,6 +115,18 @@ export class AgentOrchestrator {
 
   stop(sessionId: string): void {
     this.stops.add(sessionId);
+  }
+
+  private shouldRefreshContext(round: number, profile: CodebaseProfile): boolean {
+    if (round === 0) return false;
+    const interval = profile.contextRefreshInterval;
+    if (interval <= 0) return false;
+    return round % interval === 0;
+  }
+
+  private shouldUseCompactPrompt(round: number, profile: CodebaseProfile): boolean {
+    if (round === 0) return false;
+    return profile.useCompactPrompts;
   }
 
   private async collectProviderText(sessionId: string, providerId: ProviderId): Promise<string> {

@@ -1,11 +1,39 @@
 import type { RepoContext } from '../workspace/context';
 import type { AgentLedger } from './ledger';
+import type { CodebaseProfile } from '../workspace/codebaseTier';
 
-const TOOL_RESULT_MAX_CHARS = 24000;
-const TOOL_RESULT_ITEM_MAX_CHARS = 3000;
+const DEFAULT_TOOL_RESULT_MAX_CHARS = 24000;
+const DEFAULT_TOOL_RESULT_ITEM_MAX_CHARS = 3000;
 const MCP_TOOL_RESULT_ITEM_MAX_CHARS = 9000;
 
-export function buildProviderPrompt(task: string, context: RepoContext, toolResults: string[] = []): { systemPrompt: string; userPrompt: string } {
+const NEW_TOOLS_BLOCK = [
+  '- list_directory {"type":"list_directory","path":"src/","depth":2}',
+  '- grep_search {"type":"grep_search","pattern":"handleAuth","regex":false,"includes":["*.ts"],"limit":30}',
+  '- find_symbols {"type":"find_symbols","query":"AuthService","limit":20}',
+  '- file_outline {"type":"file_outline","path":"src/services/auth.ts"}',
+].join('\n');
+
+const LARGE_REPO_GUIDANCE = [
+  '',
+  'Large codebase guidance:',
+  '- This is a large codebase. Prefer discovery before action.',
+  '- Use list_directory to understand repo structure before broad searches.',
+  '- Use grep_search with file filters (includes) for targeted results instead of search_files.',
+  '- Use find_symbols to locate type/function definitions across the workspace.',
+  '- Use file_outline before reading large files to identify relevant sections.',
+  '- Read focused file windows (startLine/limit) instead of entire large files.',
+  '- Narrow searches with includes like ["*.ts"] or ["src/agent/*.ts"] for speed.',
+].join('\n');
+
+export function buildProviderPrompt(
+  task: string,
+  context: RepoContext,
+  toolResults: string[] = [],
+  profile?: CodebaseProfile,
+): { systemPrompt: string; userPrompt: string } {
+  const toolResultMaxChars = profile?.toolResultMaxChars ?? DEFAULT_TOOL_RESULT_MAX_CHARS;
+  const toolResultItemMaxChars = profile?.toolResultItemMaxChars ?? DEFAULT_TOOL_RESULT_ITEM_MAX_CHARS;
+
   const systemPrompt = [
     'You are an IDE coding agent. Complete the user task with tool actions, then finish.',
     'Return exactly one raw JSON object and no other text. It must start with `{` and end with `}`.',
@@ -17,8 +45,9 @@ export function buildProviderPrompt(task: string, context: RepoContext, toolResu
     '- Use repository evidence. Treat context snippets as hints until confirmed with read_file/search_files/list_files.',
     '- If the task is not clearly single-file, discover first with inspect_repo/search_code, then read likely targets.',
     '- Before edit_file/delete_file/rename_file, read that exact file in this run. New create_file targets are exempt.',
-    '- Prefer apply_patch for edits with exact oldString/newString hunks from observed file text. The IDE validates every hunk before writing.',
-    '- In edit_file/create_file/apply_patch content, use real multiline text. Do not double-escape code as literal \\n unless the target file should contain the two characters backslash+n.',
+    '- Prefer replace_range for deterministic line-window edits after read_file, and edit_file with "content" for small fully-read files.',
+    '- Use apply_patch with unified diff hunks for multi-line edits when you have enough surrounding context. Legacy oldString/newString is only a small exact-replacement fallback.',
+    '- In edit_file/create_file/apply_patch content, use real multiline text. Do not double-escape code as literal \\\\n unless the target file should contain the two characters backslash+n.',
     '- Prefer focused changes that match existing conventions. Avoid unrelated refactors and churn.',
     '- For bugs, inspect the relevant code/error/output first, form a small hypothesis, then fix the observed cause.',
     '- For UI/user-facing work, include the expected workflow and relevant empty/loading/disabled/error/success, responsive, keyboard, focus, and accessibility states.',
@@ -35,7 +64,7 @@ export function buildProviderPrompt(task: string, context: RepoContext, toolResu
     '- Emit exactly one action per response. For independent reads, use one read_many_files action instead of multiple read_file actions.',
     '- For sequential work, wait for prior tool results before choosing the next action.',
     '- For multi-file website/app work, create or edit one file at a time, then wait for the IDE result before moving to the next file.',
-    '- After a failed action, use the failure as evidence; read/search/inspect before retrying.',
+    '- After a failed edit/apply_patch action, use the failure as evidence; read/search/inspect before retrying with replace_range or edit_file content.',
     '- Never use finish with other actions. Use finish only after required work is done; mention whether verification was run or intentionally skipped.',
     '- Never finish with intent-only text such as "I will implement" or "now I have enough". Emit tool actions instead.',
     '- If MCP is needed, prefer resolve_mcp_intent. If it returns status "ready", emit nextAction exactly. If validation fails, fix only the listed fields.',
@@ -47,7 +76,9 @@ export function buildProviderPrompt(task: string, context: RepoContext, toolResu
     '- search_code {"type":"search_code","query":"symbol, text, or filename","limit":20}',
     '- read_file {"type":"read_file","path":"src/app.ts","startLine":1,"limit":250}',
     '- read_many_files {"type":"read_many_files","files":[{"path":"src/app.ts","startLine":1,"limit":160}]}',
-    '- apply_patch {"type":"apply_patch","patches":[{"path":"file.ts","oldString":"exact observed text","newString":"replacement"}]}',
+    '- apply_patch unified {"type":"apply_patch","patches":[{"path":"file.ts","diff":"@@ -10,3 +10,4 @@\\n context\\n-old\\n+new\\n context"}]}',
+    '- apply_patch legacy {"type":"apply_patch","patches":[{"path":"file.ts","oldString":"exact observed text","newString":"replacement"}]}',
+    '- replace_range {"type":"replace_range","path":"file.ts","startLine":10,"endLine":12,"content":"replacement lines"}',
     '- edit_file targeted {"type":"edit_file","path":"file.ts","oldString":"exact text","newString":"replacement"}',
     '- edit_file full {"type":"edit_file","path":"file.ts","content":"entire file"}',
     '- create_file {"type":"create_file","path":"new.ts","content":"initial content"}',
@@ -55,6 +86,7 @@ export function buildProviderPrompt(task: string, context: RepoContext, toolResu
     '- rename_file {"type":"rename_file","fromPath":"old.ts","toPath":"new.ts"}',
     '- run_command {"type":"run_command","command":"npm test"}',
     '- get_git_diff {"type":"get_git_diff"}',
+    NEW_TOOLS_BLOCK,
     '- list_mcp_tools {"type":"list_mcp_tools","server":"optional","tool":"optional"}',
     '- resolve_mcp_intent {"type":"resolve_mcp_intent","server":"optional","intent":"operation","knownArguments":{}}',
     '- call_mcp_tool {"type":"call_mcp_tool","server":"name","tool":"name","arguments":{}}',
@@ -63,23 +95,26 @@ export function buildProviderPrompt(task: string, context: RepoContext, toolResu
     '',
     'Valid example:',
     '{"summary":"Searching for the relevant code","actions":[{"type":"search_files","query":"buggyFunction"}]}',
-  ].join('\n');
+    profile?.useLargeRepoGuidance ? LARGE_REPO_GUIDANCE : '',
+  ].filter(Boolean).join('\n');
 
   const relevantFileHints = context.relevantFiles
     .map((file) => `- ${file.path}${file.reason ? ` (${file.reason})` : ''}`)
     .join('\n');
 
-  const compactedToolResults = compactToolResults(toolResults);
+  const compactedToolResults = compactToolResults(toolResults, toolResultMaxChars, toolResultItemMaxChars);
   const observations = compactedToolResults.length
     ? `\n\nLatest tool results:\n${compactedToolResults.map((result, index) => `${index + 1}. ${result}`).join('\n\n')}`
     : '';
+
+  const tierHint = profile ? `\nCodebase tier: ${profile.tier} (${profile.fileCount} files${profile.isGitRepo ? ', git repo' : ''})` : '';
 
   const userPrompt = [
     `Task:\n${task}`,
     '',
     'Operate from the tool/action contract in the system prompt. Relevant file hints are paths only; read files before relying on code details or editing. If MCP is needed, use resolve_mcp_intent first.',
     '',
-    `Workspace summary:\n${context.summary}`,
+    `Workspace summary:\n${context.summary}${tierHint}`,
     '',
     `Open editors:\n${context.openEditors.join(', ') || 'None'}`,
     '',
@@ -90,7 +125,12 @@ export function buildProviderPrompt(task: string, context: RepoContext, toolResu
   return { systemPrompt, userPrompt };
 }
 
-export function buildCompactAgentPrompt(task: string, context: RepoContext, ledger: AgentLedger): { systemPrompt: string; userPrompt: string } {
+export function buildCompactAgentPrompt(
+  task: string,
+  context: RepoContext,
+  ledger: AgentLedger,
+  profile?: CodebaseProfile,
+): { systemPrompt: string; userPrompt: string } {
   const systemPrompt = [
     'You are an IDE coding agent. Return one raw JSON object only.',
     'Shape: {"summary":"concise status","actions":[{"type":"tool_name", "...":"..."}]}',
@@ -98,14 +138,17 @@ export function buildCompactAgentPrompt(task: string, context: RepoContext, ledg
     'Rules:',
     '- Use JSON tool actions to inspect and change the workspace. Do not claim direct filesystem access.',
     '- Use workspace-relative paths only.',
-    '- Discover with inspect_repo/search_code when targets are uncertain.',
+    '- Discover with inspect_repo/search_code/grep_search when targets are uncertain.',
     '- Read a file before editing, deleting, or renaming it. New create_file targets are exempt.',
-    '- Prefer read_many_files for independent file reads and apply_patch for exact multi-hunk edits.',
-    '- In edit_file/create_file/apply_patch content, use real multiline text. Do not double-escape code as literal \\n unless the target file should contain the two characters backslash+n.',
+    '- Prefer read_many_files for independent file reads.',
+    '- Prefer replace_range for deterministic line-window edits after read_file, and edit_file with "content" for small fully-read files.',
+    '- Use apply_patch with unified diff hunks for multi-line edits when you have enough surrounding context. Legacy oldString/newString is only a small exact-replacement fallback.',
+    '- In edit_file/create_file/apply_patch content, use real multiline text. Do not double-escape code as literal \\\\n unless the target file should contain the two characters backslash+n.',
     '- Use focused read_file windows for large files.',
     '- Prefer small, evidence-based changes matching existing code.',
     '- Emit exactly one action per response. For independent reads, batch inside one read_many_files action.',
     '- For multi-file website/app work, create or edit one file at a time, then wait for the IDE result before moving to the next file.',
+    '- After any edit_file/apply_patch failure, recover by reading the current file and using replace_range for the current line window or edit_file with full content. Do not retry brittle oldString/newString.',
     '- Do not run check/build/test immediately after every edit. Verify only when the user asks, when an action failed, or when you are unsure the change works.',
     '- finish must be alone and only after the work is actually done.',
     '',
@@ -116,7 +159,9 @@ export function buildCompactAgentPrompt(task: string, context: RepoContext, ledg
     '- search_code {"type":"search_code","query":"symbol, text, or filename","limit":20}',
     '- read_file {"type":"read_file","path":"src/app.ts","startLine":1,"limit":250}',
     '- read_many_files {"type":"read_many_files","files":[{"path":"src/app.ts","startLine":1,"limit":160}]}',
-    '- apply_patch {"type":"apply_patch","patches":[{"path":"file.ts","oldString":"exact observed text","newString":"replacement"}]}',
+    '- apply_patch unified {"type":"apply_patch","patches":[{"path":"file.ts","diff":"@@ -10,3 +10,4 @@\\n context\\n-old\\n+new\\n context"}]}',
+    '- apply_patch legacy {"type":"apply_patch","patches":[{"path":"file.ts","oldString":"exact observed text","newString":"replacement"}]}',
+    '- replace_range {"type":"replace_range","path":"file.ts","startLine":10,"endLine":12,"content":"replacement lines"}',
     '- edit_file {"type":"edit_file","path":"file.ts","oldString":"exact text","newString":"replacement"}',
     '- edit_file full {"type":"edit_file","path":"file.ts","content":"entire file"}',
     '- create_file {"type":"create_file","path":"new.ts","content":"initial content"}',
@@ -124,23 +169,28 @@ export function buildCompactAgentPrompt(task: string, context: RepoContext, ledg
     '- rename_file {"type":"rename_file","fromPath":"old.ts","toPath":"new.ts"}',
     '- run_command {"type":"run_command","command":"npm test"}',
     '- get_git_diff {"type":"get_git_diff"}',
+    NEW_TOOLS_BLOCK,
     '- list_mcp_tools {"type":"list_mcp_tools","server":"optional","tool":"optional"}',
     '- resolve_mcp_intent {"type":"resolve_mcp_intent","server":"optional","intent":"operation","knownArguments":{}}',
     '- call_mcp_tool {"type":"call_mcp_tool","server":"name","tool":"name","arguments":{}}',
     '- ask_user {"type":"ask_user","question":"..."}',
     '- finish {"type":"finish","result":"work done, verification, limitations"}',
-  ].join('\n');
+    profile?.useLargeRepoGuidance ? LARGE_REPO_GUIDANCE : '',
+  ].filter(Boolean).join('\n');
 
   const relevantFileHints = context.relevantFiles
     .map((file) => `- ${file.path}${file.reason ? ` (${file.reason})` : ''}`)
     .join('\n');
+
+  const tierHint = profile ? `\nCodebase tier: ${profile.tier} (${profile.fileCount} files)` : '';
+
   const userPrompt = [
     `Task:\n${task}`,
     '',
     'Local agent state:',
     ledger.toPromptSummary(),
     '',
-    `Workspace summary:\n${context.summary}`,
+    `Workspace summary:\n${context.summary}${tierHint}`,
     '',
     `Open editors:\n${context.openEditors.join(', ') || 'None'}`,
     '',
@@ -152,9 +202,13 @@ export function buildCompactAgentPrompt(task: string, context: RepoContext, ledg
   return { systemPrompt, userPrompt };
 }
 
-function compactToolResults(toolResults: string[]): string[] {
+function compactToolResults(
+  toolResults: string[],
+  maxChars: number = DEFAULT_TOOL_RESULT_MAX_CHARS,
+  itemMaxChars: number = DEFAULT_TOOL_RESULT_ITEM_MAX_CHARS,
+): string[] {
   const compactedResults: string[] = [];
-  let remainingBudget = TOOL_RESULT_MAX_CHARS;
+  let remainingBudget = maxChars;
   const latestMcpCatalog = [...toolResults].reverse().find((result) => result.startsWith('MCP_TOOL_CATALOG:'));
 
   for (const result of [...toolResults].reverse()) {
@@ -166,10 +220,10 @@ function compactToolResults(toolResults: string[]): string[] {
       break;
     }
 
-    const itemBudget = result.startsWith('list_mcp_tools:') || result.startsWith('call_mcp_tool:')
+    const budget = result.startsWith('list_mcp_tools:') || result.startsWith('call_mcp_tool:')
       ? MCP_TOOL_RESULT_ITEM_MAX_CHARS
-      : TOOL_RESULT_ITEM_MAX_CHARS;
-    const maxForItem = Math.min(itemBudget, remainingBudget);
+      : itemMaxChars;
+    const maxForItem = Math.min(budget, remainingBudget);
     const text = result.length > maxForItem
       ? `${result.slice(0, maxForItem)}\n...[tool result truncated for prompt budget]`
       : result;
@@ -233,13 +287,13 @@ export function buildPlanningPrompt(
 
   const revisionContext = existingPlan
     ? [
-        'Existing planning context:',
-        `Original request:\n${existingPlan.originalRequest}`,
-        '',
-        `Current plan to revise:\n${existingPlan.plan}`,
-        '',
-        'Use the new user message as requested changes or extra detail, then return a revised complete plan.',
-      ].join('\n')
+      'Existing planning context:',
+      `Original request:\n${existingPlan.originalRequest}`,
+      '',
+      `Current plan to revise:\n${existingPlan.plan}`,
+      '',
+      'Use the new user message as requested changes or extra detail, then return a revised complete plan.',
+    ].join('\n')
     : '';
 
   const userPrompt = [

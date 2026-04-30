@@ -8,6 +8,9 @@ import { DiffPreviewService } from '../services/diffPreviewService';
 import { WorkspaceFilesService, type FileReadWindow } from '../workspace/files';
 import { GitService } from '../workspace/git';
 import { McpManager } from '../services/mcpManager';
+import { SymbolService } from '../workspace/symbols';
+import { WorkspaceEditEngine, type FileReplacement } from '../workspace/editEngine';
+import type { CodebaseProfile } from '../workspace/codebaseTier';
 import type { AgentAction } from './protocol';
 
 export interface ExecutionResult {
@@ -55,6 +58,7 @@ interface McpToolCandidate {
 export class ActionExecutor {
   private static readonly READ_FILE_DEFAULT_LIMIT_LINES = 250;
   private readonly sessionReads = new Map<string, Set<string>>();
+  private readonly editEngine: WorkspaceEditEngine;
 
   constructor(
     private readonly files: WorkspaceFilesService,
@@ -65,7 +69,11 @@ export class ActionExecutor {
     private readonly diffPreview: DiffPreviewService,
     private readonly terminal: TerminalRunner,
     private readonly mcp?: McpManager,
-  ) {}
+    private readonly symbols?: SymbolService,
+    private readonly getCodebaseProfile?: () => CodebaseProfile | undefined,
+  ) {
+    this.editEngine = new WorkspaceEditEngine(files);
+  }
 
   async getMcpToolPromptContext(): Promise<string | undefined> {
     if (!this.mcp) {
@@ -217,7 +225,7 @@ export class ActionExecutor {
   private async run(action: AgentAction): Promise<string> {
     switch (action.type) {
       case 'list_files': {
-        const files = await this.files.listFiles(action.limit);
+        const files = await this.files.listFiles(action.limit, this.getCodebaseProfile?.());
         return `Files:\n${files.join('\n')}`;
       }
       case 'read_file': {
@@ -255,50 +263,25 @@ export class ActionExecutor {
         return JSON.stringify(results, null, 2);
       }
       case 'edit_file': {
-        const current = await this.files.readFile(action.path);
-        let next = typeof action.content === 'string'
-          ? this.normalizeProviderEscapedMultiline(action.content)
-          : action.content;
-
-        if (typeof next !== 'string') {
-          if (typeof action.oldString !== 'string' || typeof action.newString !== 'string') {
-            throw new Error('edit_file missing content and old/new replacement strings.');
-          }
-
-          if (!action.oldString) {
-            throw new Error('edit_file oldString must not be empty.');
-          }
-
-          if (action.oldString === action.newString) {
-            throw new Error('edit_file oldString and newString must differ.');
-          }
-
-          const replacement = this.resolveReplacement(current, action.oldString, action.newString, Boolean(action.replaceAll));
-          next = replacement.next;
-        }
-
-        await this.diffPreview.showFileReplacement(action.path, current, next);
-        await this.files.writeFile(action.path, next);
-        return `Updated ${action.path}`;
+        const replacement = typeof action.content === 'string'
+          ? await this.editEngine.fullFile(action.path, action.content)
+          : await this.editEngine.exactReplacement(action.path, action.oldString ?? '', action.newString ?? '', Boolean(action.replaceAll));
+        return await this.writeReplacement(replacement);
       }
       case 'apply_patch': {
-        const nextByPath = new Map<string, string>();
-        for (const patch of action.patches) {
-          const current = nextByPath.get(patch.path) ?? await this.files.readFile(patch.path);
-          const replacement = this.resolveReplacement(current, patch.oldString, patch.newString, Boolean(patch.replaceAll));
-          nextByPath.set(patch.path, replacement.next);
+        const replacements = await this.editEngine.applyPatches(action.patches ?? [], action.patch);
+        for (const replacement of replacements) {
+          await this.writeReplacement(replacement);
         }
-
-        for (const [path, next] of nextByPath) {
-          const current = await this.files.readFile(path);
-          await this.diffPreview.showFileReplacement(path, current, next);
-          await this.files.writeFile(path, next);
-        }
-
-        return `Applied ${action.patches.length} patch${action.patches.length === 1 ? '' : 'es'} across ${nextByPath.size} file${nextByPath.size === 1 ? '' : 's'}: ${[...nextByPath.keys()].join(', ')}`;
+        const patchCount = (action.patches?.length ?? 0) + (action.patch?.trim() ? 1 : 0);
+        return `Applied ${patchCount} patch${patchCount === 1 ? '' : 'es'} across ${replacements.length} file${replacements.length === 1 ? '' : 's'}.`;
+      }
+      case 'replace_range': {
+        const replacement = await this.editEngine.replaceRange(action.path, action.startLine, action.endLine, action.content);
+        return await this.writeReplacement(replacement);
       }
       case 'create_file': {
-        await this.files.writeFile(action.path, this.normalizeProviderEscapedMultiline(action.content));
+        await this.files.writeFile(action.path, this.editEngine.normalizeProviderEscapedMultiline(action.content));
         return `Created ${action.path}`;
       }
       case 'delete_file': {
@@ -340,6 +323,50 @@ export class ActionExecutor {
       case 'resolve_mcp_intent': {
         return await this.resolveMcpIntent(action);
       }
+      case 'list_directory': {
+        const entries = await this.files.listDirectory(action.path ?? '.', action.depth ?? 2);
+        const formatted = entries.map((entry) => {
+          if (entry.type === 'directory') {
+            return `📁 ${entry.name}/ (${entry.childCount ?? '?'} items)`;
+          }
+          const sizeStr = entry.size !== undefined ? ` (${this.formatSize(entry.size)})` : '';
+          return `📄 ${entry.name}${sizeStr}`;
+        });
+        return `Directory: ${action.path ?? '.'}\n${formatted.join('\n')}`;
+      }
+      case 'grep_search': {
+        const results = await this.files.grepSearch(action.pattern, {
+          regex: action.regex,
+          includes: action.includes,
+          excludes: action.excludes,
+          limit: action.limit,
+          contextLines: action.contextLines,
+        });
+        if (results.length === 0) {
+          return `No matches found for "${action.pattern}".`;
+        }
+        return JSON.stringify(results, null, 2);
+      }
+      case 'find_symbols': {
+        if (!this.symbols) {
+          return 'Symbol search is not available.';
+        }
+        const symbols = await this.symbols.findSymbols(action.query, action.limit ?? 20);
+        if (symbols.length === 0) {
+          return `No symbols found matching "${action.query}". Language extensions may not be active for relevant file types.`;
+        }
+        return JSON.stringify(symbols, null, 2);
+      }
+      case 'file_outline': {
+        if (!this.symbols) {
+          return 'File outline is not available.';
+        }
+        const outline = await this.symbols.getFileOutline(action.path);
+        if (outline.length === 0) {
+          return `No outline available for ${action.path}. The file may not have language support or may be empty.`;
+        }
+        return `Outline of ${action.path}:\n${JSON.stringify(outline, null, 2)}`;
+      }
       case 'ask_user': {
         return action.question;
       }
@@ -371,9 +398,15 @@ export class ActionExecutor {
         }
         return `${action.path}\n\nreplace: ${truncate(action.oldString ?? '', 400)}\nwith: ${truncate(action.newString ?? '', 400)}`;
       case 'apply_patch':
-        return action.patches
-          .map((patch) => `${patch.path}\nreplace: ${truncate(patch.oldString, 300)}\nwith: ${truncate(patch.newString, 300)}`)
-          .join('\n\n---\n\n');
+        return [
+          action.patch?.trim() ? truncate(action.patch, 1500) : undefined,
+          ...(action.patches ?? [])
+          .map((patch) => typeof patch.diff === 'string' && patch.diff.trim()
+            ? `${patch.path}\n${truncate(patch.diff, 900)}`
+            : `${patch.path}\nreplace: ${truncate(patch.oldString ?? '', 300)}\nwith: ${truncate(patch.newString ?? '', 300)}`),
+        ].filter(Boolean).join('\n\n---\n\n');
+      case 'replace_range':
+        return `${action.path}:${action.startLine}-${action.endLine}\n\n${truncate(action.content, 1500)}`;
       case 'run_command':
         return action.command;
       case 'rename_file':
@@ -396,6 +429,14 @@ export class ActionExecutor {
         return `${action.server}.${action.tool}\n\n${truncate(JSON.stringify(action.arguments ?? {}, null, 2), 1500)}`;
       case 'resolve_mcp_intent':
         return `${action.server ? `${action.server}: ` : ''}${truncate(action.intent, 120)}\n\n${truncate(JSON.stringify(action.knownArguments ?? {}, null, 2), 1500)}`;
+      case 'list_directory':
+        return `${action.path ?? '.'}${action.depth ? ` (depth ${action.depth})` : ''}`;
+      case 'grep_search':
+        return `${action.regex ? '/' : ''}${truncate(action.pattern, 120)}${action.regex ? '/' : ''}${action.includes ? ` in ${action.includes.join(', ')}` : ''}`;
+      case 'find_symbols':
+        return action.query;
+      case 'file_outline':
+        return action.path;
       case 'finish':
         return action.result;
       default:
@@ -428,7 +469,12 @@ export class ActionExecutor {
       case 'edit_file':
         return withRequestedSummary(`Writing ${action.path}`);
       case 'apply_patch':
-        return withRequestedSummary(`Applying ${action.patches.length} patch${action.patches.length === 1 ? '' : 'es'}`);
+        {
+          const patchCount = (action.patches?.length ?? 0) + (action.patch?.trim() ? 1 : 0);
+          return withRequestedSummary(`Applying ${patchCount} patch${patchCount === 1 ? '' : 'es'}`);
+        }
+      case 'replace_range':
+        return withRequestedSummary(`Replacing ${action.path}:${action.startLine}-${action.endLine}`);
       case 'create_file':
         return withRequestedSummary(`Writing ${action.path}`);
       case 'delete_file':
@@ -451,6 +497,14 @@ export class ActionExecutor {
         return withRequestedSummary(`Calling MCP ${action.server}.${action.tool}`);
       case 'resolve_mcp_intent':
         return withRequestedSummary(`Resolving MCP intent${action.server ? ` on ${action.server}` : ''}`);
+      case 'list_directory':
+        return withRequestedSummary(`Browsing ${action.path ?? '.'}`);
+      case 'grep_search':
+        return withRequestedSummary(`Grep "${truncate(action.pattern, 60)}"`);
+      case 'find_symbols':
+        return withRequestedSummary(`Finding symbols "${truncate(action.query, 60)}"`);
+      case 'file_outline':
+        return withRequestedSummary(`Outlining ${action.path}`);
       case 'ask_user':
         return withRequestedSummary('Asking for your input');
       case 'finish':
@@ -463,6 +517,22 @@ export class ActionExecutor {
   private updateLatestAssistantToolStatus(sessionId: string, content: string): void {
     void sessionId;
     void content;
+  }
+
+  private async writeReplacement(replacement: FileReplacement): Promise<string> {
+    await this.diffPreview.showFileReplacement(replacement.path, replacement.current, replacement.next);
+    if (replacement.operation === 'delete') {
+      await this.files.deleteFile(replacement.path);
+    } else {
+      await this.files.writeFile(replacement.path, replacement.next);
+    }
+    return replacement.summary;
+  }
+
+  private formatSize(bytes: number): string {
+    if (bytes < 1024) return `${bytes}B`;
+    if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)}KB`;
+    return `${(bytes / (1024 * 1024)).toFixed(1)}MB`;
   }
 
   private formatReadWindow(window: FileReadWindow): string {
@@ -486,14 +556,34 @@ export class ActionExecutor {
   private recordSuccessfulAction(sessionId: string, action: AgentAction): void {
     const reads = this.sessionReads.get(sessionId) ?? new Set<string>();
     if (action.type === 'read_file') {
-      reads.add(action.path);
+      reads.add(this.normalizePath(action.path));
     }
     if (action.type === 'read_many_files') {
       for (const file of action.files) {
-        reads.add(file.path);
+        reads.add(this.normalizePath(file.path));
+      }
+    }
+    // Also record modifications as "reads" so the agent can modify again if needed
+    if (action.type === 'edit_file' || action.type === 'create_file' || action.type === 'replace_range') {
+      reads.add(this.normalizePath(action.path));
+    }
+    if (action.type === 'apply_patch') {
+      for (const patch of action.patches ?? []) {
+        reads.add(this.normalizePath(patch.path));
+      }
+      for (const path of this.editEngine.getApplyPatchReadPaths(action.patches ?? [], action.patch)) {
+        reads.add(this.normalizePath(path));
       }
     }
     this.sessionReads.set(sessionId, reads);
+  }
+
+  private normalizePath(relativePath: string): string {
+    try {
+      return this.files.fromRelativePath(relativePath).fsPath.toLowerCase();
+    } catch {
+      return relativePath.toLowerCase();
+    }
   }
 
   private async preflight(sessionId: string, action: AgentAction): Promise<string | undefined> {
@@ -511,7 +601,7 @@ export class ActionExecutor {
     if (unread.length > 0) {
       const nextAction = unread.length === 1
         ? { type: 'read_file', path: unread[0], startLine: 1, limit: ActionExecutor.READ_FILE_DEFAULT_LIMIT_LINES }
-        : { type: 'read_many_files', files: unread.slice(0, 6).map((path) => ({ path, startLine: 1, limit: ActionExecutor.READ_FILE_DEFAULT_LIMIT_LINES })) };
+        : { type: 'read_many_files', files: unread.slice(0, 6).map((p) => ({ path: p, startLine: 1, limit: ActionExecutor.READ_FILE_DEFAULT_LIMIT_LINES })) };
       return [
         `The agent tried to ${action.type} without reading required file evidence first: ${unread.join(', ')}.`,
         'Read the exact target file(s), then retry the mutation using only observed text.',
@@ -531,30 +621,39 @@ export class ActionExecutor {
         return 'edit_file is missing content and oldString/newString replacement fields. Read the target file and retry with exact observed oldString text.';
       }
 
-      const current = await this.files.readFile(action.path);
       try {
-        this.resolveReplacement(current, action.oldString, action.newString, Boolean(action.replaceAll));
+        await this.editEngine.exactReplacement(action.path, action.oldString, action.newString, Boolean(action.replaceAll));
       } catch (error) {
         return [
           `edit_file validation failed for ${action.path}: ${(error as Error).message}`,
-          'Read the current target window again and retry with exact observed text in oldString.',
+          'Read the current target window again, then retry with replace_range or edit_file content if exact text is brittle.',
           `Next valid action: ${JSON.stringify({ type: 'read_file', path: action.path, startLine: 1, limit: ActionExecutor.READ_FILE_DEFAULT_LIMIT_LINES })}`,
         ].join('\n');
       }
     }
 
     if (action.type === 'apply_patch') {
-      for (const patch of action.patches) {
-        const current = await this.files.readFile(patch.path);
-        try {
-          this.resolveReplacement(current, patch.oldString, patch.newString, Boolean(patch.replaceAll));
-        } catch (error) {
-          return [
-            `Patch validation failed for ${patch.path}: ${(error as Error).message}`,
-            'Read the current target window again and retry with exact observed text in oldString.',
-            `Next valid action: ${JSON.stringify({ type: 'read_file', path: patch.path, startLine: 1, limit: ActionExecutor.READ_FILE_DEFAULT_LIMIT_LINES })}`,
-          ].join('\n');
-        }
+      try {
+        await this.editEngine.applyPatches(action.patches ?? [], action.patch);
+      } catch (error) {
+        const firstPath = this.editEngine.getApplyPatchReadPaths(action.patches ?? [], action.patch)[0] ?? action.patches?.[0]?.path ?? 'target file';
+        return [
+          `Patch validation failed: ${(error as Error).message}`,
+          'Read the current target window again, then retry with unified diff, replace_range, or edit_file content.',
+          `Next valid action: ${JSON.stringify({ type: 'read_file', path: firstPath, startLine: 1, limit: ActionExecutor.READ_FILE_DEFAULT_LIMIT_LINES })}`,
+        ].join('\n');
+      }
+    }
+
+    if (action.type === 'replace_range') {
+      try {
+        await this.editEngine.replaceRange(action.path, action.startLine, action.endLine, action.content);
+      } catch (error) {
+        return [
+          `replace_range validation failed for ${action.path}: ${(error as Error).message}`,
+          'Read the current target window again and retry with the correct 1-based line range.',
+          `Next valid action: ${JSON.stringify({ type: 'read_file', path: action.path, startLine: Math.max(1, action.startLine - 20), limit: ActionExecutor.READ_FILE_DEFAULT_LIMIT_LINES })}`,
+        ].join('\n');
       }
     }
 
@@ -564,19 +663,28 @@ export class ActionExecutor {
   private requiredReadPaths(action: AgentAction): string[] {
     switch (action.type) {
       case 'edit_file':
+      case 'replace_range':
       case 'delete_file':
         return [action.path];
       case 'rename_file':
         return [action.fromPath];
       case 'apply_patch':
-        return [...new Set(action.patches.map((patch) => patch.path))];
+        try {
+          return this.editEngine.getApplyPatchReadPaths(action.patches ?? [], action.patch);
+        } catch {
+          return [...new Set((action.patches ?? []).map((patch) => patch.path).filter(Boolean))];
+        }
       default:
         return [];
     }
   }
 
   private hasRead(sessionId: string, path: string): boolean {
-    return this.sessionReads.get(sessionId)?.has(path) ?? false;
+    const reads = this.sessionReads.get(sessionId);
+    if (!reads) {
+      return false;
+    }
+    return reads.has(this.normalizePath(path));
   }
 
   private async preflightCommand(command: string): Promise<string | undefined> {
@@ -1169,14 +1277,67 @@ export class ActionExecutor {
       return { next, target: variant.oldString, count };
     }
 
+    for (const variant of variants) {
+      const loose = this.resolveLineTrimmedReplacement(current, variant.oldString, variant.newString, replaceAll);
+      if (loose) {
+        return loose;
+      }
+    }
+
     if (ambiguousCounts.length > 0) {
       const count = Math.max(...ambiguousCounts);
       throw new Error(`edit_file matched ${count} occurrences; set replaceAll=true or provide more specific text.`);
     }
 
     throw new Error(
-      'edit_file target text not found. Tried exact text plus common provider repairs for escaped newlines, escaped quotes, read_file line prefixes, and CRLF/LF differences.',
+      'edit_file target text not found. Tried exact text plus common provider repairs for escaped newlines, escaped quotes, read_file line prefixes, CRLF/LF differences, and trailing whitespace differences.',
     );
+  }
+
+  private resolveLineTrimmedReplacement(
+    current: string,
+    oldString: string,
+    newString: string,
+    replaceAll: boolean,
+  ): { next: string; target: string; count: number } | undefined {
+    const oldLines = this.toLf(oldString).split('\n');
+    if (oldLines.length < 2) {
+      return undefined;
+    }
+
+    const currentUsesCrlf = current.includes('\r\n');
+    const currentLines = this.toLf(current).split('\n');
+    const normalizedOldLines = oldLines.map((line) => line.trimEnd());
+    const matches: number[] = [];
+
+    for (let index = 0; index <= currentLines.length - normalizedOldLines.length; index += 1) {
+      const matched = normalizedOldLines.every((line, offset) => currentLines[index + offset].trimEnd() === line);
+      if (matched) {
+        matches.push(index);
+      }
+    }
+
+    if (matches.length === 0) {
+      return undefined;
+    }
+
+    if (!replaceAll && matches.length > 1) {
+      throw new Error(`edit_file matched ${matches.length} trailing-whitespace-normalized occurrences; set replaceAll=true or provide more specific text.`);
+    }
+
+    const nextLines = [...currentLines];
+    const replacementLines = this.toLf(newString).split('\n');
+    const starts = replaceAll ? [...matches].reverse() : [matches[0]];
+    for (const start of starts) {
+      nextLines.splice(start, oldLines.length, ...replacementLines);
+    }
+
+    const nextLf = nextLines.join('\n');
+    return {
+      next: currentUsesCrlf ? this.toCrlf(nextLf) : nextLf,
+      target: oldString,
+      count: matches.length,
+    };
   }
 
   private buildReplacementVariants(
@@ -1206,6 +1367,16 @@ export class ActionExecutor {
 
     for (const pair of basePairs) {
       add(pair.oldValue, pair.newValue);
+      
+      // Handle trailing whitespace discrepancies frequently introduced by models
+      if (pair.oldValue.includes('\n')) {
+        const lines = pair.oldValue.split(/\r?\n/);
+        const trimmedOld = lines.map((l) => l.trimEnd()).join('\n');
+        const trimmedNew = pair.newValue.split(/\r?\n/).map((l) => l.trimEnd()).join('\n');
+        add(trimmedOld, trimmedNew);
+        add(this.toCrlf(trimmedOld), this.toCrlf(trimmedNew));
+      }
+
       add(this.toLf(pair.oldValue), this.toLf(pair.newValue));
       if (current.includes('\r\n')) {
         add(this.toCrlf(pair.oldValue), this.toCrlf(pair.newValue));
@@ -1232,8 +1403,8 @@ export class ActionExecutor {
     }
 
     const comparisonHasNewlines = /[\r\n]/.test(comparisonText);
-    const likelyWholeFile = realNewlineCount === 0 && (escapedNewlineCount >= 2 || decoded.length > 120);
-    const likelyMultilineReplacement = comparisonHasNewlines || escapedNewlineCount >= 2;
+    const likelyWholeFile = realNewlineCount === 0 && (escapedNewlineCount >= 1 || decoded.length > 120);
+    const likelyMultilineReplacement = comparisonHasNewlines || escapedNewlineCount >= 1;
     return likelyWholeFile || likelyMultilineReplacement ? decoded : value;
   }
 

@@ -54,12 +54,22 @@ export const editFileActionSchema = baseAction.extend({
 
 export const applyPatchActionSchema = baseAction.extend({
   type: z.literal('apply_patch'),
+  patch: z.string().optional(),
   patches: z.array(z.object({
     path: z.string().min(1),
-    oldString: z.string().min(1),
-    newString: z.string(),
+    diff: z.string().optional(),
+    oldString: z.string().optional(),
+    newString: z.string().optional(),
     replaceAll: z.boolean().optional(),
-  })).min(1).max(20),
+  })).min(1).max(20).optional(),
+});
+
+export const replaceRangeActionSchema = baseAction.extend({
+  type: z.literal('replace_range'),
+  path: z.string().min(1),
+  startLine: z.number().int().positive(),
+  endLine: z.number().int().positive(),
+  content: z.string(),
 });
 
 export const createFileActionSchema = baseAction.extend({
@@ -119,6 +129,33 @@ export const finishActionSchema = baseAction.extend({
   result: z.string().min(1),
 });
 
+export const listDirectoryActionSchema = baseAction.extend({
+  type: z.literal('list_directory'),
+  path: z.string().default('.'),
+  depth: z.number().int().positive().max(5).optional(),
+});
+
+export const grepSearchActionSchema = baseAction.extend({
+  type: z.literal('grep_search'),
+  pattern: z.string().min(1),
+  regex: z.boolean().optional(),
+  includes: z.array(z.string()).optional(),
+  excludes: z.array(z.string()).optional(),
+  limit: z.number().int().positive().max(100).optional(),
+  contextLines: z.number().int().min(0).max(5).optional(),
+});
+
+export const findSymbolsActionSchema = baseAction.extend({
+  type: z.literal('find_symbols'),
+  query: z.string().min(1),
+  limit: z.number().int().positive().max(50).optional(),
+});
+
+export const fileOutlineActionSchema = baseAction.extend({
+  type: z.literal('file_outline'),
+  path: z.string().min(1),
+});
+
 export const agentActionSchema = z.discriminatedUnion('type', [
   listFilesActionSchema,
   readFileActionSchema,
@@ -128,6 +165,7 @@ export const agentActionSchema = z.discriminatedUnion('type', [
   searchCodeActionSchema,
   editFileActionSchema,
   applyPatchActionSchema,
+  replaceRangeActionSchema,
   createFileActionSchema,
   deleteFileActionSchema,
   renameFileActionSchema,
@@ -136,6 +174,10 @@ export const agentActionSchema = z.discriminatedUnion('type', [
   listMcpToolsActionSchema,
   callMcpToolActionSchema,
   resolveMcpIntentActionSchema,
+  listDirectoryActionSchema,
+  grepSearchActionSchema,
+  findSymbolsActionSchema,
+  fileOutlineActionSchema,
   askUserActionSchema,
   finishActionSchema,
 ]);

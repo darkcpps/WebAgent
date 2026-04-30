@@ -143,7 +143,7 @@ export function App(): JSX.Element {
   const canAttachImages = providerId === 'chatgpt' || providerId === 'perplexity';
   const debugLogs = activeSession?.logs ?? [];
   const autoApproveEnabled = state.approvalMode === 'auto-apply-safe-edits';
-  const modifiedActionTypes = new Set(['edit_file', 'create_file', 'delete_file', 'rename_file']);
+  const modifiedActionTypes = new Set(['edit_file', 'create_file', 'delete_file', 'rename_file', 'apply_patch', 'replace_range']);
   const hasCompletedCodeChanges = Boolean(activeSession?.actionHistory.some((action) => action.status === 'done' && modifiedActionTypes.has(action.type)));
   const assistantMessages = activeSession?.chatHistory.filter((entry) => entry.role === 'assistant') ?? [];
   const latestAssistantMessage = assistantMessages.at(-1);

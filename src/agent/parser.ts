@@ -35,6 +35,10 @@ export class AgentResponseParser {
     // 2. Try to find balanced JSON objects or arrays anywhere in the text.
     for (const candidate of normalizedInputs) {
       candidates.push(...this.extractBalancedJson(candidate));
+      const looseAgentJson = this.extractLooseAgentJson(candidate);
+      if (looseAgentJson) {
+        candidates.push(looseAgentJson);
+      }
     }
 
     // 3. Fallback to just the trimmed input
@@ -43,6 +47,27 @@ export class AgentResponseParser {
     const repaired = candidates.map((candidate) => this.repairJson(candidate));
     const uniqueCandidates = [...new Set(repaired.flatMap((candidate) => this.buildCandidateTextVariants(candidate)))].filter(Boolean);
     return uniqueCandidates.sort((left, right) => this.rankCandidate(right) - this.rankCandidate(left));
+  }
+
+  private extractLooseAgentJson(input: string): string | undefined {
+    if (!this.looksLikeAgentJson(input)) {
+      return undefined;
+    }
+
+    const objectStart = input.indexOf('{');
+    const arrayStart = input.indexOf('[');
+    const starts = [objectStart, arrayStart].filter((index) => index >= 0);
+    if (starts.length === 0) {
+      return undefined;
+    }
+
+    const start = Math.min(...starts);
+    const end = Math.max(input.lastIndexOf('}'), input.lastIndexOf(']'));
+    if (end <= start) {
+      return undefined;
+    }
+
+    return input.slice(start, end + 1).trim();
   }
 
   private repairJson(candidate: string): string {
@@ -355,7 +380,9 @@ export class AgentResponseParser {
       return undefined;
     }
 
-    const action = value as Record<string, unknown>;
+    let action = value as Record<string, unknown>;
+    action = this.unwrapToolCallAction(action) ?? action;
+
     const typeRaw = action.type ?? action.tool ?? action.name ?? action.action;
     const type = typeof typeRaw === 'string' ? typeRaw.trim() : '';
     if (!type) {
@@ -364,6 +391,7 @@ export class AgentResponseParser {
 
     const normalizedType = this.normalizeActionType(type);
     const result: Record<string, unknown> = { ...action, type: normalizedType };
+    this.normalizePathAndContentAliases(normalizedType, action, result);
 
     if (normalizedType === 'run_command' && typeof result.command !== 'string') {
       const cmd = action.cmd ?? action.shell;
@@ -422,17 +450,43 @@ export class AgentResponseParser {
     }
 
     if (normalizedType === 'apply_patch') {
+      if (typeof result.patch !== 'string') {
+        const patchText = action.patch ?? action.patchText ?? action.patch_text ?? action.unifiedDiff ?? action.unified_diff;
+        if (typeof patchText === 'string') {
+          result.patch = patchText;
+        } else if (typeof action.diff === 'string' && typeof action.path !== 'string') {
+          result.patch = action.diff;
+        }
+      }
       if (!Array.isArray(result.patches)) {
         const rawPatches = action.replacements ?? action.changes ?? action.edits ?? action.hunks;
         if (Array.isArray(rawPatches)) {
           result.patches = rawPatches;
         } else if (typeof action.path === 'string') {
+          if (typeof action.diff === 'string') {
+            result.patches = [{ path: action.path, diff: action.diff }];
+          }
           const oldString = action.oldString ?? action.find ?? action.old;
           const newString = action.newString ?? action.replacement ?? action.new;
-          if (typeof oldString === 'string' && typeof newString === 'string') {
+          if (!Array.isArray(result.patches) && typeof oldString === 'string' && typeof newString === 'string') {
             result.patches = [{ path: action.path, oldString, newString, replaceAll: action.replaceAll }];
           }
         }
+      }
+    }
+
+    if (normalizedType === 'replace_range') {
+      if (typeof result.startLine !== 'number' && typeof action.start === 'number') {
+        result.startLine = action.start;
+      }
+      if (typeof result.endLine !== 'number' && typeof action.end === 'number') {
+        result.endLine = action.end;
+      }
+      if (typeof result.content !== 'string' && typeof action.replacement === 'string') {
+        result.content = action.replacement;
+      }
+      if (typeof result.content !== 'string' && typeof action.new === 'string') {
+        result.content = action.new;
       }
     }
 
@@ -446,7 +500,7 @@ export class AgentResponseParser {
           result.tool = toolName;
         }
       }
-      
+
       let args = action.arguments ?? action.args ?? action.input ?? action.parameters;
       if (typeof args === 'string') {
         try {
@@ -455,7 +509,7 @@ export class AgentResponseParser {
           // Leave it as string, let Zod catch it if it's invalid
         }
       }
-      
+
       if (args && typeof args === 'object' && !Array.isArray(args)) {
         result.arguments = args;
       } else if (!('arguments' in result)) {
@@ -513,6 +567,96 @@ export class AgentResponseParser {
     return result;
   }
 
+  private unwrapToolCallAction(action: Record<string, unknown>): Record<string, unknown> | undefined {
+    const functionCall = this.asRecord(action.function) ?? this.asRecord(action.function_call);
+    if (!functionCall) {
+      return undefined;
+    }
+
+    const functionName = functionCall.name ?? action.name ?? action.tool;
+    if (typeof functionName !== 'string') {
+      return undefined;
+    }
+
+    const args = this.parseObjectLike(functionCall.arguments ?? functionCall.args ?? functionCall.parameters);
+    return {
+      ...action,
+      ...args,
+      type: functionName,
+      summary: typeof action.summary === 'string' ? action.summary : typeof functionCall.summary === 'string' ? functionCall.summary : '',
+    };
+  }
+
+  private normalizePathAndContentAliases(normalizedType: string, action: Record<string, unknown>, result: Record<string, unknown>): void {
+    const pathTypes = new Set([
+      'read_file',
+      'edit_file',
+      'replace_range',
+      'create_file',
+      'delete_file',
+      'file_outline',
+    ]);
+    if (pathTypes.has(normalizedType) && typeof result.path !== 'string') {
+      const pathValue = action.path ?? action.filePath ?? action.file_path ?? action.file ?? action.filename ?? action.targetPath ?? action.target_path;
+      if (typeof pathValue === 'string') {
+        result.path = pathValue;
+      }
+    }
+
+    if (normalizedType === 'rename_file') {
+      if (typeof result.fromPath !== 'string') {
+        const fromPath = action.fromPath ?? action.from_path ?? action.sourcePath ?? action.source_path ?? action.source ?? action.oldPath ?? action.old_path;
+        if (typeof fromPath === 'string') {
+          result.fromPath = fromPath;
+        }
+      }
+      if (typeof result.toPath !== 'string') {
+        const toPath = action.toPath ?? action.to_path ?? action.destinationPath ?? action.destination_path ?? action.destination ?? action.newPath ?? action.new_path;
+        if (typeof toPath === 'string') {
+          result.toPath = toPath;
+        }
+      }
+    }
+
+    if (['edit_file', 'replace_range', 'create_file'].includes(normalizedType) && typeof result.content !== 'string') {
+      const contentValue =
+        action.content ??
+        action.contents ??
+        action.fileContent ??
+        action.file_content ??
+        action.text ??
+        action.body ??
+        action.code ??
+        action.source;
+      if (typeof contentValue === 'string') {
+        result.content = contentValue;
+      }
+    }
+  }
+
+  private parseObjectLike(value: unknown): Record<string, unknown> {
+    if (value && typeof value === 'object' && !Array.isArray(value)) {
+      return value as Record<string, unknown>;
+    }
+
+    if (typeof value !== 'string' || !value.trim()) {
+      return {};
+    }
+
+    try {
+      const parsed = JSON.parse(value);
+      return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed as Record<string, unknown> : {};
+    } catch {
+      return {};
+    }
+  }
+
+  private asRecord(value: unknown): Record<string, unknown> | undefined {
+    return value && typeof value === 'object' && !Array.isArray(value)
+      ? value as Record<string, unknown>
+      : undefined;
+  }
+
   private normalizeActionType(type: string): string {
     const value = type.trim().toLowerCase().replace(/[^a-z0-9_]/g, '_');
     const aliases: Record<string, string> = {
@@ -539,12 +683,29 @@ export class AgentResponseParser {
       edit: 'edit_file',
       editfile: 'edit_file',
       edit_file: 'edit_file',
+      modify: 'edit_file',
+      modify_file: 'edit_file',
+      update_file: 'edit_file',
       patch: 'apply_patch',
       apply_patch: 'apply_patch',
       applypatch: 'apply_patch',
+      apply_patches: 'apply_patch',
+      applypatches: 'apply_patch',
+      patch_file: 'apply_patch',
+      patch_files: 'apply_patch',
+      replace_range: 'replace_range',
+      replace_lines: 'replace_range',
+      edit_range: 'replace_range',
+      range_edit: 'replace_range',
       create: 'create_file',
       createfile: 'create_file',
       create_file: 'create_file',
+      create_new_file: 'create_file',
+      new_file: 'create_file',
+      add_file: 'create_file',
+      write: 'create_file',
+      writefile: 'create_file',
+      write_file: 'create_file',
       delete: 'delete_file',
       deletefile: 'delete_file',
       delete_file: 'delete_file',

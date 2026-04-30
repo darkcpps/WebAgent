@@ -16,6 +16,7 @@ import { WebAgentPanel } from './services/webviewPanel';
 import { WorkspaceContextService } from './workspace/context';
 import { WorkspaceFilesService } from './workspace/files';
 import { GitService } from './workspace/git';
+import { SymbolService } from './workspace/symbols';
 import type { ApprovalMode, BridgeUiState, ChatMessage, ImageAttachment, ProviderId, SessionState } from './shared/types';
 import type { ProviderAdapter, ProviderPrompt } from './providers/base';
 import { AgentResponseParser } from './agent/parser';
@@ -26,7 +27,6 @@ import { sanitizeResponse } from './shared/utils';
 
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
   const AUTO_FOLLOW_UP_DELAY_MS = 1750;
-  const KIMI_FOLLOW_UP_DELAY_MS = 500;
   const AGENT_PROVIDER_CHAT_ROTATION_ROUNDS = 6;
   const configuration = vscode.workspace.getConfiguration('webagentCode');
   const sessions = new SessionStore(context);
@@ -38,8 +38,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   const safety = new SafetyPolicy(configuration);
   const diffPreview = new DiffPreviewService();
   const terminal = new TerminalRunner();
-  const workspaceContext = new WorkspaceContextService(files);
-  const executor = new ActionExecutor(files, git, safety, approvals, sessions, diffPreview, terminal);
+  const symbols = new SymbolService();
+  const workspaceContext = new WorkspaceContextService(files, symbols);
+  const executor = new ActionExecutor(files, git, safety, approvals, sessions, diffPreview, terminal, undefined, symbols);
   const orchestrator = new AgentOrchestrator(providers, workspaceContext, executor, sessions);
   const parser = new AgentResponseParser();
   const providerReady: Record<ProviderId, boolean> = {
@@ -816,6 +817,70 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
               () => collectProviderText(session.id, providerId),
               'streamEvents(chat)',
             );
+
+            if (providerId === 'deepseek') {
+              let parsedChatTools: { summary: string; actions: AgentAction[] } | undefined;
+              try {
+                parsedChatTools = parser.parse(responseText);
+              } catch {
+                // DeepSeek sometimes ignores Chat mode and returns agent tool JSON.
+                // If it is not valid tool JSON, keep the normal conversational path.
+              }
+
+              const mutationActions =
+                parsedChatTools?.actions.filter((action) =>
+                  ['edit_file', 'create_file', 'delete_file', 'rename_file', 'apply_patch', 'replace_range'].includes(action.type),
+                ) ?? [];
+              if (parsedChatTools && mutationActions.length > 0) {
+                sessions.appendRawResponse(session.id, cleanFinalResponse(responseText, { preferJson: true }));
+                sessions.appendLog(session.id, {
+                  level: 'warning',
+                  source: 'agent',
+                  message: 'DeepSeek returned executable tool JSON while Chat mode was active; routing it through IDE actions.',
+                });
+                if (assistantMessage) {
+                  sessions.updateChatMessage(session.id, assistantMessage.id, {
+                    content: 'DeepSeek returned IDE actions. Executing them through the normal approval flow...',
+                    rawContent: '',
+                  });
+                }
+
+                const executedResults: string[] = [];
+                const executableActions = parsedChatTools.actions.filter((action) => action.type !== 'finish');
+                for (const action of executableActions) {
+                  const result = await executor.execute(session.id, action);
+                  executedResults.push(result.message);
+                  if (action.type === 'ask_user' || result.done) {
+                    break;
+                  }
+                }
+
+                const finalResult = executedResults.join('\n\n') || parsedChatTools.summary || 'No IDE action result was returned.';
+                if (assistantMessage) {
+                  sessions.updateChatMessage(session.id, assistantMessage.id, {
+                    content: finalResult,
+                    rawContent: finalResult,
+                  });
+                }
+                sessions.setStatus(session.id, 'done');
+
+                await new Promise((r) => setTimeout(r, 1500));
+                const conversationId = await runWithAutoFallback(
+                  () => getConversationIdSafely(provider),
+                  'getCurrentConversationId',
+                ).catch(() => undefined);
+                if (conversationId) {
+                  sessions.setProviderSessionId(session.id, conversationId);
+                  sessions.appendLog(session.id, {
+                    level: 'info',
+                    source: 'agent',
+                    message: `Session locked to conversation: ${conversationId}`,
+                  });
+                }
+                return;
+              }
+            }
+
             const cleaned = cleanFinalResponse(responseText);
             sessions.appendRawResponse(session.id, cleaned);
             if (assistantMessage) {
@@ -884,7 +949,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
           };
 
           const isCodeMutationAction = (actionType: string): boolean =>
-            ['edit_file', 'create_file', 'delete_file', 'rename_file'].includes(actionType);
+            ['edit_file', 'create_file', 'delete_file', 'rename_file', 'apply_patch', 'replace_range'].includes(actionType);
 
           const isFailedActionMessage = (message: string): boolean =>
             /^(Action failed:|Blocked action |User rejected action )/i.test(message.trim());
@@ -897,12 +962,50 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
             );
 
           const isPrematureIntentFinish = (message: string): boolean =>
-            /\b(now\s+i\s+have\s+enough|let\s+me\s+build|i(?:'ll| will)\s+(?:build|create|implement|modify|edit|make)|i\s+can\s+(?:build|create|implement|modify|edit|make)|going\s+to\s+(?:build|create|implement|modify|edit|make))\b/i.test(
+            /\b(now\s+i\s+have\s+enough|let\s+me\s+build|i(?:'ll| will)\s+(?:build|create|implement|modify|edit|make)|i\s+can\s+(?:build|create|implement|modify|edit|make)|going\s+to\s+(?:build|create|implement|modify|edit|make)|(?:created|implemented|modified|edited|updated|fixed|added|wrote)\b)/i.test(
               message,
             );
 
+          const taskRequiresMutation = (): boolean =>
+            /\b(create|add|write|implement|modify|edit|update|fix|repair|change|delete|remove|rename|move|patch|refactor|build)\b/i.test(chatPrompt);
+
           const hasWorkspaceDiscoveryResult = (): boolean =>
             toolResults.some((result) => /^(list_files|search_files|read_file):/i.test(result.trim()));
+
+          const looksLikeIncompleteToolJson = (value: string): boolean => {
+            const text = cleanFinalResponse(value, { preferJson: true }).trim();
+            if (!/(?:"actions"|"type"|create_file|edit_file|apply_patch|replace_range|write_file)/i.test(text)) {
+              return false;
+            }
+            if (!/^[\s`]*(?:```json\s*)?[{[]/i.test(text)) {
+              return false;
+            }
+
+            const stack: string[] = [];
+            let inString = false;
+            let escaped = false;
+            for (const char of text.replace(/^```json\s*/i, '').replace(/```\s*$/i, '')) {
+              if (inString) {
+                if (escaped) {
+                  escaped = false;
+                } else if (char === '\\') {
+                  escaped = true;
+                } else if (char === '"') {
+                  inString = false;
+                }
+                continue;
+              }
+              if (char === '"') {
+                inString = true;
+              } else if (char === '{' || char === '[') {
+                stack.push(char);
+              } else if (char === '}' || char === ']') {
+                stack.pop();
+              }
+            }
+
+            return inString || stack.length > 0 || !/[}\]]\s*(?:```)?\s*$/.test(text);
+          };
 
           const parseExitCode = (message: string): number | undefined => {
             const raw = message.match(/Exit code:\s*([^\n]+)/i)?.[1]?.trim();
@@ -973,6 +1076,12 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
                 return withSummary(`Reading ${action.path ?? 'file'}`);
               case 'edit_file':
                 return withSummary(`Modifying ${action.path ?? 'file'}`);
+              case 'apply_patch': {
+                const patches = (action as any).patches || [];
+                const paths = [...new Set(patches.map((p: any) => p.path))];
+                const target = paths.length === 1 ? paths[0] : `${paths.length} files`;
+                return withSummary(`Patching ${target}`);
+              }
               case 'create_file':
                 return withSummary(`Creating ${action.path ?? 'file'}`);
               case 'delete_file':
@@ -1017,6 +1126,12 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
                 return `Read ${action.path ?? 'file'}`;
               case 'edit_file':
                 return `Edited ${action.path ?? 'file'}`;
+              case 'apply_patch': {
+                const patches = (action as any).patches || [];
+                const paths = [...new Set(patches.map((p: any) => p.path))];
+                const target = paths.length === 1 ? paths[0] : `${paths.length} files`;
+                return `Patched ${target}`;
+              }
               case 'create_file':
                 return `Created ${action.path ?? 'file'}`;
               case 'delete_file':
@@ -1028,9 +1143,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
               case 'list_files':
                 return 'File list ready';
               case 'run_command': {
-                const exitCode = trimmed.match(/Exit code:\s*([^\n]+)/i)?.[1]?.trim();
+                const exitCode = parseExitCode(trimmed);
                 const cmd = compact(action.command ?? '', 60);
-                return exitCode ? `Command finished (${cmd}) [exit ${exitCode}]` : `Command finished (${cmd})`;
+                return exitCode !== undefined ? `Command finished (${cmd}) [exit ${exitCode}]` : `Command finished (${cmd})`;
               }
               case 'get_git_diff':
                 return 'Git diff ready';
@@ -1093,7 +1208,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 
           for (let round = 0; round < 25; round += 1) {
             if (round > 0) {
-              const followUpDelayMs = providerId === 'kimi' ? KIMI_FOLLOW_UP_DELAY_MS : AUTO_FOLLOW_UP_DELAY_MS;
+              const followUpDelayMs = AUTO_FOLLOW_UP_DELAY_MS;
               sessions.appendLog(session.id, {
                 level: 'info',
                 source: 'provider',
@@ -1129,22 +1244,43 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
               `sendPrompt(agent round ${round + 1})`,
             );
 
-            const responseText = await runWithAutoFallback(
+            let responseText = await runWithAutoFallback(
               () => collectProviderText(session.id, providerId),
               `streamEvents(agent round ${round + 1})`,
             );
             lastRawResponse = responseText;
             
-            const cleaned = cleanFinalResponse(responseText, { preferJson: true });
-            sessions.appendRawResponse(session.id, cleaned);
-
             let parsed;
-            try {
-              parsed = parser.parse(responseText);
-            } catch {
+            let cleaned = cleanFinalResponse(responseText, { preferJson: true });
+            sessions.appendRawResponse(session.id, cleaned);
+            for (let parseAttempt = 0; parseAttempt < (providerId === 'deepseek' ? 8 : 1); parseAttempt += 1) {
               try {
-                parsed = parser.parse(cleaned);
-              } catch (parseError) {
+                parsed = parser.parse(responseText);
+                break;
+              } catch {
+                try {
+                  parsed = parser.parse(cleaned);
+                  break;
+                } catch (parseError) {
+                  if ((providerId === 'deepseek' || providerId === 'kimi') && looksLikeIncompleteToolJson(responseText) && parseAttempt < 7) {
+                    const waitMs = 5000;
+                    sessions.appendLog(session.id, {
+                      level: 'info',
+                      source: 'agent',
+                      message: `DeepSeek response looks like partial tool JSON; waiting ${waitMs / 1000}s before parsing again.`,
+                    });
+                    pushActionUpdate('Waiting for DeepSeek to finish the current tool JSON response.');
+                    await new Promise((resolve) => setTimeout(resolve, waitMs));
+                    responseText = await runWithAutoFallback(
+                      () => collectProviderText(session.id, providerId),
+                      `streamEvents(agent round ${round + 1}, retry ${parseAttempt + 1})`,
+                    );
+                    lastRawResponse = responseText;
+                    cleaned = cleanFinalResponse(responseText, { preferJson: true });
+                    sessions.appendRawResponse(session.id, cleaned);
+                    continue;
+                  }
+
                 invalidToolResponseCount += 1;
                 const parseErrorMessage = parseError instanceof Error ? parseError.message : String(parseError);
                 sessions.appendLog(session.id, {
@@ -1177,7 +1313,11 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
                 ].join('\n');
                 endedByAskUser = true;
                 break;
+                }
               }
+            }
+            if (!parsed) {
+              break;
             }
 
             invalidToolResponseCount = 0;
@@ -1241,6 +1381,23 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
                   `Rejected finish result: ${compact(action.result, 500)}`,
                 ].join('\n'));
                 pushActionUpdate('Auto-recovery: rejected intent-only finish and requested executable actions.');
+                continue;
+              }
+
+              if (action.type === 'finish' && taskRequiresMutation() && !codeChangesApplied) {
+                sessions.appendLog(session.id, {
+                  level: 'warning',
+                  source: 'agent',
+                  message: 'Rejected premature finish; the task appears to require file changes but no mutation action succeeded.',
+                });
+                pushSystemFeedback([
+                  'SYSTEM_FEEDBACK: Do not finish yet. The user requested a code/file change, but no IDE mutation action has succeeded.',
+                  'Your next response must be raw JSON only. No prose or Markdown outside the JSON object.',
+                  'Emit an executable mutation action such as create_file, edit_file, replace_range, apply_patch, delete_file, or rename_file.',
+                  'Use finish only after the IDE reports that the required file change action succeeded.',
+                  `Rejected finish result: ${compact(action.result, 500)}`,
+                ].join('\n'));
+                pushActionUpdate('Auto-recovery: rejected premature finish and requested a real file-change action.');
                 continue;
               }
 

@@ -140,20 +140,46 @@
         },
         "webagentCode.maxFiles": {
           "type": "number",
-          "default": 150,
+          "default": 500,
           "minimum": 10,
-          "description": "Maximum number of workspace files to consider while building repo context."
+          "maximum": 10000,
+          "description": "Maximum number of workspace files to consider while building repo context. Auto-scales with detected codebase tier."
         },
         "webagentCode.searchScanLimit": {
           "type": "number",
-          "default": 80,
+          "default": 200,
           "minimum": 10,
-          "description": "Maximum number of ranked workspace files to open during each Agent Mode text search."
+          "description": "Maximum number of ranked workspace files to open during each Agent Mode text search. Auto-scales with detected codebase tier."
         },
         "webagentCode.includeHiddenFiles": {
           "type": "boolean",
           "default": false,
           "description": "Whether hidden files should be considered during repo scans."
+        },
+        "webagentCode.useRipgrep": {
+          "type": "boolean",
+          "default": true,
+          "description": "Use ripgrep for fast file search when available. Falls back to naive search if ripgrep is not found."
+        },
+        "webagentCode.excludePatterns": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "description": "Additional glob patterns to exclude from file discovery, beyond .gitignore and built-in excludes."
+        },
+        "webagentCode.codebaseTier": {
+          "type": "string",
+          "enum": [
+            "auto",
+            "small",
+            "medium",
+            "large",
+            "massive"
+          ],
+          "default": "auto",
+          "description": "Override automatic codebase tier detection. Controls context budget, prompt strategy, and tool behavior. Use 'auto' for automatic detection."
         },
         "webagentCode.agent.maxRounds": {
           "type": "number",
